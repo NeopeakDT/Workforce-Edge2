@@ -1,0 +1,7 @@
+# data-
+data/1.pseudo_labeled/
+data/2.qa_sample/
+data/3.qa_preview/
+data/unlabeled/
+
+Activities/01-Milking/best.pt
