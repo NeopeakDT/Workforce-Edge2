@@ -1,39 +1,20 @@
-"""
-Dataset merge and preparation script for YOLO training.
-
-This script:
-- Merges multiple Roboflow-exported YOLO datasets (train-only) into a single dataset
-- Prevents filename collisions by prefixing source dataset names
-- Creates a validation split from the merged training data (configurable ratio)
-- Preserves image–label pairing and YOLO annotation format
-- Automatically generates a canonical data.yaml file for Ultralytics YOLO
-
-Output:
-- workforce_merged/images/{train, valid}
-- workforce_merged/labels/{train, valid}
-- workforce_merged/data.yaml
-
-Intended for object-detection datasets with identical class definitions.
-"""
-
-
 from pathlib import Path
 import shutil
 import random
-import yaml   # pip install pyyaml if missing
+import yaml
 
 # ---------------- CONFIG ----------------
 DATASETS = [
-    Path(r"C:\Users\offic\OneDrive\Desktop\Pranjal\WF_zip_files\Workforce Detection-2.v5i.yolov8"),   # contains train/images, train/labels
-    Path(r"C:\Users\offic\OneDrive\Desktop\Pranjal\WF_zip_files\Workforce_management-1.v2i.yolov8")
+    Path(r"C:\Users\offic\OneDrive\Desktop\Pranjal\WF_zip_files\Workforce Detection-2.v5i.yolov8"),
+    Path(r"C:\Users\offic\OneDrive\Desktop\Pranjal\WF_zip_files\Workforce_management-1.v2i.yolov8"),
 ]
 
-OUT = Path(r"C:\Users\offic\OneDrive\Desktop\Pranjal")
+OUT = Path(r"C:\Users\offic\OneDrive\Desktop\Pranjal\workforce_merged")
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
 VAL_RATIO = 0.2
 SEED = 42
 
-# Canonical class list (SINGLE SOURCE OF TRUTH)
+# Canonical class list (single source of truth)
 CLASS_NAMES = [
     "cow",
     "person",
@@ -50,15 +31,27 @@ for split in ["train", "valid"]:
     (OUT / "images" / split).mkdir(parents=True, exist_ok=True)
     (OUT / "labels" / split).mkdir(parents=True, exist_ok=True)
 
-# -------- Step 1: Merge all TRAIN data --------
 merged_images = []
 
+# -------- Step 1: Merge TRAIN data safely --------
 for ds in DATASETS:
+    yaml_path = ds / "data.yaml"
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"Missing data.yaml in {ds}")
+
+    with open(yaml_path) as f:
+        ds_yaml = yaml.safe_load(f)
+
+    ds_names = ds_yaml["names"]
+    ds_class_map = {name: idx for idx, name in ds_names.items()}
+
+    # Validate class names
+    for name in CLASS_NAMES:
+        if name not in ds_class_map:
+            raise ValueError(f"Class '{name}' missing in dataset {ds}")
+
     img_dir = ds / "train" / "images"
     lbl_dir = ds / "train" / "labels"
-
-    if not img_dir.exists():
-        raise FileNotFoundError(f"Missing {img_dir}")
 
     for img in img_dir.iterdir():
         if img.suffix.lower() not in IMG_EXTS:
@@ -71,14 +64,25 @@ for ds in DATASETS:
         shutil.copy2(img, out_img)
 
         lbl = lbl_dir / img.with_suffix(".txt").name
-        if lbl.exists():
-            shutil.copy2(lbl, out_lbl)
-        else:
+        if not lbl.exists():
             out_lbl.touch()
+            merged_images.append(out_img)
+            continue
+
+        with open(lbl) as f:
+            lines = f.readlines()
+
+        with open(out_lbl, "w") as f:
+            for line in lines:
+                parts = line.strip().split()
+                old_cls = int(parts[0])
+                cls_name = ds_names[old_cls]
+                new_cls = CLASS_NAMES.index(cls_name)
+                f.write(" ".join([str(new_cls)] + parts[1:]) + "\n")
 
         merged_images.append(out_img)
 
-print(f"[INFO] Merged {len(merged_images)} images into train/")
+print(f"[INFO] Merged {len(merged_images)} images")
 
 # -------- Step 2: Create VALID split --------
 random.shuffle(merged_images)
@@ -88,22 +92,20 @@ for img_path in merged_images[:val_count]:
     lbl_path = OUT / "labels" / "train" / img_path.name.replace(img_path.suffix, ".txt")
 
     shutil.move(img_path, OUT / "images" / "valid" / img_path.name)
-
     if lbl_path.exists():
         shutil.move(lbl_path, OUT / "labels" / "valid" / lbl_path.name)
 
-print(f"[INFO] Moved {val_count} images to valid/")
+print(f"[INFO] Validation samples: {val_count}")
 
-# -------- Step 3: Auto-generate data.yaml --------
+# -------- Step 3: data.yaml --------
 data_yaml = {
     "path": str(OUT),
     "train": "images/train",
     "val": "images/valid",
-    "names": {i: name for i, name in enumerate(CLASS_NAMES)}
+    "names": {i: n for i, n in enumerate(CLASS_NAMES)},
 }
 
-yaml_path = OUT / "data.yaml"
-with open(yaml_path, "w") as f:
+with open(OUT / "data.yaml", "w") as f:
     yaml.safe_dump(data_yaml, f, sort_keys=False)
 
-print(f"[INFO] data.yaml written to {yaml_path}")
+print("[INFO] data.yaml written")
