@@ -19,8 +19,9 @@ for IN_PROGRESS activities.
 
 # common/idempotency.py
 
-from common.db import get_cursor
-from common.time_utils import utc_now
+# Use relative imports since we're already in the common package
+from .db import get_cursor
+from .time_utils import utc_now
 
 def is_duplicate(key: str) -> bool:
     with get_cursor() as cur:

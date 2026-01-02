@@ -9,8 +9,9 @@ Logs all important system events for audit trail.
 
 # common/audit_logger.py
 
-from common.db import get_cursor
-from common.time_utils import utc_now
+# Use relative imports since we're already in the common package
+from .db import get_cursor
+from .time_utils import utc_now
 
 def log_event(
     actor_id: str,

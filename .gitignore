@@ -8,4 +8,8 @@ Activities/01-Milking/best.pt
 
 input_videos/
 
-backend/info.txt
+# Ignore all .txt files except requirements.txt
+*.txt
+!requirements.txt
+!**/requirements.txt
+backend/IMPORT_GUIDE.md
