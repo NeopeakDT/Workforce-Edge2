@@ -10,6 +10,7 @@ psycopg2-binary>=2.9.9
 
 # Authentication
 python-jose[cryptography]>=3.3.0
+PyJWT>=2.8.0
 python-multipart>=0.0.6
 
 # Timezone handling
@@ -22,4 +23,5 @@ requests>=2.31.0
 # Utilities
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
 
