@@ -1,0 +1,17 @@
+Validation Checklist (MANDATORY)
+
+Run these manually after scripts:
+
+1️⃣ Device registration
+SELECT id, device_name, status
+FROM edge_device
+WHERE device_name = 'jetson-orin-01';
+
+2️⃣ Model registry
+SELECT name, version, artifact_uri
+FROM model;
+
+3️⃣ Device ↔ Model binding
+SELECT *
+FROM device_model_assignment
+WHERE device_id = '<device_uuid>';

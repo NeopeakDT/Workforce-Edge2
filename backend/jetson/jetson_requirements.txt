@@ -1,0 +1,23 @@
+# Jetson Edge Device Dependencies
+
+# Computer Vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+
+# HTTP Client
+requests>=2.31.0
+
+# Geometry & Spatial Operations
+shapely>=2.0.0
+
+# System Monitoring
+psutil>=5.9.0
+
+# Utilities
+pydantic>=2.5.0
+

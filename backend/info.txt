@@ -1,0 +1,58 @@
+#Created Structure -
+
+Backend (backend/)
+API Layer (api/):
+event_ingest_api.py - Handles detection events with idempotency
+heartbeat_ingest_api.py - Handles device heartbeats
+admin_endpoints.py - Administrative operations
+
+Aggregation (aggregation/):
+activity_aggregator.py - Manages activity_instance lifecycle (single source of truth)
+missed_activity_cron.py - Background job for missed activities
+device_health_monitor.py - Monitors device health
+
+Alerts (alerts/):
+alert_evaluator.py - Evaluates alert conditions
+notification_dispatcher.py - Dispatches notifications
+
+Dashboard (dashboard/):
+dashboard_query_service.py - Optimized queries for dashboard
+
+Operations (ops/):
+device_provisioning.py - Device registration and management
+model_registry_sync.py - AI model version management
+event_retention_cleanup.py - Cleanup old events
+
+Common Utilities (common/):
+db.py - Supabase connection management
+auth.py - Authentication and authorization
+time_utils.py - Timezone-safe datetime operations
+idempotency.py - Idempotency and uniqueness enforcement
+audit_logger.py - Audit logging
+
+Main (main.py): FastAPI application entry point
+
+#Jetson (jetson/)
+
+Edge Components:
+edge_detector.py - AI inference and event sending (no lifecycle management)
+edge_heartbeat_agent.py - Periodic heartbeat sender
+edge_config_sync.py - Configuration synchronization
+
+Runtime (runtime/):
+model_loader.py - Model loading and inference
+roi_utils.py - Region of Interest filtering
+temporal_smoother.py - Temporal smoothing for detections
+
+Config (config/):
+local_cache.py - Local configuration caching
+local_cache.json - Cache storage
+
+#Architecture Principles Implemented
+Jetson devices only send detection events (no activity lifecycle management)
+Backend owns activity lifecycle, schedules, and status
+activity_detection_event is append-only
+activity_instance is the single source of truth
+Timezone-safe logic with UTC storage and conversion
+Idempotency and uniqueness enforcement for IN_PROGRESS activities
+EARLY/LATE computation only in backend (never on edge)
