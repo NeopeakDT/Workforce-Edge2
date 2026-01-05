@@ -9,7 +9,22 @@ Activities/01-Milking/best.pt
 input_videos/
 
 # Ignore all .txt files except requirements.txt
+backend/requirements.txt
 *.txt
 !requirements.txt
 !**/requirements.txt
 backend/IMPORT_GUIDE.md
+
+# Jetson runtime generated files
+backend/jetson/config/local_cache.json
+backend/jetson/config/bootstrap_config.json
+
+#jetson config examples
+backend/jetson/config/bootstrap_config.json.example
+backend/jetson/config/local_cache.json
+
+*/md
+**/*.md
+backend/.env.example
+*/.env
+**/.env
