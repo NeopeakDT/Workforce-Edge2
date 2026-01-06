@@ -56,3 +56,19 @@ activity_instance is the single source of truth
 Timezone-safe logic with UTC storage and conversion
 Idempotency and uniqueness enforcement for IN_PROGRESS activities
 EARLY/LATE computation only in backend (never on edge)
+
+---------------------------------------------------------------------------------------------
+06/1/2025-
+
+PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend> python ops/device_provisioning.py --farm-id 912cbfb5-2644-4a01-8b7e-470f2a175a4e --device-name harmony-jetson-01 --device-code HARMONY_JETSON_01
+>> 
+✅ Device provisioned successfully
+Device ID      : 5a6bfdd5-f099-4c34-8a56-1d8f09255b12
+Device Name    : harmony-jetson-01
+Device Code    : HARMONY_JETSON_01
+API Key (SAVE) : 9d88605f0a7f495efc1fd089b62f634b1924f53954e831500a68000d3f817214
+
+⚠️  WARNING: Save this API key now!
+   It will NOT be shown again.
+   Store it securely on the Jetson device.
+PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend>

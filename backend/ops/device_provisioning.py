@@ -1,33 +1,18 @@
+#!/usr/bin/env python3
 """
-Device Provisioning  (One-Time)
+Device Provisioning (One-Time)
 Registers a Jetson edge device in the system.
 
-# Purpose:
-- One-time registration of a Jetson device into the system.
-
-# This script:
-- Creates a logical device identity
-- Generates a device API key
-- Binds device → farm
+Purpose:
+- One-time registration of a Jetson device
+- Generates a secure device API key
+- Stores only the hashed key in DB
+- Links device to farm
 - Marks device as ACTIVE
-No inference, no streaming, no heartbeats
 
-# What this does:
-1. Generates cryptographically safe device_api_key
-2	Inserts row into edge_device
-3	Links device to farm
-4	Prints API key once (must be stored on Jetson)
-
-# Usage:
-python ops/device_provisioning.py \
-    --farm-id <uuid> \
-    --device-name jetson-orin-01 \
-    --device-type JETSON_ORIN
-
-# How Jetson uses this later:
-- Jetson sends X-DEVICE-KEY header
-- Backend maps key → edge_device.id
-- Used for ingestion auth, heartbeat, telemetry
+IMPORTANT:
+- Run ONLY from admin/backend machine
+- Do NOT run on Jetson
 """
 
 import argparse
@@ -36,7 +21,9 @@ import hashlib
 import sys
 from pathlib import Path
 
+# ------------------------------------------------------------------
 # Setup path for imports (allows script to run from any directory)
+# ------------------------------------------------------------------
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
@@ -48,18 +35,22 @@ from common.time_utils import utc_now
 def provision_device(farm_id: str, device_name: str, device_code: str):
     """
     Provision a new edge device.
-    
+
     Args:
         farm_id: UUID of the farm
         device_name: Human-readable device name
-        device_code: Unique device code/identifier
+        device_code: Unique device code (UPPERCASE recommended)
     """
-    # Generate cryptographically secure API key (plain text - shown once)
-    device_api_key = secrets.token_hex(32)  # 64 character hex string
-    
-    # Hash the API key for storage (security best practice)
+
+    # Normalize device_code (recommended)
+    device_code = device_code.strip().upper()
+
+    # Generate cryptographically secure API key (shown once)
+    device_api_key = secrets.token_hex(32)  # 256-bit key
+
+    # Hash API key for DB storage
     api_key_hash = hashlib.sha256(device_api_key.encode()).hexdigest()
-    
+
     with get_cursor() as cur:
         cur.execute(
             """
@@ -78,12 +69,15 @@ def provision_device(farm_id: str, device_name: str, device_code: str):
                 farm_id,
                 device_name,
                 device_code,
-                api_key_hash,  # Store hash, not plain text
-                True,  # is_active
+                api_key_hash,
+                True,
                 utc_now(),
             ),
         )
-        device_id = cur.fetchone()[0]
+
+        # IMPORTANT: dict cursor → access by column name
+        row = cur.fetchone()
+        device_id = row["id"]
 
     print("✅ Device provisioned successfully")
     print(f"Device ID      : {device_id}")
@@ -91,7 +85,8 @@ def provision_device(farm_id: str, device_name: str, device_code: str):
     print(f"Device Code    : {device_code}")
     print(f"API Key (SAVE) : {device_api_key}")
     print()
-    print("⚠️  WARNING: Save this API key now! It will not be shown again.")
+    print("⚠️  WARNING: Save this API key now!")
+    print("   It will NOT be shown again.")
     print("   Store it securely on the Jetson device.")
 
 
@@ -100,8 +95,8 @@ if __name__ == "__main__":
         description="Provision a new Jetson edge device"
     )
     parser.add_argument("--farm-id", required=True, help="UUID of the farm")
-    parser.add_argument("--device-name", required=True, help="Human-readable device name (e.g., 'jetson-orin-01')")
-    parser.add_argument("--device-code", required=True, help="Unique device code/identifier")
+    parser.add_argument("--device-name", required=True, help="Human-readable device name")
+    parser.add_argument("--device-code", required=True, help="Unique device code")
 
     args = parser.parse_args()
 
