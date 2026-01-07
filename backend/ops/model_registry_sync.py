@@ -18,45 +18,63 @@ python ops/model_registry_sync.py \
     --version 1.2.0 \
     --artifact-uri s3://wf-models/yolo/wf_v1.2.engine \
     --device-id <uuid>
+
+Run this dummy-
+python ops/model_registry_sync.py --model-name wf_test --model-type YOLO --version 0.0.1 --artifact-uri s3://dummy --device-id 6eb487b5-17c4-4f62-a613-84db27397621
 """
 
 import argparse
+import sys
+from pathlib import Path
+
+# -------------------------------------------------
+# Setup path for imports
+# -------------------------------------------------
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
 from common.db import get_cursor
 from common.time_utils import utc_now
 
 
 def register_and_assign_model(
+    activity_type_id: int,
     model_name: str,
-    model_type: str,
     version: str,
-    artifact_uri: str,
+    storage_path: str,
     device_id: str,
 ):
     with get_cursor() as cur:
-        # 1. Register model (idempotent)
+        # 1. Register model version (idempotent)
         cur.execute(
             """
-            INSERT INTO model (
+            INSERT INTO ml_model_version (
+                activity_type_id,
                 name,
-                model_type,
                 version,
-                artifact_uri,
+                storage_path,
+                is_active,
                 created_at
             )
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (name, version)
-            DO UPDATE SET artifact_uri = EXCLUDED.artifact_uri
+            VALUES (%s, %s, %s, %s, true, %s)
+            ON CONFLICT (activity_type_id, name, version)
+            DO UPDATE SET
+                storage_path = EXCLUDED.storage_path,
+                is_active = true
             RETURNING id
             """,
             (
+                activity_type_id,
                 model_name,
-                model_type,
                 version,
-                artifact_uri,
+                storage_path,
                 utc_now(),
             ),
         )
-        model_id = cur.fetchone()[0]
+
+        row = cur.fetchone()
+        model_id = row["id"]
 
         # 2. Assign model to device
         cur.execute(
@@ -82,24 +100,25 @@ def register_and_assign_model(
         )
 
     print("✅ Model registered and assigned")
-    print(f"Model ID  : {model_id}")
-    print(f"Device ID : {device_id}")
+    print(f"Model ID        : {model_id}")
+    print(f"Activity Type   : {activity_type_id}")
+    print(f"Device ID       : {device_id}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--activity-type-id", type=int, required=True)
     parser.add_argument("--model-name", required=True)
-    parser.add_argument("--model-type", required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--artifact-uri", required=True)
+    parser.add_argument("--storage-path", required=True)
     parser.add_argument("--device-id", required=True)
 
     args = parser.parse_args()
 
     register_and_assign_model(
+        activity_type_id=args.activity_type_id,
         model_name=args.model_name,
-        model_type=args.model_type,
         version=args.version,
-        artifact_uri=args.artifact_uri,
+        storage_path=args.storage_path,
         device_id=args.device_id,
     )

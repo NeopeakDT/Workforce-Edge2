@@ -8,6 +8,7 @@ Phase-aware wiring:
 - Phase 6: Alerts & Dashboard (DISABLED by default)
 
 This file must NEVER contain business logic.
+
 """
 
 # -------------------------------------------------
