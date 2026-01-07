@@ -8,7 +8,7 @@ Converts Jetson timestamps safely
 Prevents aggregation drift across farms/timezones
 Supabase stores timestamptz → UTC internally.
 """
-
+# datatime.now(timezone.utc),isoformat()  ---check this from jetson
 # common/time_utils.py
 
 from datetime import datetime, timezone

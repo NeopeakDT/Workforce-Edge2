@@ -58,17 +58,38 @@ Idempotency and uniqueness enforcement for IN_PROGRESS activities
 EARLY/LATE computation only in backend (never on edge)
 
 ---------------------------------------------------------------------------------------------
-06/1/2025-
+07/1/2025- device_provisioning.py
 
-PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend> python ops/device_provisioning.py --farm-id 912cbfb5-2644-4a01-8b7e-470f2a175a4e --device-name harmony-jetson-01 --device-code HARMONY_JETSON_01
+PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend> 
+python ops/device_provisioning.py --farm-id 9fa991d5-23ee-429f-8c7f-09b4acc3a415 --device-name harmony-jetson-01 --device-code HARMONY_JETSON_01
 >> 
 ✅ Device provisioned successfully
-Device ID      : 5a6bfdd5-f099-4c34-8a56-1d8f09255b12
+Device ID      : 6eb487b5-17c4-4f62-a613-84db27397621
 Device Name    : harmony-jetson-01
 Device Code    : HARMONY_JETSON_01
-API Key (SAVE) : 9d88605f0a7f495efc1fd089b62f634b1924f53954e831500a68000d3f817214
+API Key (SAVE) : 5c399d607fe890ea61d3405b0fc40d6b17a15dac6751d6c49e61fd78ce0992a8
 
 ⚠️  WARNING: Save this API key now!
    It will NOT be shown again.
    Store it securely on the Jetson device.
-PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend>
+-----------------------------------------------------------------------------------------------
+main.py
+
+# FastAPI is the code where you WRITE your backend logic.
+It lets you write things like:
+- “When someone calls /ingest/event, run this function”
+- “Accept JSON data”
+- “Return JSON response”
+
+# Uvicorn is the thing that actually RUNS the server.
+It:
+- Opens a network port (like 8000)
+- Listens for HTTP requests
+- Sends those requests to FastAPI
+- Sends responses back to the caller
+
+#To start backend server-
+cd backend
+uvicorn main:app --reload
+
+-----------------------------------------------------------
