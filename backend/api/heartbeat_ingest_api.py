@@ -1,119 +1,104 @@
 """
 Heartbeat Ingest API
 
-Accepts device heartbeat signals and writes health telemetry to edge_device_heartbeat table.
+Accepts device heartbeat signals and writes health telemetry to
+edge_device_heartbeat table.
 
-Responsibilities:
-    - Device authentication via X-DEVICE-KEY header
-    - Insert heartbeat record with status and metrics
-    - Update edge_device.last_seen_at timestamp
-    - Lightweight and cheap (high-frequency safe)
+PHASE 4 — TRUST BOUNDARY
 
-Architecture:
-    - Edge devices send periodic heartbeat signals (typically every 120 seconds)
-    - Backend stores heartbeat history for health monitoring
-    - Updates last_seen_at for device liveness tracking
-    - Designed for high-frequency calls without performance impact
+Rules enforced:
+- Authenticate device via hashed API key
+- Store timestamps in UTC
+- Insert heartbeat history
+- Update edge_device.last_seen_at
 """
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional
+from decimal import Decimal
 
 from common.db import get_cursor
 from common.time_utils import utc_now
+from common.device_auth import hash_device_key
 
 router = APIRouter(prefix="/ingest", tags=["heartbeat"])
 
 
-# -------------------- SCHEMA --------------------
+# -------------------------------------------------
+# Request Schema
+# -------------------------------------------------
 
 class HeartbeatIn(BaseModel):
-    status: str = "OK"                     # OK / DEGRADED / ERROR
-    metrics: Optional[Dict[str, Any]] = None   # CPU, RAM, FPS, temp, disk, etc.
+    cpu_temp_c: Optional[Decimal] = None
+    gpu_temp_c: Optional[Decimal] = None
+    disk_usage_pct: Optional[Decimal] = None
+    memory_usage_pct: Optional[Decimal] = None
+    notes: Optional[str] = None
 
 
-# -------------------- HELPERS --------------------
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
 
 def resolve_device(device_key: str):
-    """
-    Resolve device ID from device API key.
-    
-    Args:
-        device_key: Plain text device API key from X-DEVICE-KEY header
-        
-    Returns:
-        UUID: Device ID
-        
-    Raises:
-        HTTPException: 401 if device key is invalid or device is inactive
-    """
+    key_hash = hash_device_key(device_key)
+
     with get_cursor() as cur:
         cur.execute(
             """
             SELECT id
             FROM edge_device
-            WHERE api_key = %s
+            WHERE api_key_hash = %s
               AND is_active = true
             """,
-            (device_key,),
+            (key_hash,),
         )
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=401, detail="Invalid device key")
-        return row["id"]
+        return row[0]
 
 
-# -------------------- ENDPOINT --------------------
+# -------------------------------------------------
+# Endpoint
+# -------------------------------------------------
 
 @router.post("/heartbeat")
 def ingest_heartbeat(
     payload: HeartbeatIn,
     x_device_key: str = Header(..., alias="X-DEVICE-KEY"),
 ):
-    """
-    Ingest heartbeat signal from edge device.
-    
-    Process:
-    1. Authenticate device via X-DEVICE-KEY header
-    2. Insert heartbeat record into edge_device_heartbeat table
-    3. Update edge_device.last_seen_at timestamp
-    4. Return success
-    
-    This endpoint is designed to be lightweight and safe for high-frequency calls.
-    Edge devices typically call this every 120 seconds.
-    
-    Args:
-        payload: Heartbeat payload with status and optional metrics
-        x_device_key: Device API key from X-DEVICE-KEY header
-        
-    Returns:
-        dict: {"status": "alive"} on success
-    """
     device_id = resolve_device(x_device_key)
     now = utc_now()
 
     with get_cursor() as cur:
-        # Insert heartbeat
         cur.execute(
             """
             INSERT INTO edge_device_heartbeat (
                 device_id,
-                status,
-                metrics,
+                heartbeat_time,
+                cpu_temp_c,
+                gpu_temp_c,
+                disk_usage_pct,
+                memory_usage_pct,
+                notes,
                 created_at
             )
-            VALUES (%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 device_id,
-                payload.status,
-                payload.metrics,
+                now,
+                payload.cpu_temp_c,
+                payload.gpu_temp_c,
+                payload.disk_usage_pct,
+                payload.memory_usage_pct,
+                payload.notes,
                 now,
             ),
         )
 
-        # Update last_seen
         cur.execute(
             """
             UPDATE edge_device

@@ -93,3 +93,11 @@ cd backend
 uvicorn main:app --reload
 
 -----------------------------------------------------------
+# 8-1-2026- event_ingest_api.py
+testing-
+PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend> curl.exe -X POST http://127.0.0.1:8000/api/v1/ingest/event `
+>>   -H "X-DEVICE-KEY: wf_test_device_key_001" `
+>>   -H "Content-Type: application/json" `
+>>   --data-binary "@event_ok.json"
+>> 
+{"status":"ok"}

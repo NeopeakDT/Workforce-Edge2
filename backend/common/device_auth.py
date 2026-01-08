@@ -31,6 +31,11 @@ def _hash_api_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
+def hash_device_key(device_key: str) -> str:
+    """Hash device API key using SHA-256 (public API)"""
+    return _hash_api_key(device_key)
+
+
 def resolve_device_from_headers(headers: Dict[str, str]) -> dict:
     """
     Resolve device identity from request headers.
