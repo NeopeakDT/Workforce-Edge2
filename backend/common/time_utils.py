@@ -13,6 +13,16 @@ Supabase stores timestamptz → UTC internally.
 
 from datetime import datetime, timezone
 import pytz
+from datetime import date, time, datetime
+
+def build_utc_from_local_date_time(
+    local_date: date,
+    local_time: time,
+    tz_name: str
+) -> datetime:
+    naive_local = datetime.combine(local_date, local_time)
+    return local_to_utc(naive_local, tz_name)
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)

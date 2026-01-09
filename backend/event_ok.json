@@ -1,0 +1,9 @@
+{
+  "camera_id": "31cd7e65-af3c-4531-9fd2-6aa4a233d0a4",
+  "activity_type": "MILKING",
+  "confidence": 0.9,
+  "frame_ts": "2026-01-08T06:00:00Z",
+  "objects": { "cow": [ { "id": 1 } ] },
+  "idempotency_key": "phase4-test-007"
+}
+

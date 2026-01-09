@@ -1,27 +1,34 @@
 """
-Heartbeat Ingest API
+Heartbeat Ingest API (Phase 4)
 
-Accepts device heartbeat signals and writes health telemetry to edge_device_heartbeat table.
+Accepts periodic health pings from Jetson devices.
 
 Responsibilities:
-    - Device authentication via X-DEVICE-KEY header
-    - Insert heartbeat record with status and metrics
-    - Update edge_device.last_seen_at timestamp
-    - Lightweight and cheap (high-frequency safe)
+- Authenticate device via X-DEVICE-KEY
+- Insert heartbeat telemetry (append-only)
+- Update edge_device.last_seen_at
+- Enforce UTC timestamps
+- Lightweight & high-frequency safe
 
-Architecture:
-    - Edge devices send periodic heartbeat signals (typically every 120 seconds)
-    - Backend stores heartbeat history for health monitoring
-    - Updates last_seen_at for device liveness tracking
-    - Designed for high-frequency calls without performance impact
+NO aggregation
+NO alerting
+NO scheduling
+
+# Run this below in terminal
+curl.exe -X POST http://127.0.0.1:8000/api/v1/ingest/heartbeat `
+  -H "X-DEVICE-KEY: wf_test_device_key_001" `
+  -H "Content-Type: application/json" `
+  --data-binary "@heartbeat.json"
+
 """
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field
+from typing import Optional
 
 from common.db import get_cursor
 from common.time_utils import utc_now
+from common.device_auth import resolve_device_from_headers, DeviceAuthError
 
 router = APIRouter(prefix="/ingest", tags=["heartbeat"])
 
@@ -29,39 +36,11 @@ router = APIRouter(prefix="/ingest", tags=["heartbeat"])
 # -------------------- SCHEMA --------------------
 
 class HeartbeatIn(BaseModel):
-    status: str = "OK"                     # OK / DEGRADED / ERROR
-    metrics: Optional[Dict[str, Any]] = None   # CPU, RAM, FPS, temp, disk, etc.
-
-
-# -------------------- HELPERS --------------------
-
-def resolve_device(device_key: str):
-    """
-    Resolve device ID from device API key.
-    
-    Args:
-        device_key: Plain text device API key from X-DEVICE-KEY header
-        
-    Returns:
-        UUID: Device ID
-        
-    Raises:
-        HTTPException: 401 if device key is invalid or device is inactive
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT id
-            FROM edge_device
-            WHERE api_key = %s
-              AND is_active = true
-            """,
-            (device_key,),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=401, detail="Invalid device key")
-        return row["id"]
+    cpu_temp_c: Optional[float] = Field(default=None, ge=0)
+    gpu_temp_c: Optional[float] = Field(default=None, ge=0)
+    disk_usage_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    memory_usage_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    notes: Optional[str] = None
 
 
 # -------------------- ENDPOINT --------------------
@@ -72,25 +51,22 @@ def ingest_heartbeat(
     x_device_key: str = Header(..., alias="X-DEVICE-KEY"),
 ):
     """
-    Ingest heartbeat signal from edge device.
-    
-    Process:
-    1. Authenticate device via X-DEVICE-KEY header
-    2. Insert heartbeat record into edge_device_heartbeat table
-    3. Update edge_device.last_seen_at timestamp
-    4. Return success
-    
-    This endpoint is designed to be lightweight and safe for high-frequency calls.
-    Edge devices typically call this every 120 seconds.
-    
-    Args:
-        payload: Heartbeat payload with status and optional metrics
-        x_device_key: Device API key from X-DEVICE-KEY header
-        
-    Returns:
-        dict: {"status": "alive"} on success
+    Ingest heartbeat from Jetson device.
+
+    Flow:
+    1. Authenticate device
+    2. Insert heartbeat record
+    3. Update last_seen_at
     """
-    device_id = resolve_device(x_device_key)
+
+    try:
+        device_ctx = resolve_device_from_headers(
+            {"X-DEVICE-KEY": x_device_key}
+        )
+    except DeviceAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    device_id = device_ctx["device_id"]
     now = utc_now()
 
     with get_cursor() as cur:
@@ -99,28 +75,36 @@ def ingest_heartbeat(
             """
             INSERT INTO edge_device_heartbeat (
                 device_id,
-                status,
-                metrics,
+                heartbeat_time,
+                cpu_temp_c,
+                gpu_temp_c,
+                disk_usage_pct,
+                memory_usage_pct,
+                notes,
                 created_at
             )
-            VALUES (%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
-                device_id,
-                payload.status,
-                payload.metrics,
+                str(device_id),
+                now,
+                payload.cpu_temp_c,
+                payload.gpu_temp_c,
+                payload.disk_usage_pct,
+                payload.memory_usage_pct,
+                payload.notes,
                 now,
             ),
         )
 
-        # Update last_seen
+        # Update device liveness
         cur.execute(
             """
             UPDATE edge_device
             SET last_seen_at = %s
             WHERE id = %s
             """,
-            (now, device_id),
+            (now, str(device_id)),
         )
 
     return {"status": "alive"}

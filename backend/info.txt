@@ -57,7 +57,7 @@ Timezone-safe logic with UTC storage and conversion
 Idempotency and uniqueness enforcement for IN_PROGRESS activities
 EARLY/LATE computation only in backend (never on edge)
 
----------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 07/1/2025- device_provisioning.py
 
 PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend> 
@@ -93,3 +93,12 @@ cd backend
 uvicorn main:app --reload
 
 -----------------------------------------------------------
+# 8-1-2026- event_ingest_api.py
+testing-
+PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend> curl.exe -X POST http://127.0.0.1:8000/api/v1/ingest/event `
+>>   -H "X-DEVICE-KEY: wf_test_device_key_001" `
+>>   -H "Content-Type: application/json" `
+>>   --data-binary "@event_ok.json"
+>> 
+{"status":"ok"}
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
