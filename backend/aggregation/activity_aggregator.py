@@ -1,254 +1,114 @@
 """
-CORE ACTIVITY AGGREGATOR
+PHASE 5 — STEP 1 (READ-ONLY DRY RUN)
 
-Transforms raw detection events into ground-truth activity instances.
+Purpose:
+- Validate farm-local activity_date computation
+- Validate grouping of detection events into logical activities
+- Observe multi-camera behavior
+- Verify midnight-boundary correctness
 
-Key guarantees:
-    - Deterministic: Same events produce same results
-    - Idempotent: Safe to run multiple times
-    - Single IN_PROGRESS per (farm, activity): Enforces uniqueness
-    - Buffer-based defragmentation: Handles gaps in detection stream
-
-Architecture:
-    - Processes unprocessed detection events from activity_detection_event table
-    - Creates or updates activity_instance records
-    - Auto-closes stale activities after inactivity period
-    - Single source of truth for live and completed activities
-
-Process Flow:
-    1. Fetch pending events (processed_at IS NULL)
-    2. For each event:
-       - Filter by confidence threshold
-       - Check for existing IN_PROGRESS activity
-       - Start new activity or update existing
-       - Mark event as processed
-    3. Close stale activities (no events within buffer period)
+STRICT RULES:
+- NO inserts
+- NO updates
+- NO processed_at changes
+- NO activity_instance usage
+- NO schedule logic
 """
 
-from datetime import timedelta
 
+from pathlib import Path
+import sys  
+
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from collections import defaultdict
 from common.db import get_cursor
-from common.time_utils import utc_now
 
-# ---------------- CONFIG ----------------
-
-ACTIVITY_END_BUFFER_SEC = 120   # inactivity buffer
-CONFIDENCE_MIN = 0.5
-
-# ---------------------------------------
-
-def fetch_pending_events(limit=500):
+def dry_run_grouping(limit=500):
     """
-    Fetch unprocessed detection events.
-    
-    Args:
-        limit: Maximum number of events to fetch
-        
-    Returns:
-        list: List of event records (id, farm_id, activity_type, event_time, confidence)
+    Read-only inspection of detection events grouped by:
+    (farm_id, activity_type, activity_date)
+
+    activity_date MUST be computed as:
+    (event_time AT TIME ZONE farm.timezone)::date
     """
+
     with get_cursor() as cur:
         cur.execute(
             """
-            SELECT id, farm_id, activity_type, event_time, confidence
-            FROM activity_detection_event
-            WHERE processed_at IS NULL
-            ORDER BY event_time
+            SELECT
+                e.id AS event_id,
+                e.event_time,                     -- UTC timestamptz
+                at.code AS activity_type,         -- human-readable activity
+                e.camera_id,
+                f.id AS farm_id,
+                f.timezone,
+                (e.event_time AT TIME ZONE f.timezone)::date AS activity_date
+            FROM activity_detection_event e
+            JOIN activity_type at ON at.id = e.activity_type_id
+            JOIN edge_device d ON d.id = e.device_id
+            JOIN farm f ON f.id = d.farm_id
+            ORDER BY e.event_time
             LIMIT %s
             """,
             (limit,),
         )
-        return cur.fetchall()
+        rows = cur.fetchall()
 
 
-def mark_event_processed(event_id):
-    """
-    Mark an event as processed by setting processed_at timestamp.
-    
-    Args:
-        event_id: UUID of the event to mark as processed
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE activity_detection_event
-            SET processed_at = %s
-            WHERE id = %s
-            """,
-            (utc_now(), event_id),
-        )
+    # ------------------------------
+    # Grouping (pure in-memory)
+    # ------------------------------
+    buckets = defaultdict(list)
 
-
-def get_active_instance(farm_id, activity_type):
-    """
-    Get the active (IN_PROGRESS) activity instance for a farm and activity type.
-    
-    Args:
-        farm_id: UUID of the farm
-        activity_type: Type of activity (e.g., "SCRAPING", "FEEDING")
-        
-    Returns:
-        dict or None: Active instance record (id, started_at, confidence) or None
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, started_at, confidence
-            FROM activity_instance
-            WHERE farm_id = %s
-              AND activity_type = %s
-              AND status = 'IN_PROGRESS'
-            """,
-            (farm_id, activity_type),
-        )
-        return cur.fetchone()
-
-
-def start_activity(farm_id, activity_type, event_time, confidence):
-    """
-    Start a new activity instance.
-    
-    Uses ON CONFLICT DO NOTHING to enforce single IN_PROGRESS per (farm, activity).
-    Requires unique constraint on (farm_id, activity_type, status) where status='IN_PROGRESS'.
-    
-    Args:
-        farm_id: UUID of the farm
-        activity_type: Type of activity
-        event_time: Timestamp when activity started
-        confidence: Confidence score for the activity
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO activity_instance (
-                farm_id,
-                activity_type,
-                status,
-                started_at,
-                confidence
-            )
-            VALUES (%s, %s, 'IN_PROGRESS', %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            (farm_id, activity_type, event_time, confidence),
-        )
-
-
-def update_activity_confidence(instance_id, confidence):
-    """
-    Update activity confidence to the maximum of current and new confidence.
-    
-    Args:
-        instance_id: UUID of the activity instance
-        confidence: New confidence score
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE activity_instance
-            SET confidence = GREATEST(confidence, %s)
-            WHERE id = %s
-            """,
-            (confidence, instance_id),
-        )
-
-
-def end_activity(instance_id, end_time):
-    """
-    End an activity instance by setting status to COMPLETED.
-    
-    Args:
-        instance_id: UUID of the activity instance
-        end_time: Timestamp when activity ended
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE activity_instance
-            SET status = 'COMPLETED',
-                ended_at = %s
-            WHERE id = %s
-            """,
-            (end_time, instance_id),
-        )
-
-
-def close_stale_activities():
-    """
-    Auto-close IN_PROGRESS activities if no detections arrived
-    within ACTIVITY_END_BUFFER_SEC.
-    
-    This handles cases where detection stream stops without an explicit END event.
-    """
-    cutoff = utc_now() - timedelta(seconds=ACTIVITY_END_BUFFER_SEC)
-    
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT id
-            FROM activity_instance
-            WHERE status = 'IN_PROGRESS'
-              AND started_at < %s
-              AND id NOT IN (
-                SELECT DISTINCT activity_instance_id
-                FROM activity_detection_event
-                WHERE event_time >= %s
-              )
-            """,
-            (cutoff, cutoff),
-        )
-        stale = cur.fetchall()
-        
-        for (instance_id,) in stale:
-            end_activity(instance_id, utc_now())
-
-
-def process_events():
-    """
-    Main processing function.
-    
-    Processes all pending detection events and manages activity lifecycle:
-    1. Fetches unprocessed events
-    2. For each event:
-       - Filters by confidence threshold
-       - Starts new activity or updates existing
-       - Marks event as processed
-    3. Closes stale activities
-    
-    This function is idempotent and can be called repeatedly safely.
-    """
-    events = fetch_pending_events()
-    
-    for event in events:
+    for row in rows:
         (
             event_id,
-            farm_id,
-            activity_type,
             event_time,
-            confidence,
-        ) = event
-        
-        if confidence < CONFIDENCE_MIN:
-            mark_event_processed(event_id)
-            continue
-        
-        active = get_active_instance(farm_id, activity_type)
-        
-        if not active:
-            start_activity(
-                farm_id=farm_id,
-                activity_type=activity_type,
-                event_time=event_time,
-                confidence=confidence,
+            activity_type,
+            camera_id,
+            farm_id,
+            timezone,
+            activity_date,
+        ) = row
+
+        key = (farm_id, activity_type, activity_date)
+        buckets[key].append(
+            {
+                "event_id": event_id,
+                "event_time": event_time,
+                "camera_id": camera_id,
+                "timezone": timezone,
+            }
+        )
+
+    # ------------------------------
+    # Logging / Observation
+    # ------------------------------
+    for (farm_id, activity_type, activity_date), events in buckets.items():
+        event_times = [e["event_time"] for e in events]
+        cameras = sorted({e["camera_id"] for e in events})
+        timezone = events[0]["timezone"]
+
+        print(
+            f"\n[FARM={farm_id}]"
+            f"[ACTIVITY={activity_type}]"
+            f"[DATE={activity_date}]"
+            f"[TZ={timezone}]"
+        )
+        print(f"  Cameras involved   : {cameras}")
+        print(f"  Event count        : {len(events)}")
+        print(f"  First event (UTC)  : {min(event_times)}")
+        print(f"  Last event  (UTC)  : {max(event_times)}")
+
+        # Optional: print individual events for deep inspection
+        for e in events:
+            print(
+                f"    - {e['event_time']} | camera={e['camera_id']}"
             )
-        else:
-            instance_id, _, _ = active
-            update_activity_confidence(instance_id, confidence)
-        
-        mark_event_processed(event_id)
-    
-    close_stale_activities()
 
 
 if __name__ == "__main__":
-    process_events()
+    dry_run_grouping()
