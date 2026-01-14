@@ -1,9 +1,12 @@
 {
-  "camera_id": "31cd7e65-af3c-4531-9fd2-6aa4a233d0a4",
-  "activity_type": "MILKING",
-  "confidence": 0.9,
-  "frame_ts": "2026-01-08T06:00:00Z",
-  "objects": { "cow": [ { "id": 1 } ] },
-  "idempotency_key": "phase4-test-007"
+  "camera_id": "36a0e13a-b9eb-459c-9feb-e41a7616244a",
+  "activity_type": "FEEDING",
+  "confidence": 0.8,
+  "event_type": "END_CANDIDATE",
+  "frame_ts": "2026-01-08T05:55:55Z",
+  "objects": {
+    "tractor": [{ "id": 1 }],
+    "person": [{ "id": 2 }]
+  },
+  "idempotency_key": "phase4-test-117"
 }
-

@@ -12,6 +12,12 @@ Rules enforced:
 - Ignore any farm_id from edge
 - Resolve farm via device_id
 - Insert-only (no aggregation, no schedules)
+
+Test:
+curl.exe -X POST http://127.0.0.1:8000/api/v1/ingest/event `
+  -H "X-DEVICE-KEY: wf_test_device_key_001" `
+  -H "Content-Type: application/json" `
+  --data-binary "@event_ok.json"
 """
 
 from fastapi import APIRouter, Header, HTTPException
@@ -19,13 +25,13 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from uuid import UUID
 from datetime import datetime, timezone
-from psycopg2.extras import Json
 
+from psycopg2.extras import Json
 
 from common.db import get_cursor
 from common.idempotency import is_duplicate, mark_processed
 from common.time_utils import utc_now
-from common.device_auth import hash_device_key
+from common.device_auth import resolve_device_from_headers, DeviceAuthError
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
 
@@ -37,8 +43,10 @@ router = APIRouter(prefix="/ingest", tags=["ingestion"])
 class DetectionEventIn(BaseModel):
     camera_id: UUID
     activity_type: str
+    event_type: str              # detection_event_type enum
     confidence: float = Field(ge=0.0, le=1.0)
     frame_ts: datetime
+
     objects: Dict[str, Any]
     zones: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -62,35 +70,6 @@ def validate_utc_timestamp(ts: datetime):
         )
 
 
-def resolve_device(device_key: str):
-    """
-    Resolve device_id and farm_id from plaintext device API key.
-    """
-
-    import hashlib
-
-    api_key_hash = hashlib.sha256(device_key.encode()).hexdigest()
-
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, farm_id
-            FROM edge_device
-            WHERE api_key_hash = %s
-              AND is_active = true
-            """,
-            (api_key_hash,),
-        )
-
-        row = cur.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=401, detail="Invalid device key")
-
-        return row["id"], row["farm_id"]
-
-
-
 def resolve_activity_type_id(activity_type: str) -> int:
     with get_cursor() as cur:
         cur.execute(
@@ -101,18 +80,36 @@ def resolve_activity_type_id(activity_type: str) -> int:
             """,
             (activity_type,),
         )
-
         row = cur.fetchone()
-
         if not row:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown activity_type: {activity_type}"
             )
-
         return row["id"]
 
 
+def validate_detection_event_type(event_type: str) -> str:
+    """
+    Validate against DB enum detection_event_type.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT enumlabel
+            FROM pg_enum
+            WHERE enumtypid = 'detection_event_type'::regtype
+              AND enumlabel = %s
+            """,
+            (event_type,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid detection event_type: {event_type}"
+            )
+    return event_type
 
 
 # -------------------------------------------------
@@ -124,27 +121,38 @@ def ingest_event(
     payload: DetectionEventIn,
     x_device_key: str = Header(..., alias="X-DEVICE-KEY"),
 ):
-    # Device auth
-    device_id, farm_id = resolve_device(x_device_key)
+    # ---------------- Device authentication ----------------
+    try:
+        device_ctx = resolve_device_from_headers(
+            {"X-DEVICE-KEY": x_device_key}
+        )
+    except DeviceAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
-    # UTC enforcement
+    device_id = device_ctx["device_id"]
+    farm_id = device_ctx["farm_id"]
+
+    # ---------------- UTC enforcement ----------------
     validate_utc_timestamp(payload.frame_ts)
 
-    # Idempotency
+    # ---------------- Idempotency ----------------
     if payload.idempotency_key:
         if is_duplicate(payload.idempotency_key):
             return {"status": "duplicate_ignored"}
         mark_processed(payload.idempotency_key)
 
+    # ---------------- Reference resolution ----------------
     activity_type_id = resolve_activity_type_id(payload.activity_type)
+    validated_event_type = validate_detection_event_type(payload.event_type)
 
+    # ---------------- Payload ----------------
     event_payload = Json({
-    "objects": payload.objects,
-    "zones": payload.zones,
-    "metadata": payload.metadata,
-})
+        "objects": payload.objects,
+        "zones": payload.zones,
+        "metadata": payload.metadata,
+    })
 
-
+    # ---------------- Insert-only write ----------------
     with get_cursor() as cur:
         cur.execute(
             """
@@ -162,17 +170,16 @@ def ingest_event(
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
-            str(farm_id),
-            str(device_id),
-            str(payload.camera_id),
-            activity_type_id,
-            'START_CANDIDATE',
-            payload.frame_ts,
-            payload.confidence,
-            event_payload,
-            utc_now(),
-        )
-
+                str(farm_id),
+                str(device_id),
+                str(payload.camera_id),
+                activity_type_id,
+                validated_event_type,
+                payload.frame_ts,
+                payload.confidence,
+                event_payload,
+                utc_now(),
+            ),
         )
 
     return {"status": "ok"}
