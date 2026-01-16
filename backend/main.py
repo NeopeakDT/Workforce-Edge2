@@ -4,11 +4,10 @@ Workforce Management Backend
 
 Phase-aware wiring:
 - Phase 4: Ingestion APIs (ENABLED)
-- Phase 5: Aggregation jobs (DISABLED by default)
-- Phase 6: Alerts & Dashboard (DISABLED by default)
+- Phase 5: Aggregation jobs (OUTSIDE HTTP)
+- Phase 6: Dashboard APIs (READ-ONLY, OPTIONAL)
 
 This file must NEVER contain business logic.
-
 """
 
 # -------------------------------------------------
@@ -24,9 +23,7 @@ from fastapi import FastAPI
 # Phase Flags (explicit & safe)
 # -------------------------------------------------
 ENABLE_INGEST_APIS = True          # Phase 4
-ENABLE_AGGREGATION_JOBS = False    # Phase 5
-ENABLE_ALERT_APIS = False          # Phase 6
-ENABLE_DASHBOARD_APIS = False      # Phase 6
+ENABLE_DASHBOARD_APIS = True       # Phase 6 (read-only)
 ENABLE_ADMIN_APIS = False          # Optional
 
 # -------------------------------------------------
@@ -35,7 +32,7 @@ ENABLE_ADMIN_APIS = False          # Optional
 app = FastAPI(
     title="Workforce Management Backend",
     version="1.0.0",
-    docs_url="/docs",        # can be disabled later
+    docs_url="/docs",
     redoc_url="/redoc",
 )
 
@@ -69,41 +66,24 @@ if ENABLE_INGEST_APIS:
     )
 
 # -------------------------------------------------
-# Phase 5 — Aggregation (Background / Cron Jobs)
+# Phase 5 — Aggregation (INTENTIONALLY NOT HTTP)
 # -------------------------------------------------
-if ENABLE_AGGREGATION_JOBS:
-    """
-    IMPORTANT:
-    Aggregation is NOT an API.
-    It should be triggered via:
-    - cron
-    - background worker
-    - CLI
-    DO NOT expose as HTTP unless explicitly needed.
-    """
-
-    # Example (NOT enabled yet):
-    # from aggregation.activity_aggregator import run_aggregator
-    # from aggregation.missed_activity_cron import run_missed_cron
-    pass
+"""
+Aggregation is triggered via:
+- cron
+- background worker
+- CLI
+NEVER exposed via HTTP.
+"""
 
 # -------------------------------------------------
-# Phase 6 — Alerts APIs
-# -------------------------------------------------
-if ENABLE_ALERT_APIS:
-    from alerts.alert_evaluator import router as alert_router
-
-    app.include_router(
-        alert_router,
-        prefix="/api/v1/alerts",
-        tags=["alerts"],
-    )
-
-# -------------------------------------------------
-# Phase 6 — Dashboard APIs (Read-only)
+# Phase 6 — Dashboard APIs (READ-ONLY)
 # -------------------------------------------------
 if ENABLE_DASHBOARD_APIS:
-    from dashboard.dashboard_query_service import router as dashboard_router
+    # NOTE:
+    # dashboard_query_service.py is NOT a router.
+    # Only enable this if you create dashboard_api.py
+    from dashboard.dashboard_api import router as dashboard_router
 
     app.include_router(
         dashboard_router,

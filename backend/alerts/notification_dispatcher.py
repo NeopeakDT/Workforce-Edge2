@@ -1,119 +1,161 @@
 """
-Notification Dispatcher
+STEP 6.2 — Notification Dispatcher (Enum-safe)
 
-Reads unresolved alerts and delivers them.
-Delivery channels are pluggable.
+Reads existing alerts and delivers them via configured channels.
 
-Current:
-- APP (dashboard notification)
+No alert creation.
 
-Future:
-- EMAIL
-- SMS
-- WhatsApp
-- Slack
-
-Alert → Delivery: This does not decide alerts.
-It only delivers unresolved alerts via configured channels.
-
-Design:
-- Reads alert_log for undelivered alerts
-- Delivers via configured channels
-- Marks alerts as delivered
-- Pluggable channel architecture
+No activity evaluation.
 """
 
 from common.db import get_cursor
 from common.time_utils import utc_now
+from psycopg2.extras import Json
+from psycopg2.extensions import register_adapter
+import psycopg2.extensions as ext
 
+# -------------------------------------------------
+# Fetch alerts pending delivery (enum-correct)
+# -------------------------------------------------
 
 def fetch_pending_alerts(limit=50):
     """
-    Fetch unresolved alerts that haven't been delivered yet.
-    
-    Args:
-        limit: Maximum number of alerts to fetch
-        
-    Returns:
-        list: List of alert records
+    Fetch alerts that are visible (SENT) but not yet dispatched to channels.
     """
     with get_cursor() as cur:
         cur.execute(
             """
-            SELECT *
-            FROM alert_log
-            WHERE resolved_at IS NULL
-              AND delivered_at IS NULL
-            ORDER BY created_at
+            SELECT
+                al.id              AS alert_id,
+                al.farm_id,
+                al.alert_rule_id,
+                al.activity_instance_id,
+
+                ar.name            AS rule_name,
+                ar.channel         AS rule_channels,
+                ar.severity        AS rule_severity,
+
+                ai.activity_type_id,
+                ai.status          AS activity_status,
+                ai.started_offset_min,
+                ai.activity_schedule_id
+
+            FROM alert_log al
+            JOIN alert_rule ar ON ar.id = al.alert_rule_id
+            JOIN activity_instance ai ON ai.id = al.activity_instance_id
+
+            WHERE al.status = 'SENT'
+              AND al.channel IS NULL
+            ORDER BY al.triggered_at
             LIMIT %s
             """,
             (limit,),
         )
         return cur.fetchall()
 
+# -------------------------------------------------
+# Message & details builders
+# -------------------------------------------------
 
-def mark_delivered(alert_id):
+def build_message(rule_name: str, activity_status: str) -> str:
     """
-    Mark an alert as delivered by setting delivered_at timestamp.
-    
-    Args:
-        alert_id: UUID of the alert to mark as delivered
+    Human-readable alert message.
     """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE alert_log
-            SET delivered_at = %s
-            WHERE id = %s
-            """,
-            (utc_now(), alert_id),
-        )
+    return f"{rule_name} ({activity_status})"
 
-
-# ---------------- DELIVERY CHANNELS ----------------
-
-def deliver_app(alert):
+def build_details(row: dict) -> dict:
     """
-    App delivery is implicit (dashboard polling).
-    Just mark delivered.
-    
-    Args:
-        alert: Alert record dictionary
+    Structured metadata for debugging / UI drilldown.
     """
-    mark_delivered(alert["id"])
+    return {
+        "activity_type_id": row["activity_type_id"],
+        "activity_status": row["activity_status"],
+        "started_offset_min": row["started_offset_min"],
+        "activity_schedule_id": row["activity_schedule_id"],
+    }
 
+# -------------------------------------------------
+# Channel delivery stubs (V1)
+# -------------------------------------------------
 
-def deliver_email(alert):
-    """
-    Placeholder for email delivery.
-    
-    TODO: Integrate with SES / SendGrid / SMTP
-    
-    Args:
-        alert: Alert record dictionary
-    """
-    # integrate SES / SendGrid later
-    mark_delivered(alert["id"])
+def deliver_email(alert_id: str, message: str) -> bool:
+    print(f"[EMAIL] alert_id={alert_id} | {message}")
+    return True
 
+def deliver_sms(alert_id: str, message: str) -> bool:
+    print(f"[SMS] alert_id={alert_id} | {message}")
+    return True
 
-# ---------------- MAIN ----------------
+def deliver_whatsapp(alert_id: str, message: str) -> bool:
+    print(f"[WHATSAPP] alert_id={alert_id} | {message}")
+    return True
+
+# -------------------------------------------------
+# Dispatcher main
+# -------------------------------------------------
 
 def dispatch_notifications():
-    """
-    Main dispatch function.
-    
-    Fetches pending alerts and delivers them via configured channels.
-    Currently only supports APP delivery (dashboard notifications).
-    
-    Process:
-    1. Fetch unresolved, undelivered alerts
-    2. Deliver via APP channel (default)
-    3. Mark as delivered
-    
-    Future: Add support for EMAIL, SMS, WhatsApp, Slack channels.
-    """
     alerts = fetch_pending_alerts()
 
-    for alert in alerts:
-        # Default: APP
-        deliver_app(alert)
+    if not alerts:
+        return
+
+    with get_cursor() as cur:
+        for row in alerts:
+            message = build_message(
+                row["rule_name"],
+                row["activity_status"],
+            )
+
+            details = build_details(row)
+
+            rule_channels_raw = row["rule_channels"]
+            
+            # Handle different formats from database
+            if isinstance(rule_channels_raw, list):
+                channels = rule_channels_raw
+            elif isinstance(rule_channels_raw, str):
+                # Parse PostgreSQL array string format like "{EMAIL,SMS}" or "{EMAIL}"
+                if rule_channels_raw.startswith("{") and rule_channels_raw.endswith("}"):
+                    # Remove braces and split by comma
+                    inner = rule_channels_raw[1:-1]
+                    channels = [ch.strip().strip('"') for ch in inner.split(",")] if inner else ["APP"]
+                else:
+                    channels = [rule_channels_raw] if rule_channels_raw else ["APP"]
+            else:
+                channels = ["APP"]
+
+            delivery_ok = True
+
+            for ch in channels:
+                if ch == "EMAIL":
+                    delivery_ok &= deliver_email(row["alert_id"], message)
+                elif ch == "SMS":
+                    delivery_ok &= deliver_sms(row["alert_id"], message)
+                elif ch == "WHATSAPP":
+                    delivery_ok &= deliver_whatsapp(row["alert_id"], message)
+                elif ch == "APP":
+                    # APP is already visible — no-op
+                    pass
+
+            # Store first channel (column is single enum, not array)
+            channel_value = channels[0] if channels else "APP"
+            
+            cur.execute(
+                """
+                UPDATE alert_log
+                SET
+                    channel = %s,
+                    message = %s,
+                    details = %s,
+                    status = %s
+                WHERE id = %s
+                """,
+                (
+                    channel_value,
+                    message,
+                    Json(details),
+                    "SENT" if delivery_ok else "FAILED",
+                    row["alert_id"],
+                ),
+            )

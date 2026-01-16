@@ -1,207 +1,109 @@
 """
-Alert Evaluator
+STEP 6.1 — Alert Evaluation Engine (ACTIVITY ONLY)
 
-Evaluates alert rules based on:
-- activity_instance status transitions
-- MISSED activities
-- edge device offline detection
-
-Writes:
-- alert_log
-
-Triggered by:
-- activity_aggregator.py
-- missed_activity_cron.py
-- device_health_monitor.py
-
-Design Principles:
-- Event-driven (called by Phase 5 scripts or cron)
-- Idempotent (no duplicate alerts)
-- Deterministic rules only (no ML here)
-
-Truth → Reaction: Evaluates alert conditions whenever:
-- activity status changes
-- MISSED activity is created
-- device goes offline
+Evaluates alert rules against FINAL activity truth.
 """
 
 from common.db import get_cursor
 from common.time_utils import utc_now
 
-# ---------------- CONFIG ----------------
 
-DEVICE_OFFLINE_THRESHOLD_MIN = 10
-
-# --------------------------------------
-
-
-def create_alert(
-    farm_id,
-    alert_type,
-    severity,
-    message,
-    ref_table=None,
-    ref_id=None,
-):
+def _condition_matches(condition: dict, activity: dict) -> bool:
     """
-    Idempotent alert insert.
-    Prevents duplicate active alerts for same ref.
-    
-    Args:
-        farm_id: UUID of the farm
-        alert_type: Type of alert (e.g., "ACTIVITY_MISSED", "DEVICE_OFFLINE")
-        severity: Alert severity ("INFO", "WARNING", "CRITICAL")
-        message: Human-readable alert message
-        ref_table: Reference table name (e.g., "activity_instance", "edge_device")
-        ref_id: Reference record ID
+    Deterministic rule evaluation.
     """
+    if not condition:
+        return False  # empty condition is invalid
+
+    if "status" in condition:
+        if activity["status"] != condition["status"]:
+            return False
+
+    if "started_offset_min_gt" in condition:
+        if activity["started_offset_min"] is None:
+            return False
+        if activity["started_offset_min"] <= condition["started_offset_min_gt"]:
+            return False
+
+    return True
+
+
+def evaluate_activity_alerts(activity_instance_id: str):
+    """
+    STEP 6.1 entry point
+    """
+
     with get_cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO alert_log (
-                farm_id,
-                alert_type,
-                severity,
-                message,
-                ref_table,
-                ref_id,
-                created_at
-            )
-            SELECT %s, %s, %s, %s, %s, %s, %s
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM alert_log
-                WHERE farm_id = %s
-                  AND alert_type = %s
-                  AND ref_table IS NOT DISTINCT FROM %s
-                  AND ref_id IS NOT DISTINCT FROM %s
-                  AND resolved_at IS NULL
-            )
-            """,
-            (
-                farm_id,
-                alert_type,
-                severity,
-                message,
-                ref_table,
-                ref_id,
-                utc_now(),
-                farm_id,
-                alert_type,
-                ref_table,
-                ref_id,
-            ),
-        )
-
-
-# ---------------- ACTIVITY ALERTS ----------------
-
-def on_activity_status_change(activity_instance_id):
-    """
-    Triggered when activity status changes.
-    
-    Args:
-        activity_instance_id: UUID of the activity instance
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                ai.id,
-                ai.farm_id,
-                ai.activity_type,
-                ai.status
-            FROM activity_instance ai
-            WHERE ai.id = %s
-            """,
-            (activity_instance_id,),
-        )
-        row = cur.fetchone()
-
-    if not row:
-        return
-
-    if row["status"] == "COMPLETED":
-        create_alert(
-            farm_id=row["farm_id"],
-            alert_type="ACTIVITY_COMPLETED",
-            severity="INFO",
-            message=f"{row['activity_type']} completed",
-            ref_table="activity_instance",
-            ref_id=row["id"],
-        )
-
-
-def on_activity_missed(activity_instance_id):
-    """
-    Triggered on MISSED activity creation.
-    
-    Args:
-        activity_instance_id: UUID of the activity instance
-    """
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                ai.id,
-                ai.farm_id,
-                ai.activity_type,
-                ai.scheduled_start
-            FROM activity_instance ai
-            WHERE ai.id = %s
-              AND ai.status = 'MISSED'
-            """,
-            (activity_instance_id,),
-        )
-        row = cur.fetchone()
-
-    if not row:
-        return
-
-    create_alert(
-        farm_id=row["farm_id"],
-        alert_type="ACTIVITY_MISSED",
-        severity="CRITICAL",
-        message=f"{row['activity_type']} missed (scheduled at {row['scheduled_start']})",
-        ref_table="activity_instance",
-        ref_id=row["id"],
-    )
-
-
-# ---------------- DEVICE ALERTS ----------------
-
-def evaluate_device_health():
-    """
-    Periodic evaluation for offline devices.
-    
-    Checks for devices that haven't sent heartbeats within the threshold
-    and creates alerts for them.
-    """
-    with get_cursor() as cur:
+        # 1. Load activity_instance
         cur.execute(
             """
             SELECT
                 id,
                 farm_id,
-                device_name,
-                last_seen_at
-            FROM edge_device
-            WHERE is_active = true
-              AND (
-                last_seen_at IS NULL
-                OR last_seen_at < now() - interval '%s minutes'
-              )
+                activity_type_id,
+                activity_schedule_id,
+                status,
+                started_offset_min
+            FROM activity_instance
+            WHERE id = %s
             """,
-            (DEVICE_OFFLINE_THRESHOLD_MIN,),
+            (activity_instance_id,),
         )
-        rows = cur.fetchall()
+        activity = cur.fetchone()
 
-    for d in rows:
-        create_alert(
-            farm_id=d["farm_id"],
-            alert_type="DEVICE_OFFLINE",
-            severity="CRITICAL",
-            message=f"Device {d['device_name']} is offline",
-            ref_table="edge_device",
-            ref_id=d["id"],
+        if not activity:
+            print("No activity_instance found")
+            return
+
+        # 2. Load matching alert rules
+        cur.execute(
+            """
+            SELECT
+                id,
+                condition
+            FROM alert_rule
+            WHERE farm_id = %s
+              AND (activity_type_id IS NULL OR activity_type_id = %s)
+              AND (activity_schedule_id IS NULL OR activity_schedule_id = %s)
+              AND is_active = true
+            """,
+            (
+                activity["farm_id"],
+                activity["activity_type_id"],
+                activity["activity_schedule_id"],
+            ),
         )
+
+        rules = cur.fetchall()
+
+        for rule in rules:
+            if not _condition_matches(rule["condition"], activity):
+                continue
+
+            # 3. Idempotent insert
+            cur.execute(
+                """
+                INSERT INTO alert_log (
+                    farm_id,
+                    alert_rule_id,
+                    activity_instance_id,
+                    triggered_at,
+                    status
+                )
+                SELECT %s, %s, %s, %s, 'SENT'
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM alert_log
+                    WHERE alert_rule_id = %s
+                      AND activity_instance_id = %s
+                )
+                """,
+                (
+                    activity["farm_id"],
+                    rule["id"],
+                    activity["id"],
+                    utc_now(),
+                    rule["id"],
+                    activity["id"],
+                ),
+            )
