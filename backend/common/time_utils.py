@@ -28,6 +28,13 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 def to_utc(dt: datetime) -> datetime:
+    """
+    Convert datetime to UTC.
+    
+    ⚠️ WARNING: NOT for DB writes!
+    All timestamps written to DB must already be UTC.
+    This function is for display/logging purposes only.
+    """
     if dt.tzinfo is None:
         raise ValueError("Naive datetime not allowed")
     return dt.astimezone(timezone.utc)
@@ -40,5 +47,12 @@ def to_epoch_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 def local_to_utc(dt: datetime, tz_name: str) -> datetime:
+    """
+    Convert local datetime to UTC.
+    
+    ⚠️ WARNING: NOT for DB writes!
+    All timestamps written to DB must already be UTC.
+    This function is for display/logging purposes only.
+    """
     tz = pytz.timezone(tz_name)
     return tz.localize(dt).astimezone(timezone.utc)

@@ -1,9 +1,12 @@
 {
   "camera_id": "31cd7e65-af3c-4531-9fd2-6aa4a233d0a4",
-  "activity_type": "MILKING",
+  "activity_type": "SCRAPING",
   "confidence": 0.9,
-  "frame_ts": "2026-01-08T06:00:00Z",
-  "objects": { "cow": [ { "id": 1 } ] },
-  "idempotency_key": "phase4-test-007"
+  "event_type": "END_CANDIDATE",
+  "frame_ts": "2026-01-15T07:33:00Z",
+  "objects": {
+    "SCRAPPING_TOOL": [{ "id": 1 }],
+    "person": [{ "id": 1 }]
+  },
+  "idempotency_key": "test-scraping-ontime-end-008"
 }
-

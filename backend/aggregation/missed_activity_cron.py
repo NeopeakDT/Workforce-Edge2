@@ -1,110 +1,140 @@
+#!/usr/bin/env python3
 """
-MISSED ACTIVITY DETECTOR
+STEP-5b — MISSED Activity Detector (AUTHORITATIVE)
 
-Creates MISSED activity instances for scheduled activities that never produced a START event.
+Creates exactly ONE MISSED activity_instance per:
+- farm
+- activity_schedule
+- activity_date
 
-This is NOT inference — it is truth enforcement. It detects scheduled activities that never started
-by comparing activity_schedule records with activity_instance records.
+When:
+- Schedule window + late tolerance has fully passed
+- No activity_instance exists for that schedule/date
 
-Key Features:
-    - Detects scheduled activities that never started
-    - Creates MISSED activity instances for truth enforcement
-    - Uses grace period (10 minutes) after schedule end before marking as missed
-    - Idempotent: Safe to run multiple times
-
-Architecture:
-    - Reads activity_schedule table for past schedules
-    - Checks if corresponding activity_instance exists
-    - Creates MISSED status activity_instance if no match found
-    - Runs as background cron job (called from main.py)
-
-Process Flow:
-    1. Find schedules whose end_time has passed (with grace period)
-    2. Check if any activity_instance exists for that schedule window
-    3. If no instance found, create MISSED activity_instance
-    4. Uses ON CONFLICT DO NOTHING for idempotency
+This script is:
+- Idempotent
+- Safe to run repeatedly
+- Required for Phase-5 completeness
 """
 
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import sys
+
+# -------------------------------------------------
+# Bootstrap backend path
+# -------------------------------------------------
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 from common.db import get_cursor
 from common.time_utils import utc_now
 
-MISSED_GRACE_MIN = 10  # minutes after schedule end
 
+# -------------------------------------------------
+# MISSED activity detection
+# -------------------------------------------------
+def detect_missed_activities():
+    now_utc = utc_now()
+    activity_date = now_utc.date()
 
-def detect_missed():
-    """
-    Detect and create MISSED activity instances for scheduled activities that never started.
-    
-    Process:
-    1. Find schedules that ended more than MISSED_GRACE_MIN minutes ago
-    2. Check if any activity_instance exists within the schedule window
-    3. If no instance found, create a MISSED activity_instance
-    4. Uses ON CONFLICT DO NOTHING for idempotency
-    
-    This function is idempotent and can be called repeatedly safely.
-    """
-    now = utc_now()
-    cutoff = now - timedelta(minutes=MISSED_GRACE_MIN)
-    
     with get_cursor() as cur:
+        # 1. Load all active schedules
         cur.execute(
             """
-            SELECT s.farm_id, s.activity_type, s.start_time, s.end_time
+            SELECT
+                s.id AS schedule_id,
+                s.farm_id,
+                s.activity_type_id,
+                s.ideal_end_time,
+                s.tolerance_late_min
             FROM activity_schedule s
-            WHERE s.end_time < %s
-              AND NOT EXISTS (
-                SELECT 1
-                FROM activity_instance i
-                WHERE i.farm_id = s.farm_id
-                  AND i.activity_type = s.activity_type
-                  AND i.started_at BETWEEN s.start_time AND s.end_time
-              )
-            """,
-            (cutoff,),
+            WHERE s.is_active = true
+            """
         )
-        missed = cur.fetchall()
-        
-        for farm_id, activity_type, start_time, end_time in missed:
+
+        schedules = cur.fetchall()
+
+        for s in schedules:
+            schedule_id = s["schedule_id"]
+            farm_id = s["farm_id"]
+            activity_type_id = s["activity_type_id"]
+
+            # -------------------------------------------------
+            # Compute cutoff time (UTC)
+            # -------------------------------------------------
+            ideal_end_utc = datetime.combine(
+                activity_date,
+                s["ideal_end_time"],
+                tzinfo=timezone.utc,
+            )
+
+            late_cutoff_utc = ideal_end_utc + timedelta(
+                minutes=s["tolerance_late_min"]
+            )
+
+            # If window still open → skip
+            if now_utc <= late_cutoff_utc:
+                continue
+
+            # -------------------------------------------------
+            # INSERT MISSED (HARD GUARDED)
+            # -------------------------------------------------
             cur.execute(
                 """
                 INSERT INTO activity_instance (
                     farm_id,
-                    activity_type,
+                    activity_type_id,
+                    activity_schedule_id,
+                    activity_date,
                     status,
-                    started_at,
-                    ended_at
+                    source,
+                    created_at,
+                    updated_at
                 )
-                VALUES (%s, %s, 'MISSED', %s, %s)
-                ON CONFLICT DO NOTHING
+                SELECT
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    'MISSED',
+                    'SYSTEM',
+                    %s,
+                    %s
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM activity_instance ai
+                    WHERE ai.farm_id = %s
+                      AND ai.activity_schedule_id = %s
+                      AND ai.activity_date = %s
+                )
                 """,
-                (farm_id, activity_type, start_time, end_time),
+                (
+                    farm_id,
+                    activity_type_id,
+                    schedule_id,
+                    activity_date,
+                    now_utc,
+                    now_utc,
+                    farm_id,
+                    schedule_id,
+                    activity_date,
+                ),
             )
 
-
-async def run_missed_activity_check():
-    """
-    Async wrapper for detect_missed() to be used as a background task.
-    
-    This function is called periodically from main.py's lifespan context manager.
-    It runs detect_missed() in a loop with a delay between checks.
-    
-    Usage:
-        Called from main.py as a background task
-    """
-    import asyncio
-    
-    while True:
-        try:
-            detect_missed()
-            # Run every 5 minutes
-            await asyncio.sleep(300)
-        except Exception as e:
-            # Log error but continue running
-            print(f"Error in missed activity check: {e}")
-            await asyncio.sleep(60)  # Wait 1 minute before retry
+            if cur.rowcount > 0:
+                print(
+                    f"[MISSED CREATED]"
+                    f"[FARM={farm_id}]"
+                    f"[SCHEDULE={schedule_id}]"
+                    f"[ACTIVITY_TYPE={activity_type_id}]"
+                    f"[DATE={activity_date}]"
+                )
 
 
+# -------------------------------------------------
+# Runner
+# -------------------------------------------------
 if __name__ == "__main__":
-    detect_missed()
+    detect_missed_activities()
