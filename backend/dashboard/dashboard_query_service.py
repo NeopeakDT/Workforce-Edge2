@@ -1,55 +1,38 @@
 """
-Dashboard Query Service
+STEP 6.3 — Dashboard Query Service
 
 Read-only queries for UI dashboards.
-
-Reads:
-- activity_instance
-- alert_log
-- farm
-
-Rules:
-- NO detection tables (never read activity_detection_event)
-- NO inference (no computation logic)
-- NO writes (read-only)
-- Only serve aggregated truth
-
-This file is safe for direct API exposure.
+NO writes.
+NO inference.
+NO detection tables.
 """
 
 from common.db import get_cursor
 
 
-# ---------------- FARM OVERVIEW ----------------
+# -------------------------------------------------
+# Farm overview
+# -------------------------------------------------
 
-def get_farm_overview(farm_id):
+def get_farm_overview(farm_id: str):
     """
-    Get farm overview statistics.
-    
-    Returns:
-        - Farm information
-        - Count of active (IN_PROGRESS) activities
-        - Count of missed activities
-        - Count of active (unresolved) alerts
-    
-    Args:
-        farm_id: UUID of the farm
-        
-    Returns:
-        dict: Farm overview with activity and alert counts
+    High-level farm dashboard numbers.
     """
     with get_cursor() as cur:
         cur.execute(
             """
             SELECT
-                f.id,
-                f.name,
-                COUNT(ai.id) FILTER (WHERE ai.status = 'IN_PROGRESS') AS active_activities,
+                f.id AS farm_id,
+                f.name AS farm_name,
+
+                COUNT(ai.id) FILTER (WHERE ai.status = 'IN_PROGRESS') AS in_progress_activities,
                 COUNT(ai.id) FILTER (WHERE ai.status = 'MISSED') AS missed_activities,
-                COUNT(al.id) FILTER (WHERE al.resolved_at IS NULL) AS active_alerts
+                COUNT(al.id) FILTER (WHERE al.status = 'SENT') AS active_alerts
+
             FROM farm f
             LEFT JOIN activity_instance ai ON ai.farm_id = f.id
             LEFT JOIN alert_log al ON al.farm_id = f.id
+
             WHERE f.id = %s
             GROUP BY f.id
             """,
@@ -58,35 +41,68 @@ def get_farm_overview(farm_id):
         return cur.fetchone()
 
 
-# ---------------- ACTIVITY FEED ----------------
+# -------------------------------------------------
+# Activity lists
+# -------------------------------------------------
 
-def list_recent_activities(farm_id, limit=50):
+def list_today_activities(farm_id: str, activity_date):
     """
-    List recent activities for a farm.
-    
-    Returns activities ordered by start time (most recent first).
-    Includes scheduled activities that haven't started yet.
-    
-    Args:
-        farm_id: UUID of the farm
-        limit: Maximum number of activities to return
-        
-    Returns:
-        list: List of activity records
+    Activities for a given date (already computed in Phase 5).
     """
     with get_cursor() as cur:
         cur.execute(
             """
             SELECT
                 id,
-                activity_type,
+                activity_type_id,
                 status,
-                started_at,
-                ended_at,
-                confidence
+                actual_start_at,
+                actual_end_at,
+                started_offset_min,
+                ended_offset_min,
+                source
             FROM activity_instance
             WHERE farm_id = %s
-            ORDER BY COALESCE(started_at, scheduled_start) DESC
+              AND activity_date = %s
+            ORDER BY COALESCE(actual_start_at, created_at)
+            """,
+            (farm_id, activity_date),
+        )
+        return cur.fetchall()
+
+
+def list_in_progress_activities(farm_id: str):
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                activity_type_id,
+                actual_start_at,
+                status
+            FROM activity_instance
+            WHERE farm_id = %s
+              AND status = 'IN_PROGRESS'
+            ORDER BY actual_start_at
+            """,
+            (farm_id,),
+        )
+        return cur.fetchall()
+
+
+def list_missed_activities(farm_id: str, limit=20):
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                activity_type_id,
+                activity_date,
+                status
+            FROM activity_instance
+            WHERE farm_id = %s
+              AND status = 'MISSED'
+            ORDER BY activity_date DESC
             LIMIT %s
             """,
             (farm_id, limit),
@@ -94,34 +110,38 @@ def list_recent_activities(farm_id, limit=50):
         return cur.fetchall()
 
 
-# ---------------- ALERT FEED ----------------
+# -------------------------------------------------
+# Alerts
+# -------------------------------------------------
 
-def list_active_alerts(farm_id):
+def list_recent_alerts(farm_id: str, limit=20):
     """
-    List active (unresolved) alerts for a farm.
-    
-    Returns alerts ordered by creation time (most recent first).
-    
-    Args:
-        farm_id: UUID of the farm
-        
-    Returns:
-        list: List of active alert records
+    Recent alerts with context for dashboard.
     """
     with get_cursor() as cur:
         cur.execute(
             """
             SELECT
-                id,
-                alert_type,
-                severity,
-                message,
-                created_at
-            FROM alert_log
-            WHERE farm_id = %s
-              AND resolved_at IS NULL
-            ORDER BY created_at DESC
+                al.id,
+                al.triggered_at,
+                al.status AS alert_status,
+                al.message,
+                al.channel,
+
+                ar.severity,
+                ar.name AS rule_name,
+
+                ai.activity_type_id,
+                ai.status AS activity_status
+
+            FROM alert_log al
+            JOIN alert_rule ar ON ar.id = al.alert_rule_id
+            JOIN activity_instance ai ON ai.id = al.activity_instance_id
+
+            WHERE al.farm_id = %s
+            ORDER BY al.triggered_at DESC
+            LIMIT %s
             """,
-            (farm_id,),
+            (farm_id, limit),
         )
         return cur.fetchall()
