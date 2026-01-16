@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-STEP-4 + STEP-5 Activity Aggregator (AUTHORITATIVE)
+PHASE-5 — ACTIVITY AGGREGATOR (FINAL, TIMEZONE-SAFE)
 
+Responsibilities:
 STEP-4:
-- Finalize end time & duration using END_CANDIDATE
-- MUST NOT update status
+- Finalize END_CANDIDATE
+- Set actual_end_at, duration
+- DO NOT classify status
 
 STEP-5:
 - Bind activity_schedule
-- Compute offsets vs ideal window
-- Update status (ON_TIME / EARLY / LATE / MISSED)
+- Compute started_offset_min using FARM TIMEZONE
+- Classify EARLY / ON_TIME / LATE
 """
 
-from datetime import datetime, timezone, timedelta  
-
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
-# Add backend root to Python path
+# -------------------------------------------------------------------
+# Bootstrap
+# -------------------------------------------------------------------
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
@@ -25,10 +28,9 @@ if str(BACKEND_ROOT) not in sys.path:
 from common.db import get_cursor
 from common.time_utils import utc_now
 
-
-# ---------------------------------------------------------
-# STEP-4 — finalize ended activities (NO STATUS UPDATE)
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# STEP-4 — FINALIZE ENDED ACTIVITIES
+# -------------------------------------------------------------------
 def finalize_ended_activities():
     now = utc_now()
 
@@ -36,16 +38,16 @@ def finalize_ended_activities():
         cur.execute(
             """
             SELECT
-                ai.id,
+                ai.id AS activity_instance_id,
                 ai.actual_start_at,
-                MAX(ade.event_time) AS end_time
+                MAX(ade.event_time) AS actual_end_at
             FROM activity_instance ai
             JOIN activity_detection_event ade
-              ON ade.activity_type_id = ai.activity_type_id
-             AND ade.farm_id = ai.farm_id
-            WHERE ade.event_type = 'END_CANDIDATE'
+              ON ade.activity_instance_id = ai.id
+            WHERE ai.status = 'IN_PROGRESS'
+              AND ai.actual_start_at IS NOT NULL
               AND ai.actual_end_at IS NULL
-              AND ai.status = 'IN_PROGRESS'
+              AND ade.event_type = 'END_CANDIDATE'
             GROUP BY ai.id, ai.actual_start_at
             """
         )
@@ -53,9 +55,13 @@ def finalize_ended_activities():
         rows = cur.fetchall()
 
         for row in rows:
-            instance_id = row["id"]
+            instance_id = row["activity_instance_id"]
             start_at = row["actual_start_at"]
-            end_at = row["end_time"]
+            end_at = row["actual_end_at"]
+
+            # Guard against bad data
+            if end_at <= start_at:
+                continue
 
             duration_sec = int((end_at - start_at).total_seconds())
 
@@ -73,16 +79,14 @@ def finalize_ended_activities():
             )
 
             print(
-                f"[END FINALIZED]"
+                f"[FINALIZED]"
                 f"[INSTANCE={instance_id}]"
-                f"[END_AT={end_at}]"
                 f"[DURATION_SEC={duration_sec}]"
             )
 
-
-# ---------------------------------------------------------
-# STEP-5 — classify activity vs schedule (STATUS UPDATE)
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# STEP-5 — CLASSIFY COMPLETED ACTIVITIES (TIMEZONE SAFE)
+# -------------------------------------------------------------------
 def classify_completed_activities():
     now = utc_now()
 
@@ -94,8 +98,10 @@ def classify_completed_activities():
                 ai.farm_id,
                 ai.activity_type_id,
                 ai.activity_date,
-                ai.actual_start_at
+                ai.actual_start_at,
+                f.timezone AS farm_timezone
             FROM activity_instance ai
+            JOIN farm f ON f.id = ai.farm_id
             WHERE ai.status = 'IN_PROGRESS'
               AND ai.actual_end_at IS NOT NULL
             """
@@ -108,10 +114,12 @@ def classify_completed_activities():
             farm_id = ai["farm_id"]
             activity_type_id = ai["activity_type_id"]
             activity_date = ai["activity_date"]
-            actual_start = ai["actual_start_at"]
+            actual_start_at = ai["actual_start_at"]
+            farm_tz = ai["farm_timezone"]
 
-            day_of_week = activity_date.weekday()  # 0 = Monday
-
+            # ---------------------------------------------------------
+            # Find matching schedule (ONE PER SCHEDULE PER DAY)
+            # ---------------------------------------------------------
             cur.execute(
                 """
                 SELECT *
@@ -119,56 +127,87 @@ def classify_completed_activities():
                 WHERE farm_id = %s
                   AND activity_type_id = %s
                   AND is_active = true
-                  AND %s = ANY(days_of_week)
-                LIMIT 1
+                ORDER BY ideal_start_time
                 """,
-                (farm_id, activity_type_id, day_of_week),
+                (farm_id, activity_type_id),
             )
 
-            schedule = cur.fetchone()
-
-            if not schedule:
+            schedules = cur.fetchall()
+            if not schedules:
                 continue
 
-            sched_id = schedule["id"]
-            tol_early = schedule["tolerance_early_min"]
-            tol_late = schedule["tolerance_late_min"]
+            matched_schedule = None
+            started_offset_min = None
+            within_ideal = False
+            status = "LATE"  # default
 
-            ideal_start = datetime.combine(
-                activity_date,
-                schedule["ideal_start_time"],
-                tzinfo=timezone.utc,
-            )
+            for s in schedules:
+                tol_early = s["tolerance_early_min"]
+                tol_late = s["tolerance_late_min"]
 
-            delta_min = int((actual_start - ideal_start).total_seconds() / 60)
+                # -------------------------------------------------
+                # Build IDEAL START UTC (CRITICAL LOGIC)
+                # -------------------------------------------------
+                cur.execute(
+                    """
+                    SELECT
+                        (
+                            ( %s::date + %s )
+                            AT TIME ZONE %s
+                        ) AS ideal_start_utc
+                    """,
+                    (
+                        activity_date,
+                        s["ideal_start_time"],
+                        farm_tz,
+                    ),
+                )
 
-            if delta_min < -tol_early:
-                status = "EARLY"
-                within = False
-            elif delta_min > tol_late:
-                status = "LATE"
-                within = False
-            else:
-                status = "ON_TIME"
-                within = True
+                ideal_start_utc = cur.fetchone()["ideal_start_utc"]
+
+                offset_min = int(
+                    (actual_start_at - ideal_start_utc).total_seconds() / 60
+                )
+
+                if -tol_early <= offset_min <= tol_late:
+                    matched_schedule = s
+                    started_offset_min = offset_min
+                    within_ideal = True
+                    status = "ON_TIME"
+                    break
+
+                if offset_min < -tol_early:
+                    matched_schedule = s
+                    started_offset_min = offset_min
+                    status = "EARLY"
+                    break
+
+                if offset_min > tol_late:
+                    matched_schedule = s
+                    started_offset_min = offset_min
+                    status = "LATE"
+                    # continue checking later schedules
+
+            if not matched_schedule:
+                continue
 
             cur.execute(
                 """
                 UPDATE activity_instance
                 SET
-                  activity_schedule_id = %s,
-                  status = %s,
-                  started_offset_min = %s,
-                  within_ideal_window = %s,
-                  updated_at = %s
+                    activity_schedule_id = %s,
+                    status = %s,
+                    started_offset_min = %s,
+                    within_ideal_window = %s,
+                    updated_at = %s
                 WHERE id = %s
                   AND status = 'IN_PROGRESS'
                 """,
                 (
-                    sched_id,
+                    matched_schedule["id"],
                     status,
-                    delta_min,
-                    within,
+                    started_offset_min,
+                    within_ideal,
                     now,
                     instance_id,
                 ),
@@ -178,14 +217,12 @@ def classify_completed_activities():
                 f"[CLASSIFIED]"
                 f"[INSTANCE={instance_id}]"
                 f"[STATUS={status}]"
-                f"[OFFSET_MIN={delta_min}]"
-                f"[WITHIN_IDEAL={within}]"
+                f"[OFFSET_MIN={started_offset_min}]"
             )
 
-
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 # RUNNER
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 def run():
     finalize_ended_activities()
     classify_completed_activities()

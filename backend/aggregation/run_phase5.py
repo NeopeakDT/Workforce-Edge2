@@ -22,7 +22,7 @@ from aggregation.missed_activity_cron import detect_missed_activities
 def run():
     step3()
     step4_5a()
-    detect_missed_activities()
+    # detect_missed_activities()
 
 if __name__ == "__main__":
     run()

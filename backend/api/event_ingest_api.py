@@ -5,26 +5,13 @@ Accepts detection events from Jetson devices and writes to
 activity_detection_event table.
 
 PHASE 4 — TRUST BOUNDARY
-
-Rules enforced:
-- Authenticate device via hashed API key
-- Accept ONLY UTC timestamps
-- Ignore any farm_id from edge
-- Resolve farm via device_id
-- Insert-only (no aggregation, no schedules)
-
-Test:
-curl.exe -X POST http://127.0.0.1:8000/api/v1/ingest/event `
-  -H "X-DEVICE-KEY: wf_test_device_key_001" `
-  -H "Content-Type: application/json" `
-  --data-binary "@event_ok.json"
 """
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from uuid import UUID
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from psycopg2.extras import Json
 
@@ -63,7 +50,7 @@ def validate_utc_timestamp(ts: datetime):
             status_code=400,
             detail="frame_ts must include timezone (UTC)"
         )
-    if ts.utcoffset() != timezone.utc.utcoffset(ts):
+    if ts.utcoffset() != timedelta(0):
         raise HTTPException(
             status_code=400,
             detail="frame_ts must be in UTC (Z)"
@@ -90,9 +77,6 @@ def resolve_activity_type_id(activity_type: str) -> int:
 
 
 def validate_detection_event_type(event_type: str) -> str:
-    """
-    Validate against DB enum detection_event_type.
-    """
     with get_cursor() as cur:
         cur.execute(
             """
@@ -152,6 +136,30 @@ def ingest_event(
         "metadata": payload.metadata,
     })
 
+    # -------------------------------------------------
+    # 🔑 CRITICAL FIX: Attach END_CANDIDATE to open instance
+    # -------------------------------------------------
+    activity_instance_id = None
+
+    if validated_event_type == "END_CANDIDATE":
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM activity_instance
+                WHERE farm_id = %s
+                  AND activity_type_id = %s
+                  AND status = 'IN_PROGRESS'
+                  AND actual_start_at <= %s
+                ORDER BY actual_start_at DESC
+                LIMIT 1
+                """,
+                (farm_id, activity_type_id, payload.frame_ts),
+            )
+            row = cur.fetchone()
+            if row:
+                activity_instance_id = row["id"]
+
     # ---------------- Insert-only write ----------------
     with get_cursor() as cur:
         cur.execute(
@@ -161,19 +169,21 @@ def ingest_event(
                 device_id,
                 camera_id,
                 activity_type_id,
+                activity_instance_id,
                 event_type,
                 event_time,
                 ai_confidence,
                 payload,
                 created_at
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 str(farm_id),
                 str(device_id),
                 str(payload.camera_id),
                 activity_type_id,
+                activity_instance_id,
                 validated_event_type,
                 payload.frame_ts,
                 payload.confidence,
