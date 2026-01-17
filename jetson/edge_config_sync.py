@@ -1,29 +1,9 @@
 """
-Edge Config Sync
+Edge Config Sync (Phase 3)
 
-MANDATORY bootstrap script that fetches and validates configuration from backend.
-Only script that pulls backend config. Atomic cache write prevents corruption.
-
-Key Features:
-    - Fetches configuration from backend API
-    - Validates all required configuration keys
-    - Atomic write to local_cache.json (prevents corruption)
-    - Hard-fails on any error (prevents partial configuration)
-
-Usage:
-    # Method 1: Environment variable (recommended)
-    export BACKEND_API_URL=https://api.example.com
-    python edge_config_sync.py
-    
-    # Method 2: Bootstrap config file
-    # Create config/bootstrap_config.json with {"backend_api_url": "https://api.example.com"}
-    python edge_config_sync.py
-    
-    # Method 3: Command line argument
-    python edge_config_sync.py https://api.example.com
-    
-    It runs exactly once per boot — before any inference starts.
-    Must run before device starts inference. No inference allowed here.
+MANDATORY bootstrap script.
+Fetches and validates runtime configuration from backend.
+NO inference is allowed unless this succeeds.
 """
 
 import json
@@ -32,106 +12,118 @@ import sys
 from pathlib import Path
 import requests
 
-# Get API_BASE from environment variable, config file, or command line
-# Priority: 1. Environment variable, 2. bootstrap_config.json, 3. Command line arg
-API_BASE = os.getenv("BACKEND_API_URL")
+# -------------------------------------------------
+# Paths
+# -------------------------------------------------
+BASE_DIR = Path(__file__).parent
+BOOTSTRAP_CONFIG_PATH = BASE_DIR / "config" / "bootstrap_config.json"
+CACHE_PATH = BASE_DIR / "config" / "local_cache.json"
 
-BOOTSTRAP_CONFIG_PATH = Path("config/bootstrap_config.json")
-CACHE_PATH = Path("config/local_cache.json")
-
-
+# -------------------------------------------------
+# Fatal helper
+# -------------------------------------------------
 def fatal(msg: str):
-    """Print fatal error and exit"""
     print(f"FATAL: {msg}", file=sys.stderr)
     sys.exit(1)
 
-
+# -------------------------------------------------
+# Resolve backend API base
+# -------------------------------------------------
 def get_api_base() -> str:
-    """
-    Get backend API URL from multiple sources.
-    
-    Priority order:
-        1. BACKEND_API_URL environment variable
-        2. bootstrap_config.json file
-        3. Command line argument (if provided)
-    
-    Returns:
-        str: Backend API base URL
-        
-    Raises:
-        SystemExit: If API_BASE cannot be determined
-    """
-    global API_BASE
-    
-    # 1. Check environment variable
-    if API_BASE:
-        return API_BASE.rstrip('/')
-    
-    # 2. Check bootstrap config file
+    api_base = os.getenv("BACKEND_API_URL")
+
+    if api_base:
+        return api_base.rstrip("/")
+
     if BOOTSTRAP_CONFIG_PATH.exists():
         try:
-            bootstrap = json.loads(BOOTSTRAP_CONFIG_PATH.read_text())
-            if "backend_api_url" in bootstrap:
-                return bootstrap["backend_api_url"].rstrip('/')
+            data = json.loads(BOOTSTRAP_CONFIG_PATH.read_text())
+            if "backend_api_url" in data:
+                return data["backend_api_url"].rstrip("/")
         except Exception:
-            pass  # Continue to next method
-    
-    # 3. Check command line argument (if provided)
+            fatal("Invalid bootstrap_config.json")
+
     if len(sys.argv) > 1:
-        return sys.argv[1].rstrip('/')
-    
-    # No valid source found
-    fatal(
-        "BACKEND_API_URL not set. Provide via:\n"
-        "  1. Environment variable: export BACKEND_API_URL=https://api.example.com\n"
-        "  2. Bootstrap config: config/bootstrap_config.json with 'backend_api_url' key\n"
-        "  3. Command line: python edge_config_sync.py https://api.example.com"
-    )
+        return sys.argv[1].rstrip("/")
 
+    fatal("BACKEND_API_URL not set")
 
+# -------------------------------------------------
+# Main
+# -------------------------------------------------
 def main():
-    """
-    Fetch configuration from backend and write to local cache.
-    
-    Process:
-        1. Get API_BASE from environment/config/command line
-        2. Fetch config from backend API
-        3. Validate all required keys are present
-        4. Atomically write to local_cache.json
-        5. Exit on any error
-    """
     api_base = get_api_base()
-    
+
+    device_code = os.getenv("DEVICE_CODE")
+    edge_token = os.getenv("EDGE_TOKEN")
+
+    if not device_code:
+        fatal("DEVICE_CODE not set")
+
+    if not edge_token:
+        fatal("EDGE_TOKEN not set")
+
+    url = f"{api_base}/api/v1/edge/runtime-config"
+
     try:
         r = requests.get(
-            f"{api_base}/edge/runtime-config",
+            url,
             timeout=10,
-            headers={"Authorization": "Bearer EDGE_TOKEN"},
+            headers={
+                "Authorization": f"Bearer {edge_token}",
+                "X-DEVICE-CODE": device_code,
+            },
         )
     except Exception as e:
-        fatal(str(e))
-    
+        fatal(f"Connection error: {e}")
+
     if r.status_code != 200:
-        fatal(f"config fetch failed: {r.status_code}")
-    
+        fatal(f"Config fetch failed ({r.status_code}): {r.text}")
+
     cfg = r.json()
-    
-    for k in [
-        "farm_camera",
-        "camera_stream_config",
+
+    # -------------------------------------------------
+    # HARD VALIDATION (Phase-3 contract)
+    # -------------------------------------------------
+    required_keys = [
+        "device_id",
+        "farm_id",
+        "farm_timezone",
+        "cameras",
         "device_model_assignment",
         "ml_model_version",
-    ]:
-        if k not in cfg:
-            fatal(f"missing key {k}")
-    
+    ]
+
+
+    for key in required_keys:
+        if key not in cfg:
+            fatal(f"Missing required config key: {key}")
+
+    # Per-camera validation
+    for cam in cfg["cameras"]:
+        if not cam.get("rtsp_url"):
+            fatal("Camera missing rtsp_url")
+
+        if not cam.get("roi_polygon"):
+            fatal(f"Camera {cam['camera_id']} missing ROI")
+
+        if not cam.get("fps"):
+            fatal(f"Camera {cam['camera_id']} missing FPS")
+
+    if not cfg["ml_model_version"].get("model_path"):
+        fatal("Model path missing in ml_model_version")
+
+    # -------------------------------------------------
+    # Atomic cache write
+    # -------------------------------------------------
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CACHE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, indent=2))
     tmp.replace(CACHE_PATH)
-    
-    print("Config synced successfully")
 
+    print("✅ Config sync successful")
+    print(f"📄 Cached at: {CACHE_PATH}")
 
+# -------------------------------------------------
 if __name__ == "__main__":
     main()

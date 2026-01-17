@@ -1,5 +1,76 @@
 {
-  "config": {},
-  "timestamp": null
+  "device_id": "a58db57b-49cc-4ad0-ae9e-25816c3eeb78",
+  "farm_id": "9fa991d5-23ee-429f-8c7f-09b4acc3a415",
+  "farm_timezone": "Asia/Kolkata",
+  "cameras": [
+    {
+      "camera_id": "2b1d6d3b-ce9e-4255-ac11-b877a69e4574",
+      "code": "F2",
+      "rtsp_url": "rtsp://",
+      "nvr_channel": null,
+      "zone_id": "52a2565f-1d90-4793-a9cf-8d35a1d6f8f8",
+      "resolution": "1920x1080",
+      "fps": 5,
+      "roi_polygon": [
+        [
+          100,
+          100
+        ],
+        [
+          1200,
+          100
+        ],
+        [
+          1200,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ],
+      "motion_sensitivity": 3
+    }
+  ],
+  "device_model_assignment": {
+    "ml_model_version_id": "bb91a462-ff2d-45b9-b5db-fc21a8e8cf26"
+  },
+  "ml_model_version": {
+    "id": "bb91a462-ff2d-45b9-b5db-fc21a8e8cf26",
+    "name": "farm_multi_activity_detector",
+    "version": "1.0.3",
+    "model_path": "models/farm_multi_activity_detector/1.0.3/best.pt",
+    "checksum": "sha256:9a4f...c2d1",
+    "metadata": {
+      "precision": "fp16",
+      "input_size": [
+        640,
+        640
+      ],
+      "postprocess": {
+        "nms_iou": 0.55,
+        "conf_threshold": 0.75
+      },
+      "model_format": ".pt",
+      "activity_thresholds": {
+        "FEEDING": {
+          "min_conf": 0.7,
+          "min_frames": 20
+        },
+        "MILKING": {
+          "min_conf": 0.75,
+          "min_frames": 30
+        },
+        "SCRAPING": {
+          "min_conf": 0.7,
+          "min_frames": 25
+        }
+      },
+      "supported_activity_codes": [
+        "MILKING",
+        "FEEDING",
+        "SCRAPING"
+      ]
+    }
+  }
 }
-

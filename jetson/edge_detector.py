@@ -44,17 +44,32 @@ from runtime.model_loader import ModelRunner
 from runtime.roi_utils import filter_by_roi
 from runtime.temporal_smoother import TemporalSmoother
 
+import argparse
 
 # =========================
-# ENV / CONFIG
+# ARGUMENT PARSING (MUST BE FIRST)
 # =========================
+parser = argparse.ArgumentParser()
+parser.add_argument("--dry-run", action="store_true")
+args = parser.parse_args()
+
+DRY_RUN = args.dry_run
+
+# =========================
+# ENV LOADING & VALIDATION
+# =========================
+from dotenv import load_dotenv
+load_dotenv()
+
+
 API_BASE = os.getenv("EDGE_API_BASE")
 EDGE_TOKEN = os.getenv("EDGE_TOKEN")
 
-if not API_BASE or not EDGE_TOKEN:
-    raise RuntimeError("EDGE_API_BASE or EDGE_TOKEN not set")
+if not DRY_RUN:
+    if not API_BASE or not EDGE_TOKEN:
+        raise RuntimeError("EDGE_API_BASE or EDGE_TOKEN not set")
 
-HEADERS = {"Authorization": f"Bearer {EDGE_TOKEN}"}
+HEADERS = {"Authorization": f"Bearer {EDGE_TOKEN}"} if not DRY_RUN else {}
 
 
 # =========================
@@ -86,9 +101,13 @@ def euclidean(p1, p2):
 
 
 def emit_event(payload):
+    if DRY_RUN:
+        print("[DRY-RUN]", payload)
+        return
+
     try:
         requests.post(
-            f"{API_BASE}/edge/detection-event",
+            f"{API_BASE}/api/v1/edge/detection-event",
             json=payload,
             headers=HEADERS,
             timeout=2,
@@ -151,19 +170,29 @@ def main():
     activity_params = cfg.get("activity_params", {})
     SCRAPING_MAX_DISTANCE_PX = activity_params.get("SCRAPING_MAX_DISTANCE_PX", 120)
 
-    cam_cfg = cfg["camera_stream_config"]
-    
+    # Use first camera for now (Phase 4 - single camera)
+    camera = cfg["cameras"][0]
+
+    camera_id = camera["camera_id"]
+    roi_polygon = camera["roi_polygon"]
+
     # Safe guard: Validate ROI exists (fail fast > silent wrong inference)
-    roi_polygon = cfg["farm_camera"].get("roi")
     if not roi_polygon:
-        raise RuntimeError("ROI missing in farm_camera config")
+        raise RuntimeError(f"ROI missing for camera {camera_id}")
+
+    # FPS handling (optional - for future frame skipping)
+    fps = camera.get("fps", 5)
     
-    model_path = cfg["ml_model_version"]["local_path"]
+    # Model path resolution (backend decides which, Jetson decides where)
+    model_rel_path = cfg["ml_model_version"]["model_path"]
+    model_path = os.path.join(os.getcwd(), model_rel_path)
 
-    cap = cv2.VideoCapture(cam_cfg["stream_url"])
+    if not os.path.exists(model_path):
+        raise RuntimeError(f"Model file not found: {model_path}")
+
+    # Use recorded video for testing (not RTSP)
+    cap = cv2.VideoCapture("test_data/scraping_defrag 2.mp4")
     runner = ModelRunner(model_path)
-
-    camera_id = cam_cfg["camera_id"]
 
     while True:
         ret, frame = cap.read()

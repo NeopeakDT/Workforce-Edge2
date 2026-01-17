@@ -1,13 +1,17 @@
 """
-Main Application Entry Point
-Workforce Management Backend
+#Main Application Entry Point-
 
-Phase-aware wiring:
-- Phase 4: Ingestion APIs (ENABLED)
-- Phase 5: Aggregation jobs (OUTSIDE HTTP)
-- Phase 6: Dashboard APIs (READ-ONLY, OPTIONAL)
+#Purpose: Main FastAPI application entry point and router orchestration
+#Function: Wires together all API modules based on phase flags, includes both edge ping and runtime config routers under 
+"edge-bootstrap" tags
+#Use: Controls which features are enabled (currently Phase 3 bootstrap APIs + Phase 4 ingestion + Phase 6 dashboard) 
+and serves as the central application hub
 
 This file must NEVER contain business logic.
+
+# Terminal command to run the backend server-
+ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
 """
 
 # -------------------------------------------------
@@ -22,6 +26,7 @@ from fastapi import FastAPI
 # -------------------------------------------------
 # Phase Flags (explicit & safe)
 # -------------------------------------------------
+ENABLE_EDGE_BOOTSTRAP_APIS = True   # Phase 3 (MANDATORY)
 ENABLE_INGEST_APIS = True          # Phase 4
 ENABLE_DASHBOARD_APIS = True       # Phase 6 (read-only)
 ENABLE_ADMIN_APIS = False          # Optional
@@ -45,6 +50,27 @@ def health():
         "status": "healthy",
         "service": "workforce-backend",
     }
+
+# -------------------------------------------------
+# Phase 3 — Edge Bootstrap APIs (Jetson → Backend)
+# -------------------------------------------------
+if ENABLE_EDGE_BOOTSTRAP_APIS:
+    from api.edge_runtime_config_api import router as runtime_config_router
+    from api.edge_ping_api import router as edge_ping_router
+
+    app.include_router(
+        runtime_config_router,
+        prefix="/api/v1",
+        tags=["edge-bootstrap"],
+    )
+
+    app.include_router(
+        edge_ping_router,
+        prefix="/api/v1",
+        tags=["edge-bootstrap"],
+    )
+
+
 
 # -------------------------------------------------
 # Phase 4 — Ingestion APIs (Jetson → Backend)
