@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 """
-PHASE-5 — ACTIVITY AGGREGATOR (FINAL, TIMEZONE-SAFE)
+PHASE-5 — ACTIVITY AGGREGATOR (FINAL, CORRECT)
 
-Responsibilities:
-STEP-4:
-- Finalize END_CANDIDATE
-- Set actual_end_at, duration
-- DO NOT classify status
-
-STEP-5:
-- Bind activity_schedule
-- Compute started_offset_min using FARM TIMEZONE
-- Classify EARLY / ON_TIME / LATE
+DB ENUMS:
+START_PENDING → IN_PROGRESS → END_PENDING → EARLY | ON_TIME | LATE
 """
 
-from datetime import datetime, timezone
 from pathlib import Path
 import sys
+from datetime import timedelta
 
-# -------------------------------------------------------------------
-# Bootstrap
-# -------------------------------------------------------------------
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
@@ -28,205 +17,198 @@ if str(BACKEND_ROOT) not in sys.path:
 from common.db import get_cursor
 from common.time_utils import utc_now
 
-# -------------------------------------------------------------------
-# STEP-4 — FINALIZE ENDED ACTIVITIES
-# -------------------------------------------------------------------
-def finalize_ended_activities():
+# ------------------------------------------------------------------
+# RULES
+# ------------------------------------------------------------------
+ACTIVITY_RULES = {
+    "MILKING":  {"START_CONFIRM": 60, "GAP": 900, "SCHEDULE": True},
+    "FEEDING":  {"START_CONFIRM": 30, "GAP": 300, "SCHEDULE": True},
+    "SCRAPING": {"START_CONFIRM": 20, "GAP": 180, "SCHEDULE": False},
+}
+
+def load_activity_code_map(cur):
+    cur.execute("SELECT id, code FROM activity_type")
+    return {r["id"]: r["code"] for r in cur.fetchall()}
+
+# ------------------------------------------------------------------
+# STEP 1 — START_PENDING
+# ------------------------------------------------------------------
+def create_start_pending_instances():
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT e.*
+            FROM activity_detection_event e
+            LEFT JOIN activity_instance ai
+              ON ai.id = e.activity_instance_id
+            WHERE e.event_type = 'START_CANDIDATE'
+              AND ai.id IS NULL
+        """)
+
+        for e in cur.fetchall():
+            cur.execute("""
+                INSERT INTO activity_instance (
+                    farm_id, activity_type_id, activity_date,
+                    status, source, created_at, updated_at,
+                    edge_device_id, camera_id
+                )
+                VALUES (%s,%s,%s,'START_PENDING','AI',%s,%s,%s,%s)
+                RETURNING id
+            """, (
+                e["farm_id"],
+                e["activity_type_id"],
+                e["activity_date"],
+                e["event_time"],
+                e["event_time"],
+                e["edge_device_id"],
+                e["camera_id"],
+            ))
+            iid = cur.fetchone()["id"]
+            cur.execute(
+                "UPDATE activity_detection_event SET activity_instance_id=%s WHERE id=%s",
+                (iid, e["id"])
+            )
+
+# ------------------------------------------------------------------
+# STEP 2 — ADVANCE STATES
+# ------------------------------------------------------------------
+def advance_activity_states():
     now = utc_now()
 
     with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                ai.id AS activity_instance_id,
-                ai.actual_start_at,
-                MAX(ade.event_time) AS actual_end_at
-            FROM activity_instance ai
-            JOIN activity_detection_event ade
-              ON ade.activity_instance_id = ai.id
-            WHERE ai.status = 'IN_PROGRESS'
-              AND ai.actual_start_at IS NOT NULL
-              AND ai.actual_end_at IS NULL
-              AND ade.event_type = 'END_CANDIDATE'
-            GROUP BY ai.id, ai.actual_start_at
-            """
-        )
+        code_map = load_activity_code_map(cur)
 
-        rows = cur.fetchall()
+        cur.execute("""
+            SELECT *
+            FROM activity_instance
+            WHERE status IN ('START_PENDING','IN_PROGRESS','END_PENDING')
+        """)
 
-        for row in rows:
-            instance_id = row["activity_instance_id"]
-            start_at = row["actual_start_at"]
-            end_at = row["actual_end_at"]
+        for ai in cur.fetchall():
+            code = code_map[ai["activity_type_id"]]
+            rules = ACTIVITY_RULES[code]
 
-            # Guard against bad data
-            if end_at <= start_at:
+            cur.execute("""
+                SELECT MAX(event_time) AS last_seen
+                FROM activity_detection_event
+                WHERE activity_instance_id=%s
+                  AND event_type='FRAME_AGGREGATE'
+            """, (ai["id"],))
+            last_seen = cur.fetchone()["last_seen"] or ai["created_at"]
+            gap = (now - last_seen).total_seconds()
+
+            if ai["status"] == "START_PENDING":
+                if (now - ai["created_at"]).total_seconds() >= rules["START_CONFIRM"]:
+                    cur.execute("""
+                        UPDATE activity_instance
+                        SET status='IN_PROGRESS',
+                            actual_start_at=%s,
+                            updated_at=%s
+                        WHERE id=%s
+                    """, (ai["created_at"], now, ai["id"]))
                 continue
 
-            duration_sec = int((end_at - start_at).total_seconds())
+            if ai["status"] == "IN_PROGRESS":
+                if gap > rules["GAP"]:
+                    cur.execute("""
+                        UPDATE activity_instance
+                        SET status='END_PENDING', updated_at=%s
+                        WHERE id=%s
+                    """, (now, ai["id"]))
+                continue
 
-            cur.execute(
-                """
-                UPDATE activity_instance
-                SET
-                    actual_end_at = %s,
-                    actual_duration_sec = %s,
-                    updated_at = %s
-                WHERE id = %s
-                  AND status = 'IN_PROGRESS'
-                """,
-                (end_at, duration_sec, now, instance_id),
-            )
+            if ai["status"] == "END_PENDING":
+                if gap <= rules["GAP"]:
+                    cur.execute("""
+                        UPDATE activity_instance
+                        SET status='IN_PROGRESS', updated_at=%s
+                        WHERE id=%s
+                    """, (now, ai["id"]))
+                    continue
 
-            print(
-                f"[FINALIZED]"
-                f"[INSTANCE={instance_id}]"
-                f"[DURATION_SEC={duration_sec}]"
-            )
+                duration = int((last_seen - ai["actual_start_at"]).total_seconds())
+                cur.execute("""
+                    UPDATE activity_instance
+                    SET actual_end_at=%s,
+                        actual_duration_sec=%s,
+                        updated_at=%s
+                    WHERE id=%s
+                """, (last_seen, duration, now, ai["id"]))
 
-# -------------------------------------------------------------------
-# STEP-5 — CLASSIFY COMPLETED ACTIVITIES (TIMEZONE SAFE)
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------
+# STEP 3 — CLASSIFY
+# ------------------------------------------------------------------
 def classify_completed_activities():
     now = utc_now()
 
     with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                ai.id,
-                ai.farm_id,
-                ai.activity_type_id,
-                ai.activity_date,
-                ai.actual_start_at,
-                f.timezone AS farm_timezone
+        code_map = load_activity_code_map(cur)
+
+        cur.execute("""
+            SELECT ai.*, f.timezone
             FROM activity_instance ai
-            JOIN farm f ON f.id = ai.farm_id
-            WHERE ai.status = 'IN_PROGRESS'
+            JOIN farm f ON f.id=ai.farm_id
+            WHERE ai.status='END_PENDING'
               AND ai.actual_end_at IS NOT NULL
-            """
-        )
+        """)
 
-        instances = cur.fetchall()
+        for ai in cur.fetchall():
+            code = code_map[ai["activity_type_id"]]
+            rules = ACTIVITY_RULES[code]
 
-        for ai in instances:
-            instance_id = ai["id"]
-            farm_id = ai["farm_id"]
-            activity_type_id = ai["activity_type_id"]
-            activity_date = ai["activity_date"]
-            actual_start_at = ai["actual_start_at"]
-            farm_tz = ai["farm_timezone"]
+            if not rules["SCHEDULE"]:
+                cur.execute("""
+                    UPDATE activity_instance
+                    SET status='ON_TIME', updated_at=%s
+                    WHERE id=%s
+                """, (now, ai["id"]))
+                continue
 
-            # ---------------------------------------------------------
-            # Find matching schedule (ONE PER SCHEDULE PER DAY)
-            # ---------------------------------------------------------
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT *
                 FROM activity_schedule
-                WHERE farm_id = %s
-                  AND activity_type_id = %s
-                  AND is_active = true
+                WHERE farm_id=%s
+                  AND activity_type_id=%s
+                  AND is_active=true
                 ORDER BY ideal_start_time
-                """,
-                (farm_id, activity_type_id),
-            )
+            """, (ai["farm_id"], ai["activity_type_id"]))
 
-            schedules = cur.fetchall()
-            if not schedules:
-                continue
+            for s in cur.fetchall():
+                cur.execute("""
+                    SELECT ((%s::date + %s) AT TIME ZONE %s) AS ideal_start
+                """, (ai["activity_date"], s["ideal_start_time"], ai["timezone"]))
+                ideal = cur.fetchone()["ideal_start"]
 
-            matched_schedule = None
-            started_offset_min = None
-            within_ideal = False
-            status = "LATE"  # default
+                offset = int((ai["actual_start_at"] - ideal).total_seconds() / 60)
 
-            for s in schedules:
-                tol_early = s["tolerance_early_min"]
-                tol_late = s["tolerance_late_min"]
-
-                # -------------------------------------------------
-                # Build IDEAL START UTC (CRITICAL LOGIC)
-                # -------------------------------------------------
-                cur.execute(
-                    """
-                    SELECT
-                        (
-                            ( %s::date + %s )
-                            AT TIME ZONE %s
-                        ) AS ideal_start_utc
-                    """,
-                    (
-                        activity_date,
-                        s["ideal_start_time"],
-                        farm_tz,
-                    ),
-                )
-
-                ideal_start_utc = cur.fetchone()["ideal_start_utc"]
-
-                offset_min = int(
-                    (actual_start_at - ideal_start_utc).total_seconds() / 60
-                )
-
-                if -tol_early <= offset_min <= tol_late:
-                    matched_schedule = s
-                    started_offset_min = offset_min
-                    within_ideal = True
-                    status = "ON_TIME"
+                if -s["tolerance_early_min"] <= offset <= s["tolerance_late_min"]:
+                    status = (
+                        "EARLY" if offset < 0 else
+                        "LATE" if offset > 0 else
+                        "ON_TIME"
+                    )
+                    cur.execute("""
+                        UPDATE activity_instance
+                        SET status=%s,
+                            activity_schedule_id=%s,
+                            started_offset_min=%s,
+                            within_ideal_window=%s,
+                            updated_at=%s
+                        WHERE id=%s
+                    """, (
+                        status,
+                        s["id"],
+                        offset,
+                        status == "ON_TIME",
+                        now,
+                        ai["id"],
+                    ))
                     break
 
-                if offset_min < -tol_early:
-                    matched_schedule = s
-                    started_offset_min = offset_min
-                    status = "EARLY"
-                    break
-
-                if offset_min > tol_late:
-                    matched_schedule = s
-                    started_offset_min = offset_min
-                    status = "LATE"
-                    # continue checking later schedules
-
-            if not matched_schedule:
-                continue
-
-            cur.execute(
-                """
-                UPDATE activity_instance
-                SET
-                    activity_schedule_id = %s,
-                    status = %s,
-                    started_offset_min = %s,
-                    within_ideal_window = %s,
-                    updated_at = %s
-                WHERE id = %s
-                  AND status = 'IN_PROGRESS'
-                """,
-                (
-                    matched_schedule["id"],
-                    status,
-                    started_offset_min,
-                    within_ideal,
-                    now,
-                    instance_id,
-                ),
-            )
-
-            print(
-                f"[CLASSIFIED]"
-                f"[INSTANCE={instance_id}]"
-                f"[STATUS={status}]"
-                f"[OFFSET_MIN={started_offset_min}]"
-            )
-
-# -------------------------------------------------------------------
-# RUNNER
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------
 def run():
-    finalize_ended_activities()
+    create_start_pending_instances()
+    advance_activity_states()
     classify_completed_activities()
-
 
 if __name__ == "__main__":
     run()

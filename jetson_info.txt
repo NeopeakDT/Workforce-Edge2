@@ -1,0 +1,335 @@
+STEP 3.0 — Backend Readiness (IN SHORT)
+
+# What it does-
+- Proves the backend is running, reachable, and wired correctly
+- Ensures required edge-facing APIs exist
+# What you verified-
+- Backend process is live (uvicorn)
+- /health responds → backend up
+- /api/v1/edge/ping responds → edge APIs mounted
+# Why it matters
+- Jetson must never talk to a dead or miswired backend
+- Prevents silent failures later
+# In one line:  STEP 3.0 ensures the backend is alive and capable of talking to Jetson.
+----------------------------------------------------------------------------------------------------------------------------
+
+STEP 3.1 — Jetson Identity & Trust Setup (IN SHORT)
+
+# What it does
+- Binds this Jetson device to:
+- a specific backend
+- a specific device identity
+- a valid security token
+# What you did
+- Set DEVICE_CODE → identifies the Jetson
+- Set EDGE_TOKEN → authenticates the Jetson
+- Set BACKEND_API_URL → tells Jetson where backend lives
+- Verified auth using /edge/ping
+# Why it matters
+- Without this, Jetson is:
+    - unauthenticated
+    - untrusted
+    - not allowed to fetch config or send events
+
+# In one line:  STEP 3.1 establishes identity and trust between Jetson and backend.
+
+TERMINAL OUTPUT-
+(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ curl http://192.168.31.134:8000/health
+{"status":"healthy","service":"workforce-backend"}(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ curl http://192.168.31.134:8000/api/v1/edge/ping
+(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ export DEVICE_CODE=DEV-F1-01ion$ export DEVICE_CODE=DEV-F1-01
+export EDGE_TOKEN=5c399d607fe890ea61d3405b0fc40d6b17a15dac6751d6c49e61fd78ce0992a8
+export BACKEND_API_URL=http://192.168.31.134:8000/api/v1
+(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ echo $DEVICE_CODE
+echo $EDGE_TOKEN
+echo $BACKEND_API_URL
+DEV-F1-01
+5c399d607fe890ea61d3405b0fc40d6b17a15dac6751d6c49e61fd78ce0992a8
+http://192.168.31.134:8000/api/v1
+(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ curl \
+  -H "Authorization: Bearer $EDGE_TOKEN" \
+  $BACKEND_API_URL/edge/ping
+{"status":"authorized","service":"workforce-backend"}(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ 
+
+======================================================================================================================
+# To run  device_provisioning -
+
+(Below is the example , update according to new farm)
+python ops/device_provisioning.py \
+  --farm-id 07dbc890-2076-4018-b5fc-9f93cf2900e3 \
+  --device-name "Jetson_Camera_01" \
+  --device-code "JETSON_001"
+
+*then below one time run cmd -
+
+export DEVICE_CODE=HARMONY_JETSON_TEST
+export EDGE_TOKEN=<YOUR_DEVICE_API_KEY>
+export BACKEND_API_URL=http://192.168.31.134:8000
+Eg-
+export DEVICE_CODE=HD_TEST_01
+export EDGE_TOKEN=25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab
+export BACKEND_API_URL=http://192.168.31.134:8000
+to check it it is correct-
+echo $DEVICE_CODE
+echo $EDGE_TOKEN
+echo $BACKEND_API_URL
+
+**Update the above in .env file
+
+----------------------------------------------------------------------------------------------------------------------------
+19/1/2025- device_provisioning.py
+
+neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ python backend/ops/device_provisioning.py --farm-id 07dbc890-2076-4018-b5fc-9f93cf2900e3 --device-name Harmony_dairy_01 --device-code HD_test_01
+** Below is the expected output(copy and save here)
+✅ Device provisioned successfully
+Device ID      : 3259cd10-d54c-42e3-88d6-b85a05e262be
+Device Name    : Harmony_dairy_01
+Device Code    : HD_TEST_01
+API Key (SAVE) : 25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab
+
+⚠️  WARNING: Save this API key now!
+   It will NOT be shown again.
+   Store it securely on the Jetson device.
+neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ 
+
+#To insert data in activity_detection_event table .
+(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$ curl -X POST http://192.168.31.134:8000/api/v1/ingest/event   -H "X-DEVICE-KEY: 25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab"   -H "Content-Type: application/json"   --data-binary "@event_ok.json"
+
+
+=====================================================================================================
+STEP 3.2 — Runtime Config Sync (IN SHORT)
+What it does
+    • Jetson fetches authoritative runtime configuration from backend
+    • Configuration is validated strictly
+    • Cached locally for safe, repeatable startup
+What was proven
+    • Device authentication works
+    • Backend joins DB tables correctly:
+        ◦ edge_device
+        ◦ farm
+        ◦ farm_camera
+        ◦ camera_stream_config
+        ◦ device_model_assignment
+        ◦ ml_model_version
+    • No hardcoded camera, ROI, FPS, or model
+    • Config is atomic and complete
+Why it matters
+    • Prevents silent misconfiguration
+    • Guarantees edge and backend agree on reality
+One-liner
+STEP 3.2 makes Jetson configuration-aware and DB-driven.
+
+✅ STEP 3.3 — Semantic Config Validation (IN SHORT)
+What it does
+    • Human-level sanity check of cached config
+    • Ensures values are usable, not just present
+What you verified
+    • Camera IDs match DB
+    • ROI polygons are valid
+    • FPS is reasonable
+    • Model path exists and matches assignment
+    • No placeholder or fallback values
+Why it matters
+    • Catches 80% of real-world deployment failures
+    • Prevents farm-day incidents
+One-liner
+STEP 3.3 ensures the config is not just valid, but correct.
+===========================================================================================================
+
+Jetson
+  ├─ edge_config_sync.py  (before runtime)
+  ├─ edge_detector.py
+  │     └─ emits START / FRAME / END
+  └─ edge_heartbeat_agent.py
+
+        ↓ HTTP
+
+main.py
+  ├─ /health
+  ├─ /api/v1/events
+  └─ /api/v1/heartbeat
+
+        ↓ DB
+
+activity_detection_event
+edge_device_heartbeat
+
+        ↓ Background
+
+activity_aggregator.py
+missed_activity_cron.py
+
+        ↓ DB
+
+activity_instance
+
+        ↓
+
+alert_evaluator.py
+dashboard_query_service.py
+
+============================================================================================================
+
+# 20-1-26
+
+ACTIVITY_RULES = {
+    "MILKING": {
+        "START_CONFIRM_SEC": 60,
+        "GAP_BUFFER_SEC": 15 * 60,
+        "MIN_DURATION_SEC": 20 * 60,
+        "SCHEDULE_REQUIRED": True,
+    },
+    "FEEDING": {
+        "START_CONFIRM_SEC": 30,
+        "GAP_BUFFER_SEC": 5 * 60,
+        "MIN_DURATION_SEC": 10 * 60,
+        "SCHEDULE_REQUIRED": True,
+    },
+    "SCRAPING": {
+        "START_CONFIRM_SEC": 20,
+        "GAP_BUFFER_SEC": 3 * 60,
+        "MIN_DURATION_SEC": 5 * 60,
+        "SCHEDULE_REQUIRED": False,
+    },
+}
+
+============================================================================================================
+# To insert activity detection data-
+
+First (activate the env - 'source ~/torch_env/bin/activate') in whichever terminal you are using.
+1. Run the backend server (in first terminal)- 
+    (torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$ 'uvicorn main:app --host 0.0.0.0 --reload'
+2. update 'event_ok.json' data, which goes in activity_detection_event tables
+    -To insert data in in that table run the below command in another terminal (activate the env - source ~/torch_env/bin/activate)- 
+    (torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$
+        'curl -X POST http://192.168.31.134:8000/api/v1/ingest/event   -H "X-DEVICE-KEY: 25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab"   -H "Content-Type: application/json"   --data-binary "@event_ok.json"'
+3. First insert the 'START_CANDIDATE' data then run the above cmd of curl, then when the status:ok then run the 'python aggregation/run_phase5.py' to insert data in activity_instance table.
+4. Then update the data of 'END_CANDIDATE' in event_ok.json file, run the curl if the status is ok then tun the run_phase5.py file.
+5. For the alert run - 'python alerts/alert_evaluator.py' after successfully completion of activities. 
+
+
+==================================================================================================================
+# HOW TO MANUALLY INSERT DATA CORRECTLY
+If you want to simulate a real activity manually, you must insert FRAME_AGGREGATE.
+Minimal valid manual sequence
+    START_CANDIDATE  @ 00:10
+    FRAME_AGGREGATE  @ 00:12
+    FRAME_AGGREGATE  @ 00:15
+    FRAME_AGGREGATE  @ 00:18
+    END_CANDIDATE    @ 00:40   (optional)
+(no more FRAME_AGGREGATE)
+After gap buffer expires:
+END_PENDING → ON_TIME / EARLY / LATE
+
+===================================================================================================================
+Below EXAMPLE is the authoritative IST → UTC conversion and exact START / END payload timings you should use for 20-01-2026 to validate ON_TIME, EARLY, LATE correctly.
+
+Fixed reference (LOCK THIS)
+Farm timezone: Asia/Kolkata (IST)
+IST = UTC + 05:30
+Rule:
+UTC = IST − 05:30
+
+1️⃣ Morning Feeding — ON_TIME
+Schedule (IST): 05:30 – 06:30
+Tolerance: ±15 min
+Target: ON_TIME → start inside window
+Choose actual times (IST)
+    • START: 05:40 IST
+    • END: 06:10 IST
+Convert to UTC
+    • START: 05:40 − 05:30 = 00:10 UTC
+    • END: 06:10 − 05:30 = 00:40 UTC
+Payloads
+START_CANDIDATE
+{
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+  "activity_type": "FEEDING",
+  "confidence": 0.9,
+  "event_type": "START_CANDIDATE",
+  "frame_ts": "2026-01-20T00:10:00Z",
+  "objects": { "tractor": [{ "id": 1 }], "person": [{ "id": 2 }] },
+  "idempotency_key": "feed-on-start"
+}
+END_CANDIDATE
+{
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+  "activity_type": "FEEDING",
+  "confidence": 0.9,
+  "event_type": "END_CANDIDATE",
+  "frame_ts": "2026-01-20T00:40:00Z",
+  "objects": { "tractor": [{ "id": 1 }], "person": [{ "id": 2 }] },
+  "idempotency_key": "feed-on-end"
+}
+Expected result
+status = ON_TIME
+started_offset_min ≈ +10
+
+2️⃣ Morning Scraping — EARLY
+Schedule (IST): 05:00 – 06:00
+Tolerance early: 13 min
+Target: EARLY → start before tolerance
+Choose actual times (IST)
+    • START: 04:30 IST
+    • END: 04:50 IST
+Convert to UTC
+    • START: 04:30 − 05:30 = 23:00 UTC (previous day)
+    • END: 04:50 − 05:30 = 23:20 UTC (previous day)
+Payloads
+START_CANDIDATE
+{
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+  "activity_type": "SCRAPING",
+  "confidence": 0.9,
+  "event_type": "START_CANDIDATE",
+  "frame_ts": "2026-01-19T23:00:00Z",
+  "objects": { "person": [{ "id": 1 }] },
+  "idempotency_key": "scrape-early-start"
+}
+END_CANDIDATE
+{
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+  "activity_type": "SCRAPING",
+  "confidence": 0.9,
+  "event_type": "END_CANDIDATE",
+  "frame_ts": "2026-01-19T23:20:00Z",
+  "objects": { "person": [{ "id": 1 }] },
+  "idempotency_key": "scrape-early-end"
+}
+Expected result
+status = EARLY
+started_offset_min ≈ -30
+
+3️⃣ Morning Milking — LATE
+Schedule (IST): 05:00 – 06:00
+Tolerance late: 13 min
+Target: LATE → start after tolerance
+Choose actual times (IST)
+    • START: 06:20 IST
+    • END: 06:45 IST
+Convert to UTC
+    • START: 06:20 − 05:30 = 00:50 UTC
+    • END: 06:45 − 05:30 = 01:15 UTC
+Payloads
+START_CANDIDATE
+{
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+  "activity_type": "MILKING",
+  "confidence": 0.9,
+  "event_type": "START_CANDIDATE",
+  "frame_ts": "2026-01-20T00:50:00Z",
+  "objects": { "cow": [{ "id": 1 }], "person": [{ "id": 2 }] },
+  "idempotency_key": "milk-late-start"
+}
+END_CANDIDATE
+{
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+  "activity_type": "MILKING",
+  "confidence": 0.9,
+  "event_type": "END_CANDIDATE",
+  "frame_ts": "2026-01-20T01:15:00Z",
+  "objects": { "cow": [{ "id": 1 }], "person": [{ "id": 2 }] },
+  "idempotency_key": "milk-late-end"
+}
+Expected result
+status = LATE
+started_offset_min ≈ +80

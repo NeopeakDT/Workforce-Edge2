@@ -1,36 +1,11 @@
+#!/usr/bin/env python3
 """
-Edge Detector
+EDGE DETECTOR — FINAL (FRAME_AGGREGATE ENABLED)
 
-Main computer vision inference pipeline for Jetson devices. Detects specific
-farm activities (SCRAPING, FEEDING) using AI model inference, spatial filtering,
-and temporal smoothing. Emits detection signals to backend API.
-
-Activity Detection Logic:
-    - SCRAPING: Requires person + scrapping_tool within distance threshold
-    - FEEDING: Requires tmr_machine OR tractor (person optional, no distance)
-
-Key Features:
-    - Multi-activity detection with independent temporal smoothing
-    - Spatial filtering by Region of Interest (ROI)
-    - Distance-based activity validation (SCRAPING only)
-    - Fire-and-forget event emission to backend
-    - Never touches database or activity lifecycle
-
-Architecture:
-    - Edge device: Inference + signal emission only
-    - Backend: Activity lifecycle management
-    - Separation of concerns: Edge detects, backend manages
-
-Usage:
-    export EDGE_API_BASE=https://api.example.com
-    export EDGE_TOKEN=your_device_token
-    python edge_detector.py
-
-Dependencies:
-    - config.local_cache: Load cached configuration
-    - runtime.model_loader: YOLO model inference
-    - runtime.roi_utils: Spatial filtering
-    - runtime.temporal_smoother: Signal debouncing
+Edge responsibility:
+- Detect activities
+- Emit START_CANDIDATE / FRAME_AGGREGATE / END_CANDIDATE
+- NEVER decide lifecycle
 """
 
 import cv2
@@ -38,73 +13,70 @@ import time
 import math
 import os
 import requests
-
-from config.local_cache import load_config
-from runtime.model_loader import ModelRunner
-from runtime.roi_utils import filter_by_roi
-from runtime.temporal_smoother import TemporalSmoother
-
 import argparse
 
-# =========================
-# ARGUMENT PARSING (MUST BE FIRST)
-# =========================
+from dotenv import load_dotenv
+from config.local_cache import load_config
+from runtime.model_loader import ModelRunner
+from runtime.temporal_smoother import TemporalSmoother
+
+try:
+    from runtime.roi_utils import filter_by_roi
+    ROI_ENABLED = True
+except ImportError:
+    ROI_ENABLED = False
+
+# ------------------------------------------------------------------
+# Args
+# ------------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--dry-run", action="store_true")
 args = parser.parse_args()
-
 DRY_RUN = args.dry_run
 
-# =========================
-# ENV LOADING & VALIDATION
-# =========================
-from dotenv import load_dotenv
+if DRY_RUN:
+    ROI_ENABLED = False
+
+# ------------------------------------------------------------------
+# Env
+# ------------------------------------------------------------------
 load_dotenv()
-
-
 API_BASE = os.getenv("EDGE_API_BASE")
 EDGE_TOKEN = os.getenv("EDGE_TOKEN")
 
-if not DRY_RUN:
-    if not API_BASE or not EDGE_TOKEN:
-        raise RuntimeError("EDGE_API_BASE or EDGE_TOKEN not set")
+if not DRY_RUN and (not API_BASE or not EDGE_TOKEN):
+    raise RuntimeError("EDGE_API_BASE or EDGE_TOKEN not set")
 
 HEADERS = {"Authorization": f"Bearer {EDGE_TOKEN}"} if not DRY_RUN else {}
 
-
-# =========================
-# ACTIVITY SMOOTHERS
-# =========================
+# ------------------------------------------------------------------
+# Activity smoothing + emission control
+# ------------------------------------------------------------------
 SMOOTHERS = {
-    "SCRAPING": TemporalSmoother(),
+    "SCRAPPING": TemporalSmoother(),
     "FEEDING": TemporalSmoother(),
+    "MILKING": TemporalSmoother(),
 }
 
-# Class maps loaded from config (set in main())
-PERSON_CLASSES = set()
-SCRAPING_TOOL_CLASSES = set()
-TMR_CLASSES = set()
-TRACTOR_CLASSES = set()
-SCRAPING_MAX_DISTANCE_PX = 120  # Default, overridden from config
+FRAME_EMIT_INTERVAL = {
+    "FEEDING": 3,
+    "SCRAPPING": 2,
+    "MILKING": 5,
+}
 
+LAST_FRAME_EMIT = {
+    "FEEDING": 0,
+    "SCRAPPING": 0,
+    "MILKING": 0,
+}
 
-# =========================
-# UTILS - Checks distance between bounding boxes
-# =========================
-def bbox_center(bbox):
-    x1, y1, x2, y2 = bbox
-    return ((x1 + x2) / 2, (y1 + y2) / 2)
-
-
-def euclidean(p1, p2):
-    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
-
-
+# ------------------------------------------------------------------
+# Utils
+# ------------------------------------------------------------------
 def emit_event(payload):
     if DRY_RUN:
         print("[DRY-RUN]", payload)
         return
-
     try:
         requests.post(
             f"{API_BASE}/api/v1/edge/detection-event",
@@ -113,124 +85,138 @@ def emit_event(payload):
             timeout=2,
         )
     except Exception:
-        # Fire-and-forget by design
-        pass
+        pass  # fire-and-forget by design
 
+def bbox_center(b):
+    x1, y1, x2, y2 = b
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
 
-# =========================
-# ACTIVITY LOGIC (EDGE-ONLY)
-# =========================
-def detect_scraping(detections):
-    """
-    Scraping Logic:
-    - person + scrapping_tool present (using semantic class_map)
-    - distance between them <= threshold
-    """
-    persons = [d for d in detections if d["class"] in PERSON_CLASSES]
-    tools = [d for d in detections if d["class"] in SCRAPING_TOOL_CLASSES]
+def euclidean(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
+# ------------------------------------------------------------------
+# Activity logic
+# ------------------------------------------------------------------
+def detect_scrapping(detections, person_classes, tool_classes, max_dist):
+    persons = [d for d in detections if d["class"] in person_classes]
+    tools = [d for d in detections if d["class"] in tool_classes]
     for p in persons:
         pc = bbox_center(p["bbox"])
         for t in tools:
             tc = bbox_center(t["bbox"])
-            if euclidean(pc, tc) <= SCRAPING_MAX_DISTANCE_PX:
+            if euclidean(pc, tc) <= max_dist:
                 return True
-
     return False
 
+def detect_feeding(detections, tmr_classes, tractor_classes):
+    return any(
+        d["class"] in tmr_classes or d["class"] in tractor_classes
+        for d in detections
+    )
 
-def detect_feeding(detections):
-    """
-    Feeding Logic:
-    - tmr_machine OR tractor present (using semantic class_map)
-    - person optional
-    """
-    for d in detections:
-        if d["class"] in TMR_CLASSES or d["class"] in TRACTOR_CLASSES:
-            return True
-    return False
-
-
-# =========================
-# MAIN PIPELINE
-# =========================
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
 def main():
     cfg = load_config()
 
-    # Load class_map from config (MANDATORY for model evolution)
     class_map = cfg["ml_model_version"]["class_map"]
-    global PERSON_CLASSES, SCRAPING_TOOL_CLASSES, TMR_CLASSES, TRACTOR_CLASSES, SCRAPING_MAX_DISTANCE_PX
-    
-    PERSON_CLASSES = set(class_map["PERSON"])
-    SCRAPING_TOOL_CLASSES = set(class_map["SCRAPING_TOOL"])
-    TMR_CLASSES = set(class_map["TMR"])
-    TRACTOR_CLASSES = set(class_map["TRACTOR"])
+    PERSON = set(class_map["PERSON"])
+    TOOLS = set(class_map["SCRAPPING_TOOL"])  # Correct spelling: scrapping with double p
+    TMR = set(class_map["TMR"])
+    TRACTOR = set(class_map["TRACTOR"])
 
-    # Load activity parameters from config (camera-dependent thresholds)
-    activity_params = cfg.get("activity_params", {})
-    SCRAPING_MAX_DISTANCE_PX = activity_params.get("SCRAPING_MAX_DISTANCE_PX", 120)
-
-    # Use first camera for now (Phase 4 - single camera)
     camera = cfg["cameras"][0]
-
     camera_id = camera["camera_id"]
-    roi_polygon = camera["roi_polygon"]
+    roi = camera.get("roi_polygon")
+    max_dist = cfg.get("activity_params", {}).get("SCRAPING_MAX_DISTANCE_PX", 120)
 
-    # Safe guard: Validate ROI exists (fail fast > silent wrong inference)
-    if not roi_polygon:
-        raise RuntimeError(f"ROI missing for camera {camera_id}")
-
-    # FPS handling (optional - for future frame skipping)
-    fps = camera.get("fps", 5)
-    
-    # Model path resolution (backend decides which, Jetson decides where)
     model_rel_path = cfg["ml_model_version"]["model_path"]
-    model_path = os.path.join(os.getcwd(), model_rel_path)
-
+    # From jetson/ directory, go to parent (Workforce-Detection/) then to models/
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    model_path = os.path.join(project_root, model_rel_path)
     if not os.path.exists(model_path):
-        raise RuntimeError(f"Model file not found: {model_path}")
+        raise RuntimeError(f"Model not found: {model_path}")
 
-    # Use recorded video for testing (not RTSP)
-    cap = cv2.VideoCapture("test_data/scraping_defrag 2.mp4")
     runner = ModelRunner(model_path)
+
+    cap = cv2.VideoCapture("test_data/scraping_video_13.mp4")
+    if not cap.isOpened():
+        raise RuntimeError("Video open failed")
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            time.sleep(1)
-            continue
+        if not ret or frame is None:
+            break
 
         detections = runner.infer(frame)
-        detections = filter_by_roi(detections, roi_polygon)
+        if ROI_ENABLED and roi:
+            detections = filter_by_roi(detections, roi)
 
-        # ---------- SCRAPING ----------
-        scraping_present = detect_scraping(detections)
-        signal = SMOOTHERS["SCRAPING"].update(
-            detections if scraping_present else []
-        )
+        now = time.time()
 
-        if signal:
+        # ---------------- SCRAPPING ----------------
+        scrapping = detect_scrapping(detections, PERSON, TOOLS, max_dist)
+        sig = SMOOTHERS["SCRAPPING"].update(detections if scrapping else [])
+
+        if sig:
             emit_event({
-                "activity_type": "SCRAPING",
-                "event_type": signal["type"],
+                "activity_type": "SCRAPPING",
+                "event_type": sig["type"],
                 "camera_id": camera_id,
-                "ts": time.time(),
+                "ts": now,
             })
 
-        # ---------- FEEDING ----------
-        feeding_present = detect_feeding(detections)
-        signal = SMOOTHERS["FEEDING"].update(
-            detections if feeding_present else []
-        )
+        if scrapping and now - LAST_FRAME_EMIT["SCRAPPING"] >= FRAME_EMIT_INTERVAL["SCRAPPING"]:
+            emit_event({
+                "activity_type": "SCRAPPING",
+                "event_type": "FRAME_AGGREGATE",
+                "camera_id": camera_id,
+                "ts": now,
+            })
+            LAST_FRAME_EMIT["SCRAPPING"] = now
 
-        if signal:
+        # ---------------- FEEDING ----------------
+        feeding = detect_feeding(detections, TMR, TRACTOR)
+        sig = SMOOTHERS["FEEDING"].update(detections if feeding else [])
+
+        if sig:
             emit_event({
                 "activity_type": "FEEDING",
-                "event_type": signal["type"],
+                "event_type": sig["type"],
                 "camera_id": camera_id,
-                "ts": time.time(),
+                "ts": now,
             })
 
+        if feeding and now - LAST_FRAME_EMIT["FEEDING"] >= FRAME_EMIT_INTERVAL["FEEDING"]:
+            emit_event({
+                "activity_type": "FEEDING",
+                "event_type": "FRAME_AGGREGATE",
+                "camera_id": camera_id,
+                "ts": now,
+            })
+            LAST_FRAME_EMIT["FEEDING"] = now
+
+        # ---------------- MILKING ----------------
+        milking = any(d["class"] == "milking" for d in detections)
+        sig = SMOOTHERS["MILKING"].update(detections if milking else [])
+
+        if sig:
+            emit_event({
+                "activity_type": "MILKING",
+                "event_type": sig["type"],
+                "camera_id": camera_id,
+                "ts": now,
+            })
+
+        if milking and now - LAST_FRAME_EMIT["MILKING"] >= FRAME_EMIT_INTERVAL["MILKING"]:
+            emit_event({
+                "activity_type": "MILKING",
+                "event_type": "FRAME_AGGREGATE",
+                "camera_id": camera_id,
+                "ts": now,
+            })
+            LAST_FRAME_EMIT["MILKING"] = now
 
 if __name__ == "__main__":
     main()

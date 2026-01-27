@@ -24,7 +24,7 @@ from common.device_auth import resolve_device_from_headers, DeviceAuthError
 
 # PASTE A REAL DEVICE API KEY HERE
 # Get it from device_provisioning.py output when provisioning a device
-DEVICE_API_KEY = "5c399d607fe890ea61d3405b0fc40d6b17a15dac6751d6c49e61fd78ce0992a8"
+DEVICE_API_KEY = "wf_test_device_key_001"
 
 
 def main():

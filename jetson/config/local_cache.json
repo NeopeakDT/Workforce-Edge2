@@ -1,14 +1,14 @@
 {
-  "device_id": "a58db57b-49cc-4ad0-ae9e-25816c3eeb78",
-  "farm_id": "9fa991d5-23ee-429f-8c7f-09b4acc3a415",
+  "device_id": "3259cd10-d54c-42e3-88d6-b85a05e262be",
+  "farm_id": "07dbc890-2076-4018-b5fc-9f93cf2900e3",
   "farm_timezone": "Asia/Kolkata",
   "cameras": [
     {
-      "camera_id": "2b1d6d3b-ce9e-4255-ac11-b877a69e4574",
-      "code": "F2",
+      "camera_id": "8d44df12-a056-4b70-919e-ff4735453582",
+      "code": "F1-CAMERA-1",
       "rtsp_url": "rtsp://",
       "nvr_channel": null,
-      "zone_id": "52a2565f-1d90-4793-a9cf-8d35a1d6f8f8",
+      "zone_id": "47a8eaeb-1e07-4768-a039-d5329032b113",
       "resolution": "1920x1080",
       "fps": 5,
       "roi_polygon": [
@@ -30,6 +30,34 @@
         ]
       ],
       "motion_sensitivity": 3
+    },
+    {
+      "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+      "code": "F1-CAMERA-4",
+      "rtsp_url": "rtsp://",
+      "nvr_channel": null,
+      "zone_id": "47a8eaeb-1e07-4768-a039-d5329032b113",
+      "resolution": "1920x1080",
+      "fps": 28,
+      "roi_polygon": [
+        [
+          100,
+          100
+        ],
+        [
+          1200,
+          100
+        ],
+        [
+          1200,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ],
+      "motion_sensitivity": 50
     }
   ],
   "device_model_assignment": {
@@ -39,38 +67,37 @@
     "id": "bb91a462-ff2d-45b9-b5db-fc21a8e8cf26",
     "name": "farm_multi_activity_detector",
     "version": "1.0.3",
-    "model_path": "models/farm_multi_activity_detector/1.0.3/best.pt",
+    "model_path": "models/WF_V1.2_best.engine",
     "checksum": "sha256:9a4f...c2d1",
-    "metadata": {
-      "precision": "fp16",
-      "input_size": [
-        640,
-        640
+    "class_map": {
+      "TMR": [
+        "tmr_machine",
+        "feeder_wagon"
       ],
-      "postprocess": {
-        "nms_iou": 0.55,
-        "conf_threshold": 0.75
-      },
-      "model_format": ".pt",
-      "activity_thresholds": {
-        "FEEDING": {
-          "min_conf": 0.7,
-          "min_frames": 20
-        },
-        "MILKING": {
-          "min_conf": 0.75,
-          "min_frames": 30
-        },
-        "SCRAPING": {
-          "min_conf": 0.7,
-          "min_frames": 25
-        }
-      },
-      "supported_activity_codes": [
-        "MILKING",
-        "FEEDING",
-        "SCRAPING"
+      "PERSON": [
+        "person"
+      ],
+      "TRACTOR": [
+        "tractor"
+      ],
+      "SCRAPPING_TOOL": [
+        "scrapping_tool",
+        "shovel"
       ]
+    },
+    "activity_thresholds": {
+      "FEEDING": {
+        "min_conf": 0.7,
+        "min_frames": 20
+      },
+      "MILKING": {
+        "min_conf": 0.75,
+        "min_frames": 30
+      },
+      "SCRAPPING": {
+        "min_conf": 0.7,
+        "min_frames": 25
+      }
     }
   }
 }

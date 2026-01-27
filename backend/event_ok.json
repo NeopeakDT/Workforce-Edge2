@@ -1,12 +1,11 @@
 {
-  "camera_id": "31cd7e65-af3c-4531-9fd2-6aa4a233d0a4",
-  "activity_type": "SCRAPING",
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+  "activity_type": "MILKING",
   "confidence": 0.9,
-  "event_type": "END_CANDIDATE",
-  "frame_ts": "2026-01-15T07:33:00Z",
+  "event_type": "START_CANDIDATE",
+  "frame_ts": "2026-01-21T11:30:00Z",
   "objects": {
-    "SCRAPPING_TOOL": [{ "id": 1 }],
     "person": [{ "id": 1 }]
   },
-  "idempotency_key": "test-scraping-ontime-end-008"
+  "idempotency_key": "milking-start-test-08"
 }

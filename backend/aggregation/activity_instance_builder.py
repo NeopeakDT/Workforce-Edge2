@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-STEP-3 — Activity Instance Builder (AUTHORITATIVE)
+STEP-3 — Activity Instance Builder (FINAL, ROBUST, TZ-SAFE)
 
-Creates activity_instance rows from START_CANDIDATE events.
-
-Rules:
-- One instance per (farm_id, activity_type_id, activity_date)
-- Idempotent (safe to run repeatedly)
-- Does NOT classify, schedule, or close activities
+Responsibilities:
+- Ensure exactly one activity_instance per (farm, activity_type, activity_date)
+- Link ALL unlinked detection events (START / END / FRAME)
+- Compute activity_date in FARM TIMEZONE (NOT UTC)
+- Set actual_start_at ONLY from START_CANDIDATE
+- Idempotent and safe to run repeatedly
 """
 
-from datetime import timezone
 from pathlib import Path
 import sys
+import pytz
 
-# Add backend root to path
+# -------------------------------------------------------------------
+# Bootstrap
+# -------------------------------------------------------------------
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
@@ -27,20 +29,20 @@ def build_activity_instances():
     now = utc_now()
 
     with get_cursor() as cur:
-        # 1️⃣ Fetch START_CANDIDATE events that are not yet linked
+        # 1️⃣ Fetch ALL unlinked detection events (START / END / FRAME)
         cur.execute(
             """
             SELECT
-                ade.id AS event_id,
-                ade.farm_id,
-                ade.activity_type_id,
-                ade.event_time,
-                ade.device_id,
-                ade.camera_id
-            FROM activity_detection_event ade
-            WHERE ade.event_type = 'START_CANDIDATE'
-              AND ade.activity_instance_id IS NULL
-            ORDER BY ade.event_time
+                id AS event_id,
+                farm_id,
+                activity_type_id,
+                event_type,
+                event_time,
+                device_id,
+                camera_id
+            FROM activity_detection_event
+            WHERE activity_instance_id IS NULL
+            ORDER BY event_time
             """
         )
 
@@ -49,13 +51,32 @@ def build_activity_instances():
         for e in events:
             farm_id = e["farm_id"]
             activity_type_id = e["activity_type_id"]
-            start_time = e["event_time"]
-            activity_date = start_time.date()
+            event_type = e["event_type"]
+            event_time_utc = e["event_time"]
 
-            # 2️⃣ Check if instance already exists (idempotency)
+            # ---------------------------------------------------------
+            # FARM-LOCAL activity_date (CRITICAL)
+            # ---------------------------------------------------------
+            cur.execute(
+                "SELECT timezone FROM farm WHERE id = %s",
+                (farm_id,),
+            )
+            tz_row = cur.fetchone()
+            if not tz_row or not tz_row["timezone"]:
+                raise RuntimeError(
+                    f"Farm timezone missing for farm_id={farm_id}"
+                )
+
+            farm_tz = tz_row["timezone"]
+            local_dt = event_time_utc.astimezone(pytz.timezone(farm_tz))
+            activity_date = local_dt.date()
+
+            # ---------------------------------------------------------
+            # Find existing instance for (farm, activity, date)
+            # ---------------------------------------------------------
             cur.execute(
                 """
-                SELECT id
+                SELECT id, actual_start_at
                 FROM activity_instance
                 WHERE farm_id = %s
                   AND activity_type_id = %s
@@ -65,12 +86,21 @@ def build_activity_instances():
                 (farm_id, activity_type_id, activity_date),
             )
 
-            existing = cur.fetchone()
+            row = cur.fetchone()
 
-            if existing:
-                instance_id = existing["id"]
+            if row:
+                instance_id = row["id"]
             else:
-                # 3️⃣ Create new activity_instance
+                # -------------------------------------------------
+                # Create new instance
+                # actual_start_at ONLY if START_CANDIDATE
+                # -------------------------------------------------
+                actual_start_at = (
+                    event_time_utc
+                    if event_type == "START_CANDIDATE"
+                    else None
+                )
+
                 cur.execute(
                     """
                     INSERT INTO activity_instance (
@@ -100,7 +130,7 @@ def build_activity_instances():
                         farm_id,
                         activity_type_id,
                         activity_date,
-                        start_time,
+                        actual_start_at,
                         e["device_id"],
                         e["camera_id"],
                         now,
@@ -115,10 +145,11 @@ def build_activity_instances():
                     f"[ID={instance_id}]"
                     f"[ACTIVITY_TYPE={activity_type_id}]"
                     f"[DATE={activity_date}]"
-                    f"[START={start_time}]"
                 )
 
-            # 4️⃣ Link event → instance
+            # ---------------------------------------------------------
+            # Link event → instance (MANDATORY)
+            # ---------------------------------------------------------
             cur.execute(
                 """
                 UPDATE activity_detection_event

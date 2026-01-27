@@ -139,6 +139,17 @@ def edge_runtime_config(request: Request):
             raise HTTPException(status_code=500, detail="Model version not found")
 
     # -------------------------------------------------
+    # METADATA VALIDATION
+    # -------------------------------------------------
+    metadata = model["metadata"] or {}
+
+    if "class_map" not in metadata:
+        raise HTTPException(
+            status_code=500,
+            detail="Model metadata missing class_map"
+        )
+
+    # -------------------------------------------------
     # FINAL RUNTIME CONFIG PAYLOAD
     # -------------------------------------------------
     return {
@@ -151,14 +162,6 @@ def edge_runtime_config(request: Request):
         "device_model_assignment": {
             "ml_model_version_id": model_version_id
         },
-
-        metadata = model["metadata"] or {}
-
-        if "class_map" not in metadata:
-            raise HTTPException(
-                status_code=500,
-                detail="Model metadata missing class_map"
-            )
 
         "ml_model_version": {
             "id": model["id"],

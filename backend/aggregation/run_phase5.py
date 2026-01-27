@@ -5,8 +5,9 @@ aggregation/
 ├── missed_activity_cron.py        # STEP-5b
 └── run_phase5.py                      # orchestrator (optional)
 
-"""
+This script comments out the production aggregator and uses the test aggregator only.
 
+"""
 from pathlib import Path
 import sys
 
@@ -16,13 +17,13 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from aggregation.activity_instance_builder import run as step3
-from aggregation.activity_aggregator import run as step4_5a
-from aggregation.missed_activity_cron import detect_missed_activities
+from aggregation.test_activity_aggregator import run as step4_5a
 
 def run():
-    step3()
-    step4_5a()
-    # detect_missed_activities()
+    step3()        # link ALL events + create instance if needed
+    step4_5a()     # finalize + classify
 
 if __name__ == "__main__":
     run()
+
+
