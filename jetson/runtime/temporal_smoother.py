@@ -59,14 +59,14 @@ class TemporalSmoother:
             None: No significant signal
         
         Logic:
-            - START: Need 3+ detections in window (out of 5)
+            - START: Need 4+ detections in window (out of 5)
             - END: Need 1 or fewer detections in window (out of 5)
             - Prevents false positives from single-frame noise
         """
         present = bool(detections)
         self.buffer.append(present)
         
-        if not self.active and sum(self.buffer) >= 3:
+        if not self.active and sum(self.buffer) >= 4:
             self.active = True
             return {"type": "START_CANDIDATE"}
         

@@ -23,7 +23,7 @@ from common.time_utils import utc_now
 ACTIVITY_RULES = {
     "MILKING":  {"START_CONFIRM": 60, "GAP": 900, "SCHEDULE": True},
     "FEEDING":  {"START_CONFIRM": 30, "GAP": 300, "SCHEDULE": True},
-    "SCRAPING": {"START_CONFIRM": 20, "GAP": 180, "SCHEDULE": False},
+    "SCRAPPING": {"START_CONFIRM": 20, "GAP": 180, "SCHEDULE": False},
 }
 
 def load_activity_code_map(cur):
@@ -212,3 +212,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+ 

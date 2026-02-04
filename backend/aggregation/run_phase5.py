@@ -17,7 +17,10 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from aggregation.activity_instance_builder import run as step3
-from aggregation.test_activity_aggregator import run as step4_5a
+
+# NOTE: Using production activity_aggregator for STEP-4 + STEP-5a
+from aggregation.activity_aggregator import run as step4_5a
+# from aggregation.test_activity_aggregator import run as step4_5a  # old test implementation
 
 def run():
     step3()        # link ALL events + create instance if needed

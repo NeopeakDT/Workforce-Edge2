@@ -67,7 +67,7 @@
     "id": "bb91a462-ff2d-45b9-b5db-fc21a8e8cf26",
     "name": "farm_multi_activity_detector",
     "version": "1.0.3",
-    "model_path": "models/WF_V1.2_best.engine",
+    "model_path": "models/WF_V1.3_best.engine",
     "checksum": "sha256:9a4f...c2d1",
     "class_map": {
       "TMR": [

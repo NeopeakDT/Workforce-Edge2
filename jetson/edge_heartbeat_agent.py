@@ -1,79 +1,113 @@
+#!/usr/bin/env python3
 """
-Edge Heartbeat Agent
+Edge Heartbeat Agent (FINAL, TELEMETRY-AWARE)
 
-Sends periodic heartbeat messages to backend for device health monitoring.
-Runs continuously in the background to indicate device liveness.
+Responsibilities:
+- Periodically send device health heartbeat to backend
+- Collect real Jetson telemetry automatically
+- Fire-and-forget (non-blocking, fault tolerant)
 
-Key Features:
-    - Periodic heartbeat emission (default: 120 seconds)
-    - Fire-and-forget design (non-blocking)
-    - Automatic retry on next interval
-    - Device authentication via EDGE_TOKEN
+Backend endpoint:
+POST /api/v1/ingest/heartbeat
+Auth: X-DEVICE-KEY
 
-Architecture:
-    - Edge device: Sends heartbeat signals only
-    - Backend: Updates edge_device.last_seen_at timestamp
-    - Separation: Edge reports, backend monitors
-
-Usage:
-    export EDGE_API_BASE=https://api.example.com
-    export EDGE_TOKEN=your_device_token
-    python edge_heartbeat_agent.py
-
-Note: This should run as a background service (systemd) on Jetson device.
+Stored in:
+- edge_device_heartbeat (append-only)
+- edge_device.last_seen_at (updated)
 """
 
 import time
 import os
 import requests
+from dotenv import load_dotenv
 
-# =========================
+# Import Jetson-specific telemetry module
+try:
+    from jetson_telemetry import collect_telemetry
+except ImportError:
+    # Fallback if module not available (for testing on non-Jetson systems)
+    def collect_telemetry():
+        return {
+            "cpu_temp_c": None,
+            "gpu_temp_c": None,
+            "disk_usage_pct": None,
+            "memory_usage_pct": None,
+            "notes": "telemetry module not available",
+        }
+
+# ------------------------------------------------------------------
 # ENV / CONFIG
-# =========================
+# ------------------------------------------------------------------
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
+DOTENV_PATH = os.path.join(BACKEND_DIR, ".env")
+load_dotenv(DOTENV_PATH)
+
 API_BASE = os.getenv("EDGE_API_BASE")
-EDGE_TOKEN = os.getenv("EDGE_TOKEN")
+DEVICE_KEY = os.getenv("EDGE_DEVICE_KEY")
 
-if not API_BASE or not EDGE_TOKEN:
-    raise RuntimeError("EDGE_API_BASE or EDGE_TOKEN not set")
+if not API_BASE or not DEVICE_KEY:
+    raise RuntimeError("EDGE_API_BASE or EDGE_DEVICE_KEY not set")
 
-HEADERS = {"Authorization": f"Bearer {EDGE_TOKEN}"}
+# API must be /api/v1
+assert API_BASE.endswith("/api/v1"), (
+    f"EDGE_API_BASE must end with '/api/v1', got {API_BASE}"
+)
 
-# Heartbeat interval in seconds (default: 120 seconds = 2 minutes)
+HEADERS = {"X-DEVICE-KEY": DEVICE_KEY}
+
+# Interval (seconds)
 INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "120"))
 
+# ------------------------------------------------------------------
+# TELEMETRY COLLECTION
+# ------------------------------------------------------------------
+# Telemetry is collected via jetson_telemetry module
+# This provides production-grade, non-blocking telemetry for Jetson Orin devices
 
+# ------------------------------------------------------------------
+# HEARTBEAT SENDER
+# ------------------------------------------------------------------
 def send_heartbeat():
     """
-    Send heartbeat signal to backend.
+    Send heartbeat to backend with telemetry data.
     
-    Returns:
-        bool: True if successful, False otherwise
+    Collects real Jetson device metrics (CPU temp, GPU temp, disk, memory)
+    and sends them to the backend for health monitoring.
     """
+    # Collect telemetry using Jetson-specific module
+    payload = collect_telemetry()
+    
+    # Normalize API_BASE (remove trailing slash if present)
+    base_url = API_BASE.rstrip("/")
+    endpoint = f"{base_url}/ingest/heartbeat"
+
     try:
-        response = requests.post(
-            f"{API_BASE}/edge/heartbeat",
+        resp = requests.post(
+            endpoint,
             headers=HEADERS,
+            json=payload,
             timeout=5,
         )
-        # Log success (optional - can be removed for production)
-        if response.status_code == 200:
-            return True
-        return False
-    except Exception:
-        # Fire-and-forget by design - failures are expected during network issues
+
+        if resp.status_code != 200:
+            print(f"[HEARTBEAT][ERROR] HTTP {resp.status_code}: {resp.text[:200]}")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"[HEARTBEAT][ERROR] {str(e)[:200]}")
         return False
 
-
+# ------------------------------------------------------------------
+# MAIN LOOP
+# ------------------------------------------------------------------
 def main():
-    """
-    Main heartbeat loop.
-    
-    Continuously sends heartbeat signals at configured interval.
-    Runs forever until interrupted.
-    """
-    print(f"Heartbeat agent started. Interval: {INTERVAL}s")
-    print(f"Backend: {API_BASE}")
-    
+    print("Edge Heartbeat Agent started")
+    print(f"Backend   : {API_BASE}")
+    print(f"Interval  : {INTERVAL}s")
+
     while True:
         send_heartbeat()
         time.sleep(INTERVAL)

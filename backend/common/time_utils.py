@@ -25,7 +25,15 @@ def build_utc_from_local_date_time(
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    """
+    Get current UTC time, rounded to seconds (no microseconds).
+    
+    Returns timestamps in format: 2026-01-29 11:46:11+00:00
+    (instead of: 2026-01-29 11:46:11.660875+00:00)
+    """
+    now = datetime.now(timezone.utc)
+    # Round to seconds by replacing microseconds with 0
+    return now.replace(microsecond=0)
 
 def to_utc(dt: datetime) -> datetime:
     """

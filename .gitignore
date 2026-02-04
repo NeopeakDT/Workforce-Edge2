@@ -8,6 +8,7 @@ Activities/01-Milking/best.pt
 
 input_videos/
 test_data/
+runs/
 
 # Ignore all .txt files except requirements.txt
 # backend/requirements.txt

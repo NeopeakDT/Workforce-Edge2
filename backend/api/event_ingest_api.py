@@ -32,7 +32,7 @@ class DetectionEventIn(BaseModel):
     activity_type: str
     event_type: str              # detection_event_type enum
     confidence: float = Field(ge=0.0, le=1.0)
-    frame_ts: datetime
+    event_time: datetime  # Changed from frame_ts to event_time for consistency
 
     objects: Dict[str, Any]
     zones: Optional[Dict[str, Any]] = None
@@ -48,12 +48,12 @@ def validate_utc_timestamp(ts: datetime):
     if ts.tzinfo is None:
         raise HTTPException(
             status_code=400,
-            detail="frame_ts must include timezone (UTC)"
+            detail="event_time must include timezone (UTC)"
         )
     if ts.utcoffset() != timedelta(0):
         raise HTTPException(
             status_code=400,
-            detail="frame_ts must be in UTC (Z)"
+            detail="event_time must be in UTC (Z)"
         )
 
 
@@ -117,7 +117,7 @@ def ingest_event(
     farm_id = device_ctx["farm_id"]
 
     # ---------------- UTC enforcement ----------------
-    validate_utc_timestamp(payload.frame_ts)
+    validate_utc_timestamp(payload.event_time)
 
     # ---------------- Idempotency ----------------
     if payload.idempotency_key:
@@ -154,7 +154,7 @@ def ingest_event(
                 ORDER BY actual_start_at DESC
                 LIMIT 1
                 """,
-                (farm_id, activity_type_id, payload.frame_ts),
+                (farm_id, activity_type_id, payload.event_time),
             )
             row = cur.fetchone()
             if row:
@@ -185,7 +185,7 @@ def ingest_event(
                 activity_type_id,
                 activity_instance_id,
                 validated_event_type,
-                payload.frame_ts,
+                payload.event_time,
                 payload.confidence,
                 event_payload,
                 utc_now(),

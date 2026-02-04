@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-PHASE-5 — TEST ACTIVITY AGGREGATOR (FINAL, TIMEZONE-SAFE)
+PHASE-5 — TEST ACTIVITY AGGREGATOR (FINAL, DISAMBIGUATED)
 
-Responsibilities:
 STEP-4:
 - Finalize END_CANDIDATE
-- Set actual_end_at, duration
-- DO NOT classify status
 
 STEP-5:
-- Bind activity_schedule
-- Compute started_offset_min using FARM TIMEZONE
-- Classify EARLY / ON_TIME / LATE
+- Select closest schedule by ideal_start_time
+- Classify EARLY / ON_TIME / LATE relative to THAT schedule only
 
 NOTE:
 - days_of_week intentionally ignored in Phase-5
-- Will be enforced in Phase-6 scheduling rules
 """
 
 from pathlib import Path
 import sys
-from datetime import timedelta
 
 # -------------------------------------------------------------------
 # Bootstrap
@@ -57,7 +51,6 @@ def finalize_ended_activities():
         )
 
         for row in cur.fetchall():
-            instance_id = row["activity_instance_id"]
             start_at = row["actual_start_at"]
             end_at = row["actual_end_at"]
 
@@ -73,19 +66,18 @@ def finalize_ended_activities():
                     actual_duration_sec = %s,
                     updated_at = %s
                 WHERE id = %s
-                  AND status = 'IN_PROGRESS'
                 """,
-                (end_at, duration_sec, now, instance_id),
+                (end_at, duration_sec, now, row["activity_instance_id"]),
             )
 
             print(
                 f"[FINALIZED]"
-                f"[INSTANCE={instance_id}]"
+                f"[INSTANCE={row['activity_instance_id']}]"
                 f"[DURATION_SEC={duration_sec}]"
             )
 
 # -------------------------------------------------------------------
-# STEP-5 — CLASSIFY COMPLETED ACTIVITIES
+# STEP-5 — CLASSIFY COMPLETED ACTIVITIES (FIXED)
 # -------------------------------------------------------------------
 def classify_completed_activities():
     now = utc_now()
@@ -116,7 +108,7 @@ def classify_completed_activities():
             farm_tz = ai["farm_timezone"]
 
             # ---------------------------------------------------------
-            # Deterministic schedule scan (IMPORTANT)
+            # Load schedules
             # ---------------------------------------------------------
             cur.execute(
                 """
@@ -125,7 +117,6 @@ def classify_completed_activities():
                 WHERE farm_id = %s
                   AND activity_type_id = %s
                   AND is_active = true
-                ORDER BY ideal_start_time
                 """,
                 (farm_id, activity_type_id),
             )
@@ -135,15 +126,12 @@ def classify_completed_activities():
                 print(f"[NO_SCHEDULES][INSTANCE={instance_id}]")
                 continue
 
-            matched_schedule = None
-            started_offset_min = None
-            within_ideal = False
-            status = None
+            # ---------------------------------------------------------
+            # Compute closest schedule by ideal_start_utc
+            # ---------------------------------------------------------
+            candidates = []
 
             for s in schedules:
-                tol_early = s["tolerance_early_min"]
-                tol_late = s["tolerance_late_min"]
-
                 cur.execute(
                     """
                     SELECT
@@ -155,36 +143,34 @@ def classify_completed_activities():
 
                 ideal_start_utc = cur.fetchone()["ideal_start_utc"]
 
-                offset_min = int(
-                    (actual_start_at - ideal_start_utc).total_seconds() / 60
+                diff_sec = abs(
+                    (actual_start_at - ideal_start_utc).total_seconds()
                 )
 
-                if -tol_early <= offset_min <= tol_late:
-                    matched_schedule = s
-                    started_offset_min = offset_min
-                    within_ideal = True
-                    status = "ON_TIME"
-                    break
+                candidates.append((diff_sec, s, ideal_start_utc))
 
-                if offset_min < -tol_early:
-                    matched_schedule = s
-                    started_offset_min = offset_min
-                    status = "EARLY"
-                    break
+            candidates.sort(key=lambda x: x[0])
+            _, matched_schedule, ideal_start_utc = candidates[0]
 
-                if offset_min > tol_late:
-                    matched_schedule = s
-                    started_offset_min = offset_min
-                    status = "LATE"
-                    # keep checking later schedules
+            # ---------------------------------------------------------
+            # Classify relative to chosen schedule ONLY
+            # ---------------------------------------------------------
+            tol_early = matched_schedule["tolerance_early_min"]
+            tol_late = matched_schedule["tolerance_late_min"]
 
-            if not matched_schedule:
-                print(
-                    f"[NO_SCHEDULE_MATCH]"
-                    f"[INSTANCE={instance_id}]"
-                    f"[START={actual_start_at}]"
-                )
-                continue
+            started_offset_min = int(
+                (actual_start_at - ideal_start_utc).total_seconds() / 60
+            )
+
+            if started_offset_min < -tol_early:
+                status = "EARLY"
+                within_ideal = False
+            elif started_offset_min > tol_late:
+                status = "LATE"
+                within_ideal = False
+            else:
+                status = "ON_TIME"
+                within_ideal = True
 
             cur.execute(
                 """
@@ -195,7 +181,6 @@ def classify_completed_activities():
                     within_ideal_window = %s,
                     updated_at = %s
                 WHERE id = %s
-                  AND status = 'IN_PROGRESS'
                 """,
                 (
                     matched_schedule["id"],
@@ -210,6 +195,7 @@ def classify_completed_activities():
             print(
                 f"[CLASSIFIED]"
                 f"[INSTANCE={instance_id}]"
+                f"[SCHEDULE={matched_schedule['label']}]"
                 f"[STATUS={status}]"
                 f"[OFFSET_MIN={started_offset_min}]"
             )

@@ -37,35 +37,39 @@ class ModelRunner:
             device: Device to run inference on ("cpu", "cuda", "0", etc.)
         """
         self.model = YOLO(model_path)
-        self.device = device
-
-        # TEMPORARY: Force CPU for testing (uncomment to test on CPU)
-        self.device = "cpu"
-
+        
         # Check if this is a TensorRT engine file
         self.is_engine = model_path.endswith('.engine')
-
-        # For CPU testing, use .pt model instead of .engine (TensorRT needs GPU)
-        if self.device == "cpu" and self.is_engine:
-            print("🔧 ModelRunner: CPU detected, switching to PyTorch model for compatibility")
-            # Replace .engine with .pt in the path
-            pt_path = model_path.replace('.engine', '.pt')
-            print(f"🔧 ModelRunner: Checking for PyTorch model at: {pt_path}")
-            print(f"🔧 ModelRunner: PyTorch model exists: {os.path.exists(pt_path)}")
-            if os.path.exists(pt_path):
-                print("🔧 ModelRunner: Loading PyTorch model...")
-                self.model = YOLO(pt_path)
-                self.is_engine = False
-                print(f"✅ ModelRunner: Successfully loaded PyTorch model: {pt_path}")
-            else:
-                print(f"⚠️ ModelRunner: PyTorch model not found at {pt_path}, using TensorRT anyway")
+        
+        # Auto-detect device: Use CUDA for TensorRT engines, respect device parameter otherwise
+        if self.is_engine:
+            # TensorRT engines require GPU/CUDA
+            self.device = "cuda"  # Force CUDA for TensorRT
+            print("🔧 ModelRunner: TensorRT engine detected, using CUDA (required)")
+        else:
+            # For .pt/.onnx models, use the provided device or default to cuda
+            self.device = device if device else "cuda"
+            print(f"🔧 ModelRunner: Using device: {self.device}")
+        
+        # Validate CUDA availability if using CUDA
+        if self.device == "cuda" or (isinstance(self.device, str) and "cuda" in self.device):
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    raise RuntimeError("CUDA requested but not available. Check GPU drivers.")
+                print(f"✅ ModelRunner: CUDA available - Device: {torch.cuda.get_device_name(0)}")
+            except ImportError:
+                print("⚠️ ModelRunner: PyTorch not available, CUDA check skipped")
+            except Exception as e:
+                raise RuntimeError(f"CUDA setup failed: {e}")
 
         print(f"🔧 ModelRunner: Loading model on device '{self.device}' (format: {'TensorRT' if self.is_engine else 'PyTorch'})")
 
         # Handle different model formats
         if self.is_engine:
-            # TensorRT engine files are already optimized, don't apply PyTorch operations
-            print("🔧 ModelRunner: TensorRT engine loaded (no device transfer needed)")
+            # TensorRT engine files are already optimized for GPU
+            # No PyTorch operations needed - TensorRT handles device placement
+            print("✅ ModelRunner: TensorRT engine loaded (GPU-optimized)")
         elif self.device == "cuda" or (isinstance(self.device, str) and "cuda" in self.device):
             print("🔧 ModelRunner: Applying CUDA optimizations (FP16, fused)")
             self.model.fuse()
@@ -91,9 +95,8 @@ class ModelRunner:
         """
         # Prepare inference parameters based on model type
         inference_kwargs = {
-            "imgsz": 320,  # Further reduced for Jetson memory constraints
+            "imgsz": 416,  # Further reduced for Jetson memory constraints
             "conf": 0.25,  # Default confidence threshold
-            "verbose": False
         }
 
         # Handle different model formats
@@ -101,18 +104,21 @@ class ModelRunner:
             # TensorRT engine - device is already configured, don't specify half
             inference_kwargs["device"] = self.device
         elif self.device == "cuda" or (isinstance(self.device, str) and "cuda" in self.device):
-            # PyTorch CUDA model - use FP16 optimizations
+            # PyTorch CUDA model - use FP16 optimizations (model is already FP16, frame stays uint8)
             inference_kwargs["device"] = self.device
             inference_kwargs["half"] = True
-
-            # Convert frame to FP16 for CUDA
-            import numpy as np
-            frame = frame.astype(np.float16)
         else:
             # CPU model
             inference_kwargs["device"] = self.device
 
-        results = self.model(frame, **inference_kwargs)[0]
+        # CRITICAL: stream=False to prevent GPU/DMA aliasing issues
+        # Explicitly set stream=False and verbose=False (not in kwargs to ensure they're not overridden)
+        results = self.model(
+            frame,
+            stream=False,
+            verbose=False,
+            **inference_kwargs
+        )[0]
         
         detections = []
         
