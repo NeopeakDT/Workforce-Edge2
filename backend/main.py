@@ -23,7 +23,7 @@ from fastapi import FastAPI
 # Phase Flags (explicit & safe)
 # -------------------------------------------------
 ENABLE_INGEST_APIS = True          # Phase 4
-ENABLE_DASHBOARD_APIS = True       # Phase 6 (read-only)
+ENABLE_DASHBOARD_APIS = False      # Phase 6 (read-only)
 ENABLE_ADMIN_APIS = False          # Optional
 
 # -------------------------------------------------
