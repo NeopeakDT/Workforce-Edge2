@@ -9,6 +9,7 @@ Activities/01-Milking/best.pt
 input_videos/
 test_data/
 runs/
+project_code.zip
 
 # Ignore all .txt files except requirements.txt
 # backend/requirements.txt

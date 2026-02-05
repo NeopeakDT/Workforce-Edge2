@@ -14,6 +14,8 @@ import math
 import os
 import requests
 from datetime import datetime, timezone
+from queue import Queue
+from threading import Thread
 
 from dotenv import load_dotenv
 from config.local_cache import load_config
@@ -47,6 +49,11 @@ assert API_BASE.endswith("/api/v1"), (
 HEADERS = {"X-DEVICE-KEY": DEVICE_KEY}
 
 # ------------------------------------------------------------------
+# Async event queue (CRITICAL for performance)
+# ------------------------------------------------------------------
+EVENT_QUEUE = Queue(maxsize=2000)
+
+# ------------------------------------------------------------------
 # Video Configuration
 # ------------------------------------------------------------------
 VIDEO_FILE_PATH = os.path.join(
@@ -65,11 +72,11 @@ SMOOTHERS = {
     "FEEDING": TemporalSmoother(),
     "MILKING": TemporalSmoother(),
 }
-
+# Send FRAME_AGGREGATE at intervals (production-safe, reduced spam)
 FRAME_EMIT_INTERVAL = {
-    "FEEDING": 3,
-    "SCRAPPING": 2,
-    "MILKING": 5,
+    "FEEDING": 5,
+    "SCRAPPING": 5,
+    "MILKING": 8,
 }
 
 LAST_FRAME_EMIT = {
@@ -134,6 +141,25 @@ def emit_event(payload):
     except Exception as e:
         print(f"[EDGE][ERROR] Request failed: {str(e)[:200]}")
 
+def event_sender():
+    """
+    Background thread that sends events to backend.
+    This MUST NEVER block inference.
+    """
+    while True:
+        payload = EVENT_QUEUE.get()
+        try:
+            requests.post(
+                f"{API_BASE.rstrip('/')}/ingest/event",
+                json=payload,
+                headers=HEADERS,
+                timeout=3,
+            )
+        except Exception as e:
+            print(f"[EDGE][EVENT-SENDER] failed: {str(e)[:200]}")
+        finally:
+            EVENT_QUEUE.task_done()
+
 def bbox_center(b):
     x1, y1, x2, y2 = b
     return ((x1 + x2) / 2, (y1 + y2) / 2)
@@ -179,6 +205,9 @@ def main():
 
     model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
     runner = ModelRunner(model_path)
+
+    # Start async event sender (daemon thread)
+    Thread(target=event_sender, daemon=True).start()
 
     cap = cv2.VideoCapture(VIDEO_FILE_PATH)
     if not cap.isOpened():
@@ -226,10 +255,11 @@ def main():
         total_processing_time += frame_processing_time
         ts = video_timestamp(frame_count)  # Use actual video frame index for correct timestamp
 
-        if detections:
+        if detections and processed_frame_count % 50 == 0:
             classes = sorted({d["class"] for d in detections})
             print(
-                f"Frame {processed_frame_count:5d} | Time: {ts:6.2f}s | "
+                f"Frame {processed_frame_count:5d} | "
+                f"Time: {ts:6.2f}s | "
                 f"Classes: [{', '.join(classes)}] | "
                 f"Process: {frame_processing_time*1000:.1f}ms"
             )
@@ -247,11 +277,19 @@ def main():
             if sig["type"] == "END_CANDIDATE" and not ACTIVE["SCRAPPING"]:
                 pass  # Skip duplicate END
             else:
-                emit_event(build_event_payload("SCRAPPING", sig["type"], camera_id, detections))
+                payload = build_event_payload("SCRAPPING", sig["type"], camera_id, detections)
+                try:
+                    EVENT_QUEUE.put(payload, block=False)
+                except:
+                    pass  # drop event if queue is full (backpressure safety)
                 ACTIVE["SCRAPPING"] = sig["type"] != "END_CANDIDATE"
 
         if scrapping and ACTIVE["SCRAPPING"] and now - LAST_FRAME_EMIT["SCRAPPING"] >= FRAME_EMIT_INTERVAL["SCRAPPING"]:
-            emit_event(build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, detections))
+            payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, detections)
+            try:
+                EVENT_QUEUE.put(payload, block=False)
+            except:
+                pass  # drop event if queue is full (backpressure safety)
             LAST_FRAME_EMIT["SCRAPPING"] = now
 
         # FEEDING
@@ -265,11 +303,19 @@ def main():
             if sig["type"] == "END_CANDIDATE" and not ACTIVE["FEEDING"]:
                 pass  # Skip duplicate END
             else:
-                emit_event(build_event_payload("FEEDING", sig["type"], camera_id, detections))
+                payload = build_event_payload("FEEDING", sig["type"], camera_id, detections)
+                try:
+                    EVENT_QUEUE.put(payload, block=False)
+                except:
+                    pass  # drop event if queue is full (backpressure safety)
                 ACTIVE["FEEDING"] = sig["type"] != "END_CANDIDATE"
 
         if feeding and ACTIVE["FEEDING"] and now - LAST_FRAME_EMIT["FEEDING"] >= FRAME_EMIT_INTERVAL["FEEDING"]:
-            emit_event(build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, detections))
+            payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, detections)
+            try:
+                EVENT_QUEUE.put(payload, block=False)
+            except:
+                pass  # drop event if queue is full (backpressure safety)
             LAST_FRAME_EMIT["FEEDING"] = now
 
         # MILKING (disabled - model doesn't support it yet)
@@ -283,11 +329,19 @@ def main():
             if sig["type"] == "END_CANDIDATE" and not ACTIVE["MILKING"]:
                 pass  # Skip duplicate END
             else:
-                emit_event(build_event_payload("MILKING", sig["type"], camera_id, detections))
+                payload = build_event_payload("MILKING", sig["type"], camera_id, detections)
+                try:
+                    EVENT_QUEUE.put(payload, block=False)
+                except:
+                    pass  # drop event if queue is full (backpressure safety)
                 ACTIVE["MILKING"] = sig["type"] != "END_CANDIDATE"
 
         if milking and ACTIVE["MILKING"] and now - LAST_FRAME_EMIT["MILKING"] >= FRAME_EMIT_INTERVAL["MILKING"]:
-            emit_event(build_event_payload("MILKING", "FRAME_AGGREGATE", camera_id, detections))
+            payload = build_event_payload("MILKING", "FRAME_AGGREGATE", camera_id, detections)
+            try:
+                EVENT_QUEUE.put(payload, block=False)
+            except:
+                pass  # drop event if queue is full (backpressure safety)
             LAST_FRAME_EMIT["MILKING"] = now
 
     cap.release()
