@@ -11,6 +11,14 @@ test_data/
 runs/
 project_code.zip
 
+IMPLEMENTATION_VS_SPEC_ANALYSIS.md
+Updated_project_code.zip
+VERIFICATION_SUMMARY.md
+WORKFORCE_EVENT_PIPELINE.md
+workforce_execution_checklist.txt
+workforce_full_conversation_export.txt
+Data-cleanup-SQL.txt
+
 # Ignore all .txt files except requirements.txt
 # backend/requirements.txt
 # *.txt

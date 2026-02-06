@@ -1,32 +1,71 @@
+#!/usr/bin/env python3
 """
-aggregation/
-├── activity_instance_builder.py      # STEP-3
-├── activity_aggregator.py             # STEP-4 + STEP-5a
-├── missed_activity_cron.py        # STEP-5b
-└── run_phase5.py                      # orchestrator (optional)
+PHASE-5 ORCHESTRATOR (SAFE, FINAL)
 
-This script comments out the production aggregator and uses the test aggregator only.
+This script exists ONLY for:
+- local testing
+- manual backfills
+- controlled execution
 
+It MUST NOT:
+- create activity_instance rows
+- link detection events
+- infer lifecycle
+- call legacy builder logic
+
+Authoritative lifecycle ownership:
+- STEP-1: Edge
+- STEP-2: Ingest API
+- STEP-3: activity_aggregator (resolver)
+- STEP-5: missed_activity_cron (finalizer)
+------------------------------------------------------------------------------------
+
+EDGE (real-time)
+   ↓
+INGEST API (real-time, transactional)
+   ↓
+STEP-3 resolver (periodic / manual)
+   ↓
+STEP-5 cron (periodic)
+------------------------------------------------------------------------------------------------
 """
+
 from pathlib import Path
 import sys
 
-# Add backend root to Python path
+# -------------------------------------------------
+# Bootstrap backend path
+# -------------------------------------------------
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from aggregation.activity_instance_builder import run as step3
+# STEP-3 — Resolver (zone, merge, schedule binding)
+from aggregation.activity_aggregator import run as step3_resolver
 
-# NOTE: Using production activity_aggregator for STEP-4 + STEP-5a
-from aggregation.activity_aggregator import run as step4_5a
-# from aggregation.test_activity_aggregator import run as step4_5a  # old test implementation
+# STEP-5 — Finalization + MISSED (authoritative)
+from aggregation.missed_activity_cron import (
+    finalize_completed_activities,
+    detect_missed_activities,
+)
+
 
 def run():
-    step3()        # link ALL events + create instance if needed
-    step4_5a()     # finalize + classify
+    """
+    Manual / local execution order.
+
+    Safe to run multiple times.
+    Idempotent by design.
+    """
+    print("[PHASE-5] STEP-3 resolver starting…")
+    step3_resolver()
+
+    print("[PHASE-5] STEP-5 finalization starting…")
+    finalize_completed_activities()
+    detect_missed_activities()
+
+    print("[PHASE-5] DONE")
+
 
 if __name__ == "__main__":
     run()
-
-

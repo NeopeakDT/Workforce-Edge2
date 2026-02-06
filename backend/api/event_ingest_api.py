@@ -1,10 +1,13 @@
 """
-Event Ingest API
+Event Ingest API — STEP-2
 
 Accepts detection events from Jetson devices and writes to
-activity_detection_event table.
+activity_detection_event table with:
+- DB-level idempotency (event_id unique constraint)
+- Transactional processing
+- Session-scoped aggregation
 
-PHASE 4 — TRUST BOUNDARY
+STEP-2 — IDEMPOTENCY + TRANSACTION
 """
 
 from fastapi import APIRouter, Header, HTTPException
@@ -14,9 +17,9 @@ from uuid import UUID
 from datetime import datetime, timezone, timedelta
 
 from psycopg2.extras import Json
+from psycopg2 import IntegrityError
 
 from common.db import get_cursor
-from common.idempotency import is_duplicate, mark_processed
 from common.time_utils import utc_now
 from common.device_auth import resolve_device_from_headers, DeviceAuthError
 
@@ -28,16 +31,17 @@ router = APIRouter(prefix="/ingest", tags=["ingestion"])
 # -------------------------------------------------
 
 class DetectionEventIn(BaseModel):
+    event_id: UUID  # Required: unique per event (used for DB-level idempotency)
+    session_id: UUID  # Required: groups events from same activity run
     camera_id: UUID
     activity_type: str
-    event_type: str              # detection_event_type enum
+    event_type: str  # detection_event_type enum: START_CANDIDATE, FRAME_AGGREGATE, END_CANDIDATE
     confidence: float = Field(ge=0.0, le=1.0)
-    event_time: datetime  # Changed from frame_ts to event_time for consistency
+    event_time: datetime  # UTC timestamptz
 
     objects: Dict[str, Any]
     zones: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
-    idempotency_key: Optional[str] = None
 
 
 # -------------------------------------------------
@@ -105,6 +109,14 @@ def ingest_event(
     payload: DetectionEventIn,
     x_device_key: str = Header(..., alias="X-DEVICE-KEY"),
 ):
+    """
+    STEP-2: Idempotent, transactional event ingestion.
+    
+    Contract:
+    - DB-level idempotency via event_id unique constraint
+    - Single transaction for all operations
+    - Session-scoped aggregation logic
+    """
     # ---------------- Device authentication ----------------
     try:
         device_ctx = resolve_device_from_headers(
@@ -119,12 +131,6 @@ def ingest_event(
     # ---------------- UTC enforcement ----------------
     validate_utc_timestamp(payload.event_time)
 
-    # ---------------- Idempotency ----------------
-    if payload.idempotency_key:
-        if is_duplicate(payload.idempotency_key):
-            return {"status": "duplicate_ignored"}
-        mark_processed(payload.idempotency_key)
-
     # ---------------- Reference resolution ----------------
     activity_type_id = resolve_activity_type_id(payload.activity_type)
     validated_event_type = validate_detection_event_type(payload.event_type)
@@ -137,59 +143,209 @@ def ingest_event(
     })
 
     # -------------------------------------------------
-    # 🔑 CRITICAL FIX: Attach END_CANDIDATE to open instance
+    # STEP-2: Single transaction for all operations
+    # Explicit transaction control with manual commit/rollback
     # -------------------------------------------------
-    activity_instance_id = None
-
-    if validated_event_type == "END_CANDIDATE":
-        with get_cursor() as cur:
+    with get_cursor() as cur:
+        try:
+            # 1. Insert event with DB-level idempotency (event_id unique constraint)
             cur.execute(
                 """
-                SELECT id
-                FROM activity_instance
-                WHERE farm_id = %s
-                  AND activity_type_id = %s
-                  AND status = 'IN_PROGRESS'
-                  AND actual_start_at <= %s
-                ORDER BY actual_start_at DESC
-                LIMIT 1
+                INSERT INTO activity_detection_event (
+                    event_id,
+                    session_id,
+                    farm_id,
+                    device_id,
+                    camera_id,
+                    activity_type_id,
+                    event_type,
+                    event_time,
+                    ai_confidence,
+                    payload,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (farm_id, activity_type_id, payload.event_time),
+                (
+                    str(payload.event_id),
+                    str(payload.session_id),
+                    str(farm_id),
+                    str(device_id),
+                    str(payload.camera_id),
+                    activity_type_id,
+                    validated_event_type,
+                    payload.event_time,
+                    payload.confidence,
+                    event_payload,
+                    utc_now(),
+                ),
             )
-            row = cur.fetchone()
-            if row:
-                activity_instance_id = row["id"]
+        except IntegrityError as e:
+            # DB-level idempotency: event_id already exists (unique constraint violation)
+            # Check if it's a unique constraint violation on event_id
+            if "uq_event_id" in str(e) or "event_id" in str(e):
+                # Duplicate event - rollback and return (context manager will handle cleanup)
+                cur.connection.rollback()
+                return {"status": "duplicate_ignored"}
+            # Re-raise if it's a different integrity error (context manager will rollback)
+            raise
 
-    # ---------------- Insert-only write ----------------
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO activity_detection_event (
-                farm_id,
-                device_id,
-                camera_id,
-                activity_type_id,
-                activity_instance_id,
-                event_type,
-                event_time,
-                ai_confidence,
-                payload,
-                created_at
+        try:
+            # 2. Apply session-scoped aggregation logic
+            _apply_session_aggregation(
+                cur=cur,
+                event_id=payload.event_id,
+                session_id=payload.session_id,
+                farm_id=farm_id,
+                activity_type_id=activity_type_id,
+                event_type=validated_event_type,
+                event_time=payload.event_time,
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                str(farm_id),
-                str(device_id),
-                str(payload.camera_id),
-                activity_type_id,
-                activity_instance_id,
-                validated_event_type,
-                payload.event_time,
-                payload.confidence,
-                event_payload,
-                utc_now(),
-            ),
-        )
+            # Explicit commit on success (before context manager commit)
+            cur.connection.commit()
+        except Exception:
+            # Rollback on aggregation failure to maintain atomicity
+            # Context manager will also rollback, but explicit rollback ensures state
+            cur.connection.rollback()
+            raise
 
     return {"status": "ok"}
+
+
+def _apply_session_aggregation(
+    cur,
+    event_id: UUID,
+    session_id: UUID,
+    farm_id: UUID,
+    activity_type_id: int,
+    event_type: str,
+    event_time: datetime,
+):
+    """
+    STEP-2: Session-scoped aggregation logic.
+    
+    Rules:
+    - START_CANDIDATE: Create instance if session doesn't exist (first wins)
+    - FRAME_AGGREGATE: Append if session exists and has START (ignore if no START)
+    - END_CANDIDATE: Mark end if session exists and has START (last wins, first END wins)
+    
+    NOTE:
+    FRAME_AGGREGATE and END_CANDIDATE events without START_CANDIDATE
+    are intentionally kept unlinked.
+    Do NOT create instances from them.
+    """
+    # Fetch session state
+    cur.execute(
+        """
+        SELECT 
+            id,
+            status,
+            actual_start_at,
+            actual_end_at
+        FROM activity_instance
+        WHERE session_id = %s
+        LIMIT 1
+        """,
+        (str(session_id),),
+    )
+    session_row = cur.fetchone()
+
+    if event_type == "START_CANDIDATE":
+        # START: Create instance if session doesn't exist (first wins)
+        # Status is IN_PROGRESS (no pending states in STEP-2)
+        if not session_row:
+            cur.execute(
+                """
+                INSERT INTO activity_instance (
+                    session_id,
+                    farm_id,
+                    activity_type_id,
+                    status,
+                    actual_start_at,
+                    source,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, 'IN_PROGRESS', %s, 'AI', %s, %s)
+                RETURNING id
+                """,
+                (
+                    str(session_id),
+                    str(farm_id),
+                    activity_type_id,
+                    event_time,
+                    utc_now(),
+                    utc_now(),
+                ),
+            )
+            instance_id = cur.fetchone()["id"]
+            
+            # Link event to instance
+            cur.execute(
+                """
+                UPDATE activity_detection_event
+                SET activity_instance_id = %s
+                WHERE event_id = %s
+                """,
+                (instance_id, str(event_id)),
+            )
+        # Else: duplicate START, ignore (already handled by event_id unique constraint)
+
+    elif event_type == "FRAME_AGGREGATE":
+        # FRAME: Append if session exists and is IN_PROGRESS (ignore if no START)
+        # FRAMEs only extend liveness, nothing else
+        if session_row and session_row["status"] == "IN_PROGRESS":
+            # Link event to instance
+            cur.execute(
+                """
+                UPDATE activity_detection_event
+                SET activity_instance_id = %s
+                WHERE event_id = %s
+                """,
+                (session_row["id"], str(event_id)),
+            )
+        # Else: FRAME without START, ignore (keep event unlinked)
+
+    elif event_type == "END_CANDIDATE":
+        # END: Set end time if session exists and is IN_PROGRESS (first END wins)
+        # DO NOT change status - END_CANDIDATE only means "edge says activity stopped"
+        # Final outcome (EARLY/LATE/COMPLETED) is resolved later in STEP-3/5
+        # Guard: Only apply END if not already ended (prevent duplicate END overwrites)
+        if (
+            session_row
+            and session_row["status"] == "IN_PROGRESS"
+            and session_row["actual_end_at"] is None
+        ):
+            # Calculate duration (clamp to >= 0 to handle clock jitter)
+            duration_sec = max(
+                0,
+                int((event_time - session_row["actual_start_at"]).total_seconds())
+            )
+            
+            cur.execute(
+                """
+                UPDATE activity_instance
+                SET 
+                    actual_end_at = %s,
+                    actual_duration_sec = %s,
+                    updated_at = %s
+                WHERE id = %s
+                """,
+                (
+                    event_time,
+                    duration_sec,
+                    utc_now(),
+                    session_row["id"],
+                ),
+            )
+            
+            # Link event to instance
+            cur.execute(
+                """
+                UPDATE activity_detection_event
+                SET activity_instance_id = %s
+                WHERE event_id = %s
+                """,
+                (session_row["id"], str(event_id)),
+            )
+        # Else: END without START or duplicate END, ignore (keep event unlinked)

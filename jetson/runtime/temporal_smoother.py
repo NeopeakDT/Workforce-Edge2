@@ -15,8 +15,7 @@ Usage:
     
     smoother = TemporalSmoother(window=5)
     result = smoother.update(detections)
-    # Returns: {"type": "START_CANDIDATE"}, {"type": "END_CANDIDATE"}, 
-    #          {"type": "FRAME_AGGREGATE"}, or None
+    # Returns: "START", "END", or None (semantic signals)
 """
 
 from collections import deque
@@ -46,17 +45,15 @@ class TemporalSmoother:
         Update smoother with new frame detections.
         
         Converts noisy frame-level detections into stable activity signals.
-        Returns event type when activity state changes.
+        Returns semantic signal when activity state changes.
         
         Args:
             detections: List of detections (empty list = no detection)
             
         Returns:
-            Dict with "type" key:
-                - "START_CANDIDATE": Activity likely started
-                - "END_CANDIDATE": Activity likely ended
-                - "FRAME_AGGREGATE": Activity ongoing
-            None: No significant signal
+            "START": Activity likely started (semantic signal)
+            "END": Activity likely ended (semantic signal)
+            None: No state change
         
         Logic:
             - START: Need 4+ detections in window (out of 5)
@@ -68,13 +65,10 @@ class TemporalSmoother:
         
         if not self.active and sum(self.buffer) >= 4:
             self.active = True
-            return {"type": "START_CANDIDATE"}
+            return "START"
         
         if self.active and sum(self.buffer) <= 1:
             self.active = False
-            return {"type": "END_CANDIDATE"}
-        
-        if self.active:
-            return {"type": "FRAME_AGGREGATE"}
+            return "END"
         
         return None

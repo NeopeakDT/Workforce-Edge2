@@ -16,6 +16,7 @@ import requests
 from datetime import datetime, timezone
 from queue import Queue
 from threading import Thread
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from config.local_cache import load_config
@@ -29,6 +30,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
 DOTENV_PATH = os.path.join(BACKEND_DIR, ".env")
 load_dotenv(DOTENV_PATH)
+
+# ------------------------------------------------------------------
+# Edge-side constants (standalone, no backend dependency)
+# ------------------------------------------------------------------
+FRAME_AGGREGATE_INTERVAL_SEC = 10  # seconds
 
 API_BASE = os.getenv("EDGE_API_BASE")
 DEVICE_KEY = os.getenv("EDGE_DEVICE_KEY")
@@ -59,42 +65,54 @@ EVENT_QUEUE = Queue(maxsize=2000)
 VIDEO_FILE_PATH = os.path.join(
     PROJECT_ROOT,
     "test_data",
-    "Full_scrapping_video.mp4"
+    "Scraping video 8.mp4"
 )
 
 PROCESSING_FPS = float(os.getenv("EDGE_PROCESSING_FPS", "10.0"))
 
 # ------------------------------------------------------------------
-# Activity smoothing + emission control
+# Activity smoothing
 # ------------------------------------------------------------------
 SMOOTHERS = {
     "SCRAPPING": TemporalSmoother(),
     "FEEDING": TemporalSmoother(),
-    "MILKING": TemporalSmoother(),
-}
-# Send FRAME_AGGREGATE at intervals (production-safe, reduced spam)
-FRAME_EMIT_INTERVAL = {
-    "FEEDING": 5,
-    "SCRAPPING": 5,
-    "MILKING": 8,
+    # MILKING disabled - model doesn't support it yet
 }
 
-LAST_FRAME_EMIT = {
-    "FEEDING": 0,
-    "SCRAPPING": 0,
-    "MILKING": 0,
-}
-
-ACTIVE = {
-    "SCRAPPING": False,
-    "FEEDING": False,
-    "MILKING": False,
+# ------------------------------------------------------------------
+# Activity State Machine (per activity)
+# ------------------------------------------------------------------
+ACTIVITY_STATE = {
+    "SCRAPPING": {
+        "state": "INACTIVE",
+        "session_id": None,
+        "last_frame_emit": 0.0,
+    },
+    "FEEDING": {
+        "state": "INACTIVE",
+        "session_id": None,
+        "last_frame_emit": 0.0,
+    },
+    # MILKING disabled - model doesn't support it yet
 }
 
 # ------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------
-def build_event_payload(activity, event_type, camera_id, detections):
+def build_event_payload(activity, event_type, camera_id, detections, session_id):
+    """
+    Build event payload with mandatory event_id and session_id.
+    
+    Args:
+        activity: Activity type (SCRAPPING, FEEDING, MILKING)
+        event_type: Event type (START_CANDIDATE, FRAME_AGGREGATE, END_CANDIDATE)
+        camera_id: Camera identifier
+        detections: List of detections
+        session_id: UUID session identifier (must be provided)
+    
+    Returns:
+        Event payload dictionary
+    """
     objects_dict = {}
     confidences = []
 
@@ -116,30 +134,20 @@ def build_event_payload(activity, event_type, camera_id, detections):
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     event_time = now_utc.isoformat().replace("+00:00", "Z")
 
-    idempotency_key = f"{camera_id}-{activity}-{event_type}-{int(time.time() // 5)}"
+    # Generate unique event_id and use it as idempotency_key
+    event_id = str(uuid4())
 
     return {
+        "event_id": event_id,
+        "session_id": session_id,
         "camera_id": str(camera_id),
         "activity_type": activity,
         "event_type": event_type,
         "event_time": event_time,
         "confidence": confidence,
         "objects": objects_dict,
-        "idempotency_key": idempotency_key,
+        "idempotency_key": event_id,  # Use event_id as idempotency key
     }
-
-def emit_event(payload):
-    try:
-        resp = requests.post(
-            f"{API_BASE.rstrip('/')}/ingest/event",
-            json=payload,
-            headers=HEADERS,
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            print(f"[EDGE][ERROR] HTTP {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        print(f"[EDGE][ERROR] Request failed: {str(e)[:200]}")
 
 def event_sender():
     """
@@ -203,8 +211,21 @@ def main():
     camera_id = camera["camera_id"]
     max_dist = cfg.get("activity_params", {}).get("SCRAPING_MAX_DISTANCE_PX", 120)
 
+    # Auto-detect device: Use CPU if CUDA not available (for laptop testing)
+    device = os.getenv("EDGE_DEVICE", None)  # Allow override via env var
+    if device is None:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            device = "cpu"
+        except Exception:
+            device = "cpu"
+    
+    print(f"🔧 Edge Detector: Using device: {device}")
+    
     model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
-    runner = ModelRunner(model_path)
+    runner = ModelRunner(model_path, device=device)
 
     # Start async event sender (daemon thread)
     Thread(target=event_sender, daemon=True).start()
@@ -266,83 +287,99 @@ def main():
 
         now = time.time()
 
-        # SCRAPPING
+        # ------------------------------------------------------------------
+        # SCRAPPING - State Machine
+        # ------------------------------------------------------------------
         scrapping = detect_scrapping(detections, PERSON, TOOLS, max_dist)
-        # Note: When frames are skipped, smoothing windows are effectively longer
-        # This is acceptable for scrapping/feeding activities
         sig = SMOOTHERS["SCRAPPING"].update(detections if scrapping else [])
+        state = ACTIVITY_STATE["SCRAPPING"]
 
-        if sig:
-            # Prevent duplicate END_CANDIDATE events
-            if sig["type"] == "END_CANDIDATE" and not ACTIVE["SCRAPPING"]:
-                pass  # Skip duplicate END
-            else:
-                payload = build_event_payload("SCRAPPING", sig["type"], camera_id, detections)
-                try:
-                    EVENT_QUEUE.put(payload, block=False)
-                except:
-                    pass  # drop event if queue is full (backpressure safety)
-                ACTIVE["SCRAPPING"] = sig["type"] != "END_CANDIDATE"
+        # 1. START transition: INACTIVE -> ACTIVE
+        if sig == "START" and state["state"] == "INACTIVE":
+            state["state"] = "ACTIVE"
+            state["session_id"] = str(uuid4())
+            state["last_frame_emit"] = 0.0
 
-        if scrapping and ACTIVE["SCRAPPING"] and now - LAST_FRAME_EMIT["SCRAPPING"] >= FRAME_EMIT_INTERVAL["SCRAPPING"]:
-            payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, detections)
+            payload = build_event_payload("SCRAPPING", "START_CANDIDATE", camera_id, detections, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
+                print(f"[SCRAPPING] START_CANDIDATE emitted | session_id={state['session_id'][:8]}...")
             except:
                 pass  # drop event if queue is full (backpressure safety)
-            LAST_FRAME_EMIT["SCRAPPING"] = now
 
-        # FEEDING
+        # 2. END transition: ACTIVE -> INACTIVE
+        elif sig == "END" and state["state"] == "ACTIVE":
+            session_id_short = state["session_id"][:8] if state["session_id"] else "None"
+            payload = build_event_payload("SCRAPPING", "END_CANDIDATE", camera_id, detections, state["session_id"])
+            try:
+                EVENT_QUEUE.put(payload, block=False)
+                print(f"[SCRAPPING] END_CANDIDATE emitted | session_id={session_id_short}...")
+            except:
+                pass  # drop event if queue is full (backpressure safety)
+
+            state["state"] = "INACTIVE"
+            state["session_id"] = None
+            state["last_frame_emit"] = 0.0  # Reset for next session
+
+        # 3. FRAME_AGGREGATE: Only when ACTIVE and interval elapsed (AFTER START/END checks)
+        elif state["state"] == "ACTIVE":
+            if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+                payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, detections, state["session_id"])
+                try:
+                    EVENT_QUEUE.put(payload, block=False)
+                    if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
+                        print(f"[SCRAPPING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
+                except:
+                    pass  # drop event if queue is full (backpressure safety)
+                state["last_frame_emit"] = now
+
+        # ------------------------------------------------------------------
+        # FEEDING - State Machine
+        # ------------------------------------------------------------------
         feeding = detect_feeding(detections, TMR, TRACTOR)
-        # Note: When frames are skipped, smoothing windows are effectively longer
-        # This is acceptable for scrapping/feeding activities
         sig = SMOOTHERS["FEEDING"].update(detections if feeding else [])
+        state = ACTIVITY_STATE["FEEDING"]
 
-        if sig:
-            # Prevent duplicate END_CANDIDATE events
-            if sig["type"] == "END_CANDIDATE" and not ACTIVE["FEEDING"]:
-                pass  # Skip duplicate END
-            else:
-                payload = build_event_payload("FEEDING", sig["type"], camera_id, detections)
-                try:
-                    EVENT_QUEUE.put(payload, block=False)
-                except:
-                    pass  # drop event if queue is full (backpressure safety)
-                ACTIVE["FEEDING"] = sig["type"] != "END_CANDIDATE"
+        # 1. START transition: INACTIVE -> ACTIVE
+        if sig == "START" and state["state"] == "INACTIVE":
+            state["state"] = "ACTIVE"
+            state["session_id"] = str(uuid4())
+            state["last_frame_emit"] = 0.0
 
-        if feeding and ACTIVE["FEEDING"] and now - LAST_FRAME_EMIT["FEEDING"] >= FRAME_EMIT_INTERVAL["FEEDING"]:
-            payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, detections)
+            payload = build_event_payload("FEEDING", "START_CANDIDATE", camera_id, detections, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
+                print(f"[FEEDING] START_CANDIDATE emitted | session_id={state['session_id'][:8]}...")
             except:
                 pass  # drop event if queue is full (backpressure safety)
-            LAST_FRAME_EMIT["FEEDING"] = now
 
-        # MILKING (disabled - model doesn't support it yet)
-        milking = False
-        # Note: When frames are skipped, smoothing windows are effectively longer
-        # This is acceptable for scrapping/feeding activities
-        sig = SMOOTHERS["MILKING"].update(detections if milking else [])
-
-        if sig:
-            # Prevent duplicate END_CANDIDATE events
-            if sig["type"] == "END_CANDIDATE" and not ACTIVE["MILKING"]:
-                pass  # Skip duplicate END
-            else:
-                payload = build_event_payload("MILKING", sig["type"], camera_id, detections)
-                try:
-                    EVENT_QUEUE.put(payload, block=False)
-                except:
-                    pass  # drop event if queue is full (backpressure safety)
-                ACTIVE["MILKING"] = sig["type"] != "END_CANDIDATE"
-
-        if milking and ACTIVE["MILKING"] and now - LAST_FRAME_EMIT["MILKING"] >= FRAME_EMIT_INTERVAL["MILKING"]:
-            payload = build_event_payload("MILKING", "FRAME_AGGREGATE", camera_id, detections)
+        # 2. END transition: ACTIVE -> INACTIVE
+        elif sig == "END" and state["state"] == "ACTIVE":
+            session_id_short = state["session_id"][:8] if state["session_id"] else "None"
+            payload = build_event_payload("FEEDING", "END_CANDIDATE", camera_id, detections, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
+                print(f"[FEEDING] END_CANDIDATE emitted | session_id={session_id_short}...")
             except:
                 pass  # drop event if queue is full (backpressure safety)
-            LAST_FRAME_EMIT["MILKING"] = now
+
+            state["state"] = "INACTIVE"
+            state["session_id"] = None
+            state["last_frame_emit"] = 0.0  # Reset for next session
+
+        # 3. FRAME_AGGREGATE: Only when ACTIVE and interval elapsed (AFTER START/END checks)
+        elif state["state"] == "ACTIVE":
+            if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+                payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, detections, state["session_id"])
+                try:
+                    EVENT_QUEUE.put(payload, block=False)
+                    if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
+                        print(f"[FEEDING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
+                except:
+                    pass  # drop event if queue is full (backpressure safety)
+                state["last_frame_emit"] = now
+
+        # MILKING disabled - model doesn't support it yet
 
     cap.release()
 

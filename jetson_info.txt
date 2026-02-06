@@ -333,3 +333,105 @@ END_CANDIDATE
 Expected result
 status = LATE
 started_offset_min ≈ +80
+========================================================================================================================================================
+
+Below are production-safe cron schedules, aligned exactly with your final locked pipeline (STEP-1 → STEP-5).
+No redundancy, no conflicting ownership.
+________________________________________
+✅ CRON SCHEDULES — FINAL & RECOMMENDED
+Mental model (lock this)
+Component	Runs	Why
+Edge (Jetson)	Real-time	Emits events
+Ingest API	Real-time	Transactional
+STEP-3 Resolver	Periodic	Merge, zone, liveness
+STEP-5 Finalizer	Periodic	EARLY/LATE/MISSED
+Builder	❌ Never	Disabled
+________________________________________
+1️⃣ STEP-3 — activity_aggregator.py
+Purpose
+•	Resolve zone_id
+•	Update last_seen_at
+•	Merge-on-start
+•	Bind schedules (NO status finalization)
+✅ Recommended frequency
+Every 2 minutes
+This is:
+•	Fast enough for pause/resume
+•	Light DB load
+•	Replay-safe
+✅ Cron entry
+*/2 * * * * /usr/bin/python3 /path/to/backend/aggregation/activity_aggregator.py >> /var/log/wf_step3.log 2>&1
+________________________________________
+2️⃣ STEP-5 — missed_activity_cron.py
+Purpose
+•	Finalize EARLY / ON_TIME / LATE
+•	Create MISSED
+•	(Later: stale-close)
+✅ Recommended frequency
+Every 5 minutes
+Why not faster?
+•	Schedules change slowly
+•	Avoid premature MISSED
+•	Keeps logic clean
+✅ Cron entry
+*/5 * * * * /usr/bin/python3 /path/to/backend/cron/missed_activity_cron.py >> /var/log/wf_step5.log 2>&1
+________________________________________
+3️⃣ OPTIONAL — Combined manual orchestrator (run_phase5.py)
+Purpose
+•	Local testing
+•	Backfill
+•	Debug only
+❌ Do NOT run this in production cron
+If needed temporarily:
+# MANUAL ONLY — COMMENTED BY DEFAULT
+# */5 * * * * /usr/bin/python3 /path/to/backend/aggregation/run_phase5.py
+________________________________________
+🚫 WHAT YOU MUST NOT SCHEDULE
+Script	Reason
+activity_instance_builder.py	Disabled forever
+Any test aggregator	Old logic
+Anything creating instances	Violates pipeline
+Anything linking events	Ingest already does
+________________________________________
+⏱️ WHY THESE INTERVALS ARE CORRECT
+Pause / Resume (merge-on-start)
+•	Merge window = 3–12 min
+•	STEP-3 every 2 min ensures:
+o	No missed merges
+o	No double instances
+Schedule finalization
+•	STEP-5 every 5 min ensures:
+o	Correct EARLY/LATE
+o	MISSED created after tolerance window
+o	No race with STEP-3
+________________________________________
+🧪 SANITY CHECK (DO ONCE)
+After enabling cron, run:
+-- No IN_PROGRESS with end time
+SELECT * FROM activity_instance
+WHERE actual_end_at IS NOT NULL
+  AND status = 'IN_PROGRESS';
+
+-- No duplicate MISSED
+SELECT farm_id, activity_schedule_id, activity_date, COUNT(*)
+FROM activity_instance
+WHERE status='MISSED'
+GROUP BY farm_id, activity_schedule_id, activity_date
+HAVING COUNT(*) > 1;
+Both must return 0 rows.
+________________________________________
+🟢 FINAL CRON SUMMARY
+*/2 * * * *  STEP-3  activity_aggregator.py
+*/5 * * * *  STEP-5  missed_activity_cron.py
+This setup is:
+•	✅ deterministic
+•	✅ replay-safe
+•	✅ multi-schedule/day safe
+•	✅ pause/resume safe
+•	✅ production-ready
+If you want next:
+•	stale-close cron (STEP-5 extension)
+•	alert cron timing
+•	multi-camera scaling rules
+just say it.
+
