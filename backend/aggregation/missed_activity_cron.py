@@ -36,57 +36,58 @@ from common.time_utils import utc_now
 # -------------------------------------------------
 # STEP-5A — FINALIZE COMPLETED ACTIVITIES
 # -------------------------------------------------
-def finalize_completed_activities():
-    """
-    Finalize EARLY / ON_TIME / LATE for ended activities.
+# This below logic already implemented in activity_schedule_resolver.py
+# def finalize_completed_activities():
+#     """
+#     Finalize EARLY / ON_TIME / LATE for ended activities.
 
-    Preconditions:
-    - actual_end_at IS NOT NULL
-    - activity_schedule_id IS NOT NULL
-    - status is still IN_PROGRESS
-    """
-    now = utc_now()
+#     Preconditions:
+#     - actual_end_at IS NOT NULL
+#     - activity_schedule_id IS NOT NULL
+#     - status is still IN_PROGRESS
+#     """
+#     now = utc_now()
 
-    with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                ai.id,
-                ai.started_offset_min,
-                s.tolerance_early_min,
-                s.tolerance_late_min
-            FROM activity_instance ai
-            JOIN activity_schedule s
-              ON s.id = ai.activity_schedule_id
-            WHERE ai.actual_end_at IS NOT NULL
-              AND ai.activity_schedule_id IS NOT NULL
-              AND ai.status = 'IN_PROGRESS'
-            """
-        )
+#     with get_cursor() as cur:
+#         cur.execute(
+#             """
+#             SELECT
+#                 ai.id,
+#                 ai.started_offset_min,
+#                 s.tolerance_early_min,
+#                 s.tolerance_late_min
+#             FROM activity_instance ai
+#             JOIN activity_schedule s
+#               ON s.id = ai.activity_schedule_id
+#             WHERE ai.actual_end_at IS NOT NULL
+#               AND ai.activity_schedule_id IS NOT NULL
+#               AND ai.status = 'IN_PROGRESS'
+#             """
+#         )
 
-        for row in cur.fetchall():
-            offset = row["started_offset_min"]
+#         for row in cur.fetchall():
+#             offset = row["started_offset_min"]
 
-            if offset is None:
-                # Safety guard: should not happen, but skip if offsets missing
-                continue
+#             if offset is None:
+#                 # Safety guard: should not happen, but skip if offsets missing
+#                 continue
 
-            if offset < -row["tolerance_early_min"]:
-                status = "EARLY"
-            elif offset > row["tolerance_late_min"]:
-                status = "LATE"
-            else:
-                status = "ON_TIME"
+#             if offset < -row["tolerance_early_min"]:
+#                 status = "EARLY"
+#             elif offset > row["tolerance_late_min"]:
+#                 status = "LATE"
+#             else:
+#                 status = "ON_TIME"
 
-            cur.execute(
-                """
-                UPDATE activity_instance
-                SET status = %s,
-                    updated_at = %s
-                WHERE id = %s
-                """,
-                (status, now, row["id"]),
-            )
+#             cur.execute(
+#                 """
+#                 UPDATE activity_instance
+#                 SET status = %s,
+#                     updated_at = %s
+#                 WHERE id = %s
+#                 """,
+#                 (status, now, row["id"]),
+#             )
 
 
 # -------------------------------------------------
@@ -98,8 +99,12 @@ def detect_missed_activities():
     - Schedule window + late tolerance has passed
     - No activity_instance exists for that (farm, schedule, activity_date)
     """
+    # MISSED activity creation logic is currently disabled.
+    # To re-enable, remove/comment markers and restore the original
+    # implementation below. Keeping the code here for future reference.
+    
     now_utc = utc_now()
-
+    
     with get_cursor() as cur:
         # 1. Load all active schedules with farm timezone
         cur.execute(
@@ -108,6 +113,7 @@ def detect_missed_activities():
                 s.id AS schedule_id,
                 s.farm_id,
                 s.activity_type_id,
+                s.ideal_start_time,
                 s.ideal_end_time,
                 s.tolerance_late_min,
                 f.timezone
@@ -116,36 +122,40 @@ def detect_missed_activities():
             WHERE s.is_active = true
             """
         )
-
+    
         schedules = cur.fetchall()
-
+    
         for s in schedules:
             farm_id = s["farm_id"]
             schedule_id = s["schedule_id"]
             activity_type_id = s["activity_type_id"]
-
+    
             farm_tz = pytz.timezone(s["timezone"])
             local_now = now_utc.astimezone(farm_tz)
             activity_date = local_now.date()
-
+    
             # -------------------------------------------------
             # Compute cutoff time (LOCAL → UTC)
             # -------------------------------------------------
-            ideal_end_local = datetime.combine(
+            ideal_end_naive = datetime.combine(
                 activity_date,
                 s["ideal_end_time"],
-                tzinfo=farm_tz,
             )
-
+            ideal_end_local = farm_tz.localize(ideal_end_naive)
+            
+            # Cross-midnight handling
+            if s["ideal_end_time"] < s["ideal_start_time"]:
+                ideal_end_local += timedelta(days=1)
+            
             late_cutoff_local = ideal_end_local + timedelta(
                 minutes=s["tolerance_late_min"]
             )
             late_cutoff_utc = late_cutoff_local.astimezone(timezone.utc)
-
+    
             # If window still open → skip
             if now_utc <= late_cutoff_utc:
                 continue
-
+    
             # -------------------------------------------------
             # Insert MISSED (idempotent)
             # -------------------------------------------------
@@ -196,5 +206,5 @@ def detect_missed_activities():
 # RUNNER
 # -------------------------------------------------
 if __name__ == "__main__":
-    finalize_completed_activities()
-    detect_missed_activities()
+    # finalize_completed_activities()
+    detect_missed_activities()  # disabled: MISSED creation commented out

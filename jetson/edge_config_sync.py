@@ -1,4 +1,5 @@
 """
+jetson/edge_config_sync.py
 Edge Config Sync (Phase 3)
 
 MANDATORY bootstrap script.
@@ -11,6 +12,9 @@ import os
 import sys
 from pathlib import Path
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # -------------------------------------------------
 # Paths
@@ -18,6 +22,7 @@ import requests
 BASE_DIR = Path(__file__).parent
 BOOTSTRAP_CONFIG_PATH = BASE_DIR / "config" / "bootstrap_config.json"
 CACHE_PATH = BASE_DIR / "config" / "local_cache.json"
+load_dotenv(Path(__file__).parent.parent / "backend" / ".env")
 
 # -------------------------------------------------
 # Fatal helper
@@ -55,13 +60,9 @@ def main():
     api_base = get_api_base()
 
     device_code = os.getenv("DEVICE_CODE")
-    edge_token = os.getenv("EDGE_TOKEN")
 
     if not device_code:
         fatal("DEVICE_CODE not set")
-
-    if not edge_token:
-        fatal("EDGE_TOKEN not set")
 
     url = f"{api_base}/api/v1/edge/runtime-config"
 
@@ -70,7 +71,6 @@ def main():
             url,
             timeout=10,
             headers={
-                "Authorization": f"Bearer {edge_token}",
                 "X-DEVICE-CODE": device_code,
             },
         )
@@ -101,17 +101,34 @@ def main():
 
     # Per-camera validation
     for cam in cfg["cameras"]:
-        if not cam.get("rtsp_url"):
-            fatal("Camera missing rtsp_url")
+        st = cam.get("stream_type")
 
-        if not cam.get("roi_polygon"):
-            fatal(f"Camera {cam['camera_id']} missing ROI")
+        if st == "RTSP" and not cam.get("rtsp_url"):
+            fatal(f"RTSP camera {cam['camera_id']} missing rtsp_url")
+
+        if st == "NVR_CHANNEL" and (
+            not cam.get("nvr_rtsp_base") or not cam.get("nvr_channel")
+        ):
+            fatal(f"NVR camera {cam['camera_id']} missing base or channel")
+
+        if st == "FILE":
+            pass  # handled locally
 
         if not cam.get("fps"):
             fatal(f"Camera {cam['camera_id']} missing FPS")
 
     if not cfg["ml_model_version"].get("model_path"):
         fatal("Model path missing in ml_model_version")
+
+    # -------------------------------------------------
+    # Inject test video path for FILE streams
+    # -------------------------------------------------
+    PROJECT_ROOT = BASE_DIR.parent
+    TEST_VIDEO_PATH = PROJECT_ROOT / "test_data" / "Full_scrapping_video.mp4"
+
+    for cam in cfg["cameras"]:
+        if cam["stream_type"] == "FILE":
+            cam["video_file_path"] = str(TEST_VIDEO_PATH)
 
     # -------------------------------------------------
     # Atomic cache write

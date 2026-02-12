@@ -1,0 +1,93 @@
+{
+  "device_id": "3259cd10-d54c-42e3-88d6-b85a05e262be",
+  "farm_id": "07dbc890-2076-4018-b5fc-9f93cf2900e3",
+  "farm_timezone": "Asia/Kolkata",
+  "cameras": [
+    {
+      "camera_id": "8d44df12-a056-4b70-919e-ff4735453582",
+      "code": "F1-CAMERA-1",
+      "stream_type": "FILE",
+      "rtsp_url": "rtsp://",
+      "nvr_rtsp_base": null,
+      "nvr_channel": null,
+      "resolution": null,
+      "fps": 5,
+      "roi_polygon": null,
+      "motion_sensitivity": null,
+      "activity_zones": {
+        "FEEDING": {
+          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
+          "roi": null
+        },
+        "SCRAPPING": {
+          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
+          "roi": null
+        }
+      },
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_scrapping_video_2.mp4"
+    },
+    {
+      "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+      "code": "F1-CAMERA-4",
+      "stream_type": "FILE",
+      "rtsp_url": "rtsp://",
+      "nvr_rtsp_base": null,
+      "nvr_channel": null,
+      "resolution": null,
+      "fps": 5,
+      "roi_polygon": null,
+      "motion_sensitivity": null,
+      "activity_zones": {
+        "FEEDING": {
+          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
+          "roi": null
+        },
+        "SCRAPPING": {
+          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
+          "roi": null
+        }
+      },
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_scrapping_video_2.mp4"
+    }
+  ],
+  "device_model_assignment": {
+    "ml_model_version_id": "bb91a462-ff2d-45b9-b5db-fc21a8e8cf26"
+  },
+  "ml_model_version": {
+    "id": "bb91a462-ff2d-45b9-b5db-fc21a8e8cf26",
+    "name": "farm_multi_activity_detector",
+    "version": "1.0.3",
+    "model_path": "models/WF_V1.3_best.engine",
+    "checksum": "sha256:9a4f...c2d1",
+    "class_map": {
+      "TMR": [
+        "tmr_machine",
+        "feeder_wagon"
+      ],
+      "PERSON": [
+        "person"
+      ],
+      "TRACTOR": [
+        "tractor"
+      ],
+      "SCRAPPING_TOOL": [
+        "scrapping_tool",
+        "shovel"
+      ]
+    },
+    "activity_thresholds": {
+      "FEEDING": {
+        "min_conf": 0.7,
+        "min_frames": 20
+      },
+      "MILKING": {
+        "min_conf": 0.75,
+        "min_frames": 30
+      },
+      "SCRAPPING": {
+        "min_conf": 0.7,
+        "min_frames": 25
+      }
+    }
+  }
+}

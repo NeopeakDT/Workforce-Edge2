@@ -1,4 +1,5 @@
 """
+backend/alerts/alert_evaluator.py
 STEP 6.1 — Alert Evaluation Engine (ACTIVITY ONLY)
 
 Evaluates alert rules against FINAL activity truth.

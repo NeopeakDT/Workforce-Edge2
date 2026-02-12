@@ -4,60 +4,142 @@
   "farm_timezone": "Asia/Kolkata",
   "cameras": [
     {
-      "camera_id": "8d44df12-a056-4b70-919e-ff4735453582",
-      "code": "F1-CAMERA-1",
+      "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+      "code": "GRP-1-Front-Left",
+      "stream_type": "FILE",
       "rtsp_url": "rtsp://",
+      "nvr_rtsp_base": null,
       "nvr_channel": null,
-      "zone_id": "47a8eaeb-1e07-4768-a039-d5329032b113",
-      "resolution": "1920x1080",
+      "resolution": null,
       "fps": 5,
-      "roi_polygon": [
-        [
-          100,
-          100
-        ],
-        [
-          1200,
-          100
-        ],
-        [
-          1200,
-          600
-        ],
-        [
-          100,
-          600
-        ]
-      ],
-      "motion_sensitivity": 3
+      "roi_polygon": null,
+      "motion_sensitivity": null,
+      "activity_zones": {
+        "FEEDING": {
+          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
+          "roi": [
+            {
+              "x": 0.138,
+              "y": 0.158
+            },
+            {
+              "x": 0.138,
+              "y": 0.469
+            },
+            {
+              "x": 0.244,
+              "y": 0.993
+            },
+            {
+              "x": 0.74,
+              "y": 0.993
+            },
+            {
+              "x": 0.766,
+              "y": 0.868
+            },
+            {
+              "x": 0.137,
+              "y": 0.155
+            }
+          ]
+        },
+        "SCRAPPING": {
+          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
+          "roi": [
+            {
+              "x": 0.146,
+              "y": 0.154
+            },
+            {
+              "x": 0.771,
+              "y": 0.833
+            },
+            {
+              "x": 0.836,
+              "y": 0.436
+            },
+            {
+              "x": 0.205,
+              "y": 0.102
+            },
+            {
+              "x": 0.147,
+              "y": 0.154
+            }
+          ]
+        }
+      },
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_scrapping_video.mp4"
     },
     {
-      "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
-      "code": "F1-CAMERA-4",
+      "camera_id": "8d44df12-a056-4b70-919e-ff4735453582",
+      "code": "GRP-2-TMR_Way",
+      "stream_type": "FILE",
       "rtsp_url": "rtsp://",
+      "nvr_rtsp_base": null,
       "nvr_channel": null,
-      "zone_id": "47a8eaeb-1e07-4768-a039-d5329032b113",
-      "resolution": "1920x1080",
-      "fps": 28,
-      "roi_polygon": [
-        [
-          100,
-          100
-        ],
-        [
-          1200,
-          100
-        ],
-        [
-          1200,
-          600
-        ],
-        [
-          100,
-          600
-        ]
-      ],
-      "motion_sensitivity": 50
+      "resolution": null,
+      "fps": 5,
+      "roi_polygon": null,
+      "motion_sensitivity": null,
+      "activity_zones": {
+        "FEEDING": {
+          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
+          "roi": [
+            {
+              "x": 0.631,
+              "y": 0.052
+            },
+            {
+              "x": 0.146,
+              "y": 0.994
+            },
+            {
+              "x": 0.613,
+              "y": 0.995
+            },
+            {
+              "x": 0.677,
+              "y": 0.069
+            },
+            {
+              "x": 0.632,
+              "y": 0.047
+            }
+          ]
+        },
+        "SCRAPPING": {
+          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
+          "roi": [
+            {
+              "x": 0.702,
+              "y": 0.08
+            },
+            {
+              "x": 0.658,
+              "y": 0.988
+            },
+            {
+              "x": 0.932,
+              "y": 0.997
+            },
+            {
+              "x": 0.926,
+              "y": 0.48
+            },
+            {
+              "x": 0.748,
+              "y": 0.084
+            },
+            {
+              "x": 0.702,
+              "y": 0.077
+            }
+          ]
+        }
+      },
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_scrapping_video.mp4"
     }
   ],
   "device_model_assignment": {

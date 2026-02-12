@@ -1,4 +1,24 @@
 """
+backend/api/edge_runtime_config_api.py
+Edge Runtime Config API (Phase 3)
+
+Responds to runtime configuration requests from Jetson devices.
+
+Responsibilities:
+- Authenticate device via X-DEVICE-CODE
+- Respond with runtime configuration
+- Lightweight & high-frequency safe
+
+to run in terminal: 
+curl -X GET http://localhost:8000/api/v1/edge/runtime-config \
+  -H "X-DEVICE-CODE: HD_TEST_01"
+eg: curl -X GET http://localhost:8000/api/v1/edge/runtime-config \
+  -H "X-DEVICE-CODE: HD_TEST_01"
+
+
+
+"""
+"""
 Edge Runtime Config API (Phase 3)
 
 Responds to runtime configuration requests from Jetson devices.
@@ -8,7 +28,9 @@ Responsibilities:
 - Respond with runtime configuration
 - Lightweight & high-frequency safe
 """
+
 from fastapi import APIRouter, Request, HTTPException
+from collections import defaultdict
 from common.db import get_cursor
 
 router = APIRouter()
@@ -57,16 +79,17 @@ def edge_runtime_config(request: Request):
         farm_timezone = farm["timezone"]
 
         # -------------------------------------------------
-        # 3. Cameras + stream config (JOIN)
+        # 3. Cameras + stream config
         # -------------------------------------------------
         cur.execute(
             """
             SELECT
                 fc.id                AS camera_id,
                 fc.code              AS camera_code,
+                fc.stream_type,
                 fc.rtsp_url,
+                fc.nvr_rtsp_base,
                 fc.nvr_channel,
-                fc.zone_id,
                 csc.resolution,
                 csc.fps_target,
                 csc.roi,
@@ -85,18 +108,95 @@ def edge_runtime_config(request: Request):
             raise HTTPException(status_code=400, detail="No active cameras found")
 
         cameras = []
+        camera_index = {}
+
         for r in rows:
-            cameras.append({
+            cam = {
                 "camera_id": r["camera_id"],
                 "code": r["camera_code"],
+
+                "stream_type": r["stream_type"],
+
                 "rtsp_url": r["rtsp_url"],
+
+                # NVR
+                "nvr_rtsp_base": r["nvr_rtsp_base"],
                 "nvr_channel": r["nvr_channel"],
-                "zone_id": r["zone_id"],
+
                 "resolution": r["resolution"],
                 "fps": r["fps_target"] if r["fps_target"] is not None else 5,
                 "roi_polygon": r["roi"],
                 "motion_sensitivity": r["motion_sensitivity"],
-            })
+
+                # Will be filled next
+                "activity_zones": {},
+            }
+
+            cameras.append(cam)
+            camera_index[r["camera_id"]] = cam
+
+        # -------------------------------------------------
+        # 3.1 Camera → Activity → Zone mapping
+        # -------------------------------------------------
+        cur.execute(
+            """
+            SELECT
+                caz.camera_id,
+                at.code AS activity_code,
+                caz.zone_id,
+                caz.roi
+            FROM camera_activity_zone caz
+            JOIN activity_type at
+              ON at.id = caz.activity_type_id
+            WHERE caz.farm_id = %s
+              AND caz.is_active = true
+            """,
+            (farm_id,),
+        )
+
+        rows = cur.fetchall()
+
+        for r in rows:
+            cam = camera_index.get(r["camera_id"])
+            if not cam:
+                continue
+
+            activity_code = r["activity_code"].upper()
+            cam["activity_zones"][activity_code] = {
+                "zone_id": r["zone_id"],
+                "roi": r["roi"],  # optional override
+            }
+
+        # -------------------------------------------------
+        # Optional strict check: fail-fast if camera has no activity zones
+        # (enable in production farms only)
+        # -------------------------------------------------
+        for cam in cameras:
+            if not cam["activity_zones"]:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Camera {cam['code']} has no activity_zone mapping"
+                )
+
+        # -------------------------------------------------
+        # Validate camera stream config (fail-fast)
+        # -------------------------------------------------
+        for cam in cameras:
+            st = cam["stream_type"]
+
+            if st == "RTSP" and not cam.get("rtsp_url"):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"RTSP camera {cam['code']} missing rtsp_url"
+                )
+
+            if st == "NVR_CHANNEL" and (
+                not cam.get("nvr_rtsp_base") or not cam.get("nvr_channel")
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"NVR_CHANNEL camera {cam['code']} missing nvr_rtsp_base or nvr_channel"
+                )
 
         # -------------------------------------------------
         # 4. Device → model assignment

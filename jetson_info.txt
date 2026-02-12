@@ -96,7 +96,7 @@ neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$
 
 
 =====================================================================================================
-STEP 3.2 — Runtime Config Sync (IN SHORT)
+STEP 3.2 — Runtime Config Sync (IN SHORT) ( it stores data in local_cache.py)
 What it does
     • Jetson fetches authoritative runtime configuration from backend
     • Configuration is validated strictly
@@ -118,6 +118,7 @@ Why it matters
 One-liner
 STEP 3.2 makes Jetson configuration-aware and DB-driven.
 
+
 ✅ STEP 3.3 — Semantic Config Validation (IN SHORT)
 What it does
     • Human-level sanity check of cached config
@@ -135,39 +136,6 @@ One-liner
 STEP 3.3 ensures the config is not just valid, but correct.
 ===========================================================================================================
 
-Jetson
-  ├─ edge_config_sync.py  (before runtime)
-  ├─ edge_detector.py
-  │     └─ emits START / FRAME / END
-  └─ edge_heartbeat_agent.py
-
-        ↓ HTTP
-
-main.py
-  ├─ /health
-  ├─ /api/v1/events
-  └─ /api/v1/heartbeat
-
-        ↓ DB
-
-activity_detection_event
-edge_device_heartbeat
-
-        ↓ Background
-
-activity_aggregator.py
-missed_activity_cron.py
-
-        ↓ DB
-
-activity_instance
-
-        ↓
-
-alert_evaluator.py
-dashboard_query_service.py
-
-============================================================================================================
 
 # 20-1-26
 
@@ -435,3 +403,52 @@ If you want next:
 •	multi-camera scaling rules
 just say it.
 
+=======================================================================================================================================================
+# 6/2/2026-
+edge_jetson.py
+   ↓
+POST /ingest/event
+   ↓
+event_ingest_api.py
+   ↓
+INSERT activity_detection_event
+   ↓
+_apply_session_aggregation()
+   ↓
+IF START_CANDIDATE AND session not seen:
+       INSERT activity_instance   ✅ ← HERE
+   ↓
+FRAME → linked
+   ↓
+END → updates same instance
+
+==========================================================================================================================================================
+
+# To get the updated data (from load_cache.py) - 
+1. Run the command - curl -X GET http://localhost:8000/api/v1/edge/runtime-config \  -H "X-DEVICE-CODE: HD_TEST_01"
+ This is in file - edge_runtime_config_api.py
+
+ 2. run python edge_config_sync.py file then load_cache.py file will be created.
+
+ =========================================================================================================
+ # IMPORTANT OPERATIONAL NOTE (VERY IMPORTANT)
+Your edge_detector currently processes only the first camera:
+camera = cfg["cameras"][0]
+So right now:
+    • Events will come only from F1-CAMERA-1
+    • F1-CAMERA-4 config is valid but unused
+This is expected given your TODO comment, but be aware during testing.
+=====================================================================================================
+can you explain how this will get or how would i compute it -
+| Field                   | Why it’s null            | Impact      |
+| ----------------------- | ------------------------ | ----------- |
+| `roi_polygon`           | ROI override not defined | ❌ No impact |
+| `activity_zones[*].roi` | Using full zone polygon  | ❌ No impact |
+| `resolution`            | Decoder auto-detects     | ❌ No impact |
+| `motion_sensitivity`    | Motion model not used    | ❌ No impact |
+
+means take 
+1. roi_polygon -this is for per camera so it wants 4 coordinates right?
+how will i provide the coordinates  and i think this is 1 time activity? once a roi is defined for a camera then it will not change 
+2. roi(for activity_zone) - this is for zone wise? but what is actually there in my farm i will tell you, there is 1 zone se 'scrapping_zone' and for that zone there are 5 cameras at the moment then how to do that or for each camera tell that this coordinates are for this zones , beacuse 1 camera can show 2 or more zones.
+3. motion_sensitivity - what is this what will be in this tell me in simple and easy words.

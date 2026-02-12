@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+jetson/edge_detector.py
 EDGE DETECTOR — FINAL (FRAME_AGGREGATE ENABLED)
 
 Edge responsibility:
@@ -22,6 +23,21 @@ from dotenv import load_dotenv
 from config.local_cache import load_config
 from runtime.model_loader import ModelRunner
 from runtime.temporal_smoother import TemporalSmoother
+from runtime.video_stream import open_stream
+
+# =========================
+# ROI OPTIONAL IMPORT
+# =========================
+try:
+    from runtime.roi_utils import filter_by_roi
+    ROI_ENABLED = True
+except ImportError:
+    ROI_ENABLED = False
+    print("[WARNING] ROI filtering disabled - shapely not available")
+    def filter_by_roi(detections, polygon):
+        """Fallback: return all detections if ROI not available"""
+        return detections
+
 
 # ------------------------------------------------------------------
 # Env
@@ -62,12 +78,6 @@ EVENT_QUEUE = Queue(maxsize=2000)
 # ------------------------------------------------------------------
 # Video Configuration
 # ------------------------------------------------------------------
-VIDEO_FILE_PATH = os.path.join(
-    PROJECT_ROOT,
-    "test_data",
-    "Scraping video 8.mp4"
-)
-
 PROCESSING_FPS = float(os.getenv("EDGE_PROCESSING_FPS", "10.0"))
 
 # ------------------------------------------------------------------
@@ -95,11 +105,20 @@ ACTIVITY_STATE = {
     },
     # MILKING disabled - model doesn't support it yet
 }
+# ------------------------------------------------------------------
+# Motion Tracking Memory (for feeding)
+# ------------------------------------------------------------------
+MOTION_MEMORY = {
+    # "tmr_machine": {
+    #     "prev_centroid": (x, y),
+    #     "moving_since": float or None
+    # }
+}
 
 # ------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------
-def build_event_payload(activity, event_type, camera_id, detections, session_id):
+def build_event_payload(activity, event_type, camera_id, zone_id, detections, session_id):
     """
     Build event payload with mandatory event_id and session_id.
     
@@ -146,8 +165,12 @@ def build_event_payload(activity, event_type, camera_id, detections, session_id)
         "event_time": event_time,
         "confidence": confidence,
         "objects": objects_dict,
-        "idempotency_key": event_id,  # Use event_id as idempotency key
-    }
+        "zones": {
+            "primary": zone_id
+        } if zone_id else None,
+        "idempotency_key": event_id,
+}
+
 
 def event_sender():
     """
@@ -175,6 +198,34 @@ def bbox_center(b):
 def euclidean(a, b):
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
+
+def build_pixel_roi(normalized_roi, frame_w, frame_h):
+    """
+    Convert normalized ROI coordinates to pixel coordinates.
+    
+    Args:
+        normalized_roi: List of dicts with "x" and "y" keys (normalized 0-1)
+        frame_w: Frame width in pixels
+        frame_h: Frame height in pixels
+        
+    Returns:
+        List of (x, y) tuples in pixel coordinates
+    """
+    return [
+        (int(p["x"] * frame_w), int(p["y"] * frame_h))
+        for p in normalized_roi
+    ]
+
+
+def resolve_zone_id(camera_cfg: dict, activity: str):
+    """
+    Resolve zone_id for a given activity from camera config.
+    Returns None if not mapped.
+    """
+    zones = camera_cfg.get("activity_zones", {})
+    zone_cfg = zones.get(activity)
+    return zone_cfg["zone_id"] if zone_cfg else None
+
 # ------------------------------------------------------------------
 # Activity logic
 # ------------------------------------------------------------------
@@ -189,11 +240,53 @@ def detect_scrapping(detections, person_classes, tool_classes, max_dist):
                 return True
     return False
 
-def detect_feeding(detections, tmr_classes, tractor_classes):
-    return any(
-        d["class"].lower() in tmr_classes or d["class"].lower() in tractor_classes
-        for d in detections
-    )
+def detect_feeding_motion(
+    detections,
+    tmr_classes,
+    tractor_classes,
+    motion_threshold_px,
+    min_motion_duration_sec,
+    current_ts
+):
+    global MOTION_MEMORY
+
+    feeding_signal = False
+
+    for det in detections:
+        cls = det["class"].lower()
+
+        if cls not in tmr_classes and cls not in tractor_classes:
+            continue
+
+        cx, cy = bbox_center(det["bbox"])
+
+        mem = MOTION_MEMORY.get(cls)
+
+        if mem is None:
+            MOTION_MEMORY[cls] = {
+                "prev_centroid": (cx, cy),
+                "moving_since": None
+            }
+            continue
+
+        prev_centroid = mem["prev_centroid"]
+        displacement = euclidean(prev_centroid, (cx, cy))
+
+        # Update centroid
+        mem["prev_centroid"] = (cx, cy)
+
+        if displacement >= motion_threshold_px:
+            if mem["moving_since"] is None:
+                mem["moving_since"] = current_ts
+            else:
+                duration = current_ts - mem["moving_since"]
+                if duration >= min_motion_duration_sec:
+                    feeding_signal = True
+        else:
+            mem["moving_since"] = None
+
+    return feeding_signal
+
 
 # ------------------------------------------------------------------
 # Main
@@ -207,9 +300,23 @@ def main():
     TMR = {c.lower() for c in class_map["TMR"]}
     TRACTOR = {c.lower() for c in class_map["TRACTOR"]}
 
+    # TODO: support multi-camera processing (currently uses first camera)
     camera = cfg["cameras"][0]
     camera_id = camera["camera_id"]
-    max_dist = cfg.get("activity_params", {}).get("SCRAPING_MAX_DISTANCE_PX", 120)
+
+    # Motion tracking configuration
+    motion_threshold_px = camera.get("motion_sensitivity", 8)
+    min_motion_duration_sec = 5.0  # start conservative
+
+
+    # Resolve zone IDs for activities (may be None)
+    ZONE_SCRAPPING = resolve_zone_id(camera, "SCRAPPING")
+    ZONE_FEEDING = resolve_zone_id(camera, "FEEDING")
+
+    # Do NOT hard-fail here; allow partial mappings during rollout.
+    # Events for activities without zones will be skipped below.
+
+    max_dist = cfg.get("activity_params", {}).get("SCRAPPING_MAX_DISTANCE_PX", 120)
 
     # Auto-detect device: Use CPU if CUDA not available (for laptop testing)
     device = os.getenv("EDGE_DEVICE", None)  # Allow override via env var
@@ -230,12 +337,15 @@ def main():
     # Start async event sender (daemon thread)
     Thread(target=event_sender, daemon=True).start()
 
-    cap = cv2.VideoCapture(VIDEO_FILE_PATH)
-    if not cap.isOpened():
-        raise RuntimeError("Failed to open video")
+    # --------------------------------------------------
+    # Open video stream (FILE / RTSP / NVR_CHANNEL)
+    # --------------------------------------------------
+    stream = open_stream(camera)
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    cap = stream.cap  # required for FPS / metadata only
+
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or PROCESSING_FPS
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     frame_skip_ratio = (
         max(1, round(video_fps / PROCESSING_FPS))
@@ -258,7 +368,7 @@ def main():
         return frame_idx / video_fps if video_fps > 0 else 0.0
 
     while True:
-        ret, frame = cap.read()
+        ret, frame = stream.read()
         if not ret:
             break
 
@@ -271,6 +381,25 @@ def main():
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).copy()
         detections = runner.infer(frame)
+
+        # Apply ROI filtering if enabled and ROI polygons are configured
+        frame_h, frame_w = frame.shape[:2]
+
+        # SCRAPPING ROI filtering
+        scrap_roi_cfg = camera.get("activity_zones", {}).get("SCRAPPING", {}).get("roi")
+        if ROI_ENABLED and scrap_roi_cfg:
+            scrap_polygon = build_pixel_roi(scrap_roi_cfg, frame_w, frame_h)
+            detections_scrap = filter_by_roi(detections, scrap_polygon)
+        else:
+            detections_scrap = detections
+
+        # FEEDING ROI filtering
+        feed_roi_cfg = camera.get("activity_zones", {}).get("FEEDING", {}).get("roi")
+        if ROI_ENABLED and feed_roi_cfg:
+            feed_polygon = build_pixel_roi(feed_roi_cfg, frame_w, frame_h)
+            detections_feed = filter_by_roi(detections, feed_polygon)
+        else:
+            detections_feed = detections
 
         frame_processing_time = time.time() - t0
         total_processing_time += frame_processing_time
@@ -288,19 +417,19 @@ def main():
         now = time.time()
 
         # ------------------------------------------------------------------
-        # SCRAPPING - State Machine
+        # SCRAPPING - State Machine (using ROI-filtered detections)
         # ------------------------------------------------------------------
-        scrapping = detect_scrapping(detections, PERSON, TOOLS, max_dist)
-        sig = SMOOTHERS["SCRAPPING"].update(detections if scrapping else [])
+        scrapping = detect_scrapping(detections_scrap, PERSON, TOOLS, max_dist)
+        sig = SMOOTHERS["SCRAPPING"].update(detections_scrap if scrapping else [])
         state = ACTIVITY_STATE["SCRAPPING"]
 
         # 1. START transition: INACTIVE -> ACTIVE
-        if sig == "START" and state["state"] == "INACTIVE":
+        if ZONE_SCRAPPING and sig == "START" and state["state"] == "INACTIVE":
             state["state"] = "ACTIVE"
             state["session_id"] = str(uuid4())
             state["last_frame_emit"] = 0.0
 
-            payload = build_event_payload("SCRAPPING", "START_CANDIDATE", camera_id, detections, state["session_id"])
+            payload = build_event_payload("SCRAPPING", "START_CANDIDATE", camera_id, ZONE_SCRAPPING, detections_scrap, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
                 print(f"[SCRAPPING] START_CANDIDATE emitted | session_id={state['session_id'][:8]}...")
@@ -308,9 +437,9 @@ def main():
                 pass  # drop event if queue is full (backpressure safety)
 
         # 2. END transition: ACTIVE -> INACTIVE
-        elif sig == "END" and state["state"] == "ACTIVE":
+        elif ZONE_SCRAPPING and sig == "END" and state["state"] == "ACTIVE":
             session_id_short = state["session_id"][:8] if state["session_id"] else "None"
-            payload = build_event_payload("SCRAPPING", "END_CANDIDATE", camera_id, detections, state["session_id"])
+            payload = build_event_payload("SCRAPPING", "END_CANDIDATE", camera_id, ZONE_SCRAPPING, detections_scrap, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
                 print(f"[SCRAPPING] END_CANDIDATE emitted | session_id={session_id_short}...")
@@ -324,29 +453,38 @@ def main():
         # 3. FRAME_AGGREGATE: Only when ACTIVE and interval elapsed (AFTER START/END checks)
         elif state["state"] == "ACTIVE":
             if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
-                payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, detections, state["session_id"])
-                try:
-                    EVENT_QUEUE.put(payload, block=False)
-                    if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
-                        print(f"[SCRAPPING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
-                except:
-                    pass  # drop event if queue is full (backpressure safety)
+                if ZONE_SCRAPPING:
+                    payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, ZONE_SCRAPPING, detections_scrap, state["session_id"])
+                    try:
+                        EVENT_QUEUE.put(payload, block=False)
+                        if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
+                            print(f"[SCRAPPING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
+                    except:
+                        pass  # drop event if queue is full (backpressure safety)
                 state["last_frame_emit"] = now
 
         # ------------------------------------------------------------------
-        # FEEDING - State Machine
+        # FEEDING - State Machine (using ROI-filtered detections)
         # ------------------------------------------------------------------
-        feeding = detect_feeding(detections, TMR, TRACTOR)
-        sig = SMOOTHERS["FEEDING"].update(detections if feeding else [])
+        feeding = detect_feeding_motion(
+            detections_feed,
+            TMR,
+            TRACTOR,
+            motion_threshold_px,
+            min_motion_duration_sec,
+            ts
+        )
+
+        sig = SMOOTHERS["FEEDING"].update(detections_feed if feeding else [])
         state = ACTIVITY_STATE["FEEDING"]
 
         # 1. START transition: INACTIVE -> ACTIVE
-        if sig == "START" and state["state"] == "INACTIVE":
+        if ZONE_FEEDING and sig == "START" and state["state"] == "INACTIVE":
             state["state"] = "ACTIVE"
             state["session_id"] = str(uuid4())
             state["last_frame_emit"] = 0.0
 
-            payload = build_event_payload("FEEDING", "START_CANDIDATE", camera_id, detections, state["session_id"])
+            payload = build_event_payload("FEEDING", "START_CANDIDATE", camera_id, ZONE_FEEDING, detections_feed, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
                 print(f"[FEEDING] START_CANDIDATE emitted | session_id={state['session_id'][:8]}...")
@@ -354,9 +492,9 @@ def main():
                 pass  # drop event if queue is full (backpressure safety)
 
         # 2. END transition: ACTIVE -> INACTIVE
-        elif sig == "END" and state["state"] == "ACTIVE":
+        elif ZONE_FEEDING and sig == "END" and state["state"] == "ACTIVE":
             session_id_short = state["session_id"][:8] if state["session_id"] else "None"
-            payload = build_event_payload("FEEDING", "END_CANDIDATE", camera_id, detections, state["session_id"])
+            payload = build_event_payload("FEEDING", "END_CANDIDATE", camera_id, ZONE_FEEDING, detections_feed, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
                 print(f"[FEEDING] END_CANDIDATE emitted | session_id={session_id_short}...")
@@ -370,18 +508,30 @@ def main():
         # 3. FRAME_AGGREGATE: Only when ACTIVE and interval elapsed (AFTER START/END checks)
         elif state["state"] == "ACTIVE":
             if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
-                payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, detections, state["session_id"])
-                try:
-                    EVENT_QUEUE.put(payload, block=False)
-                    if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
-                        print(f"[FEEDING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
-                except:
-                    pass  # drop event if queue is full (backpressure safety)
+                if ZONE_FEEDING:
+                    payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, ZONE_FEEDING, detections_feed, state["session_id"])
+                    try:
+                        EVENT_QUEUE.put(payload, block=False)
+                        if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
+                            print(f"[FEEDING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
+                    except:
+                        pass  # drop event if queue is full (backpressure safety)
                 state["last_frame_emit"] = now
+
+        # Clean motion memory if no feeding-class detections present
+        active_classes = {
+            d["class"].lower()
+            for d in detections_feed
+            if d["class"].lower() in TMR or d["class"].lower() in TRACTOR
+        }
+
+        for cls in list(MOTION_MEMORY.keys()):
+            if cls not in active_classes:
+                MOTION_MEMORY.pop(cls)
 
         # MILKING disabled - model doesn't support it yet
 
-    cap.release()
+    stream.release()
 
     # Summary
     video_duration = video_timestamp(frame_count)  # Use actual video frame count for duration
