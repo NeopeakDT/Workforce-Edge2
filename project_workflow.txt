@@ -1,0 +1,401 @@
+================================================================================
+📊 END-TO-END WORKFLOW: COMPLETE BREAKDOWN
+================================================================================
+
+This document explains the complete flow of data from Jetson device detection
+to finalized activity records in the database.
+
+================================================================================
+🎥 STEP 1: JETSON DETECTS ACTIVITY (edge_detector.py)
+================================================================================
+
+WHERE: Jetson device (on-farm)
+
+WHAT IT DOES:
+- Runs YOLO model on video frames continuously
+- Detects SCRAPPING or FEEDING activities
+- Maintains a state machine for each activity
+
+STATE MACHINE LOGIC:
+┌─────────────────────────────────────────────┐
+│ INACTIVE → sees SCRAPPING/FEEDING           │
+│     ↓                                        │
+│ Sends START_CANDIDATE (activity started)    │
+│     ↓ (every 10 sec while active)           │
+│ Sends FRAME_AGGREGATE (activity continuing) │
+│     ↓ (when activity stops)                 │
+│ Sends END_CANDIDATE (activity ended)        │
+│     ↓                                        │
+│ INACTIVE again                              │
+└─────────────────────────────────────────────┘
+
+EXAMPLE OUTPUT FROM JETSON:
+{
+  "event_id": "abc-123",
+  "session_id": "session-xyz",
+  "event_type": "START_CANDIDATE",
+  "activity_type": "FEEDING",
+  "confidence": 0.92,
+  "event_time": "2026-02-14T10:30:00Z"
+}
+
+================================================================================
+📡 STEP 2: BACKEND RECEIVES EVENT (event_ingest_api.py)
+================================================================================
+
+WHERE: Backend server
+
+ENDPOINT: POST /api/v1/ingest/event
+
+WHAT IT DOES:
+1. Authenticates device using X-DEVICE-KEY header
+2. Validates the event payload (times, confidence, etc.)
+3. Inserts into activity_detection_event table ← First database record
+4. Handles duplicates (if same event sent twice)
+
+KEY VALIDATION:
+✅ Must be UTC timestamp
+✅ Confidence must be 0-1 range
+✅ Activity type must exist in database
+✅ Device must be registered and authorized
+
+DATABASE INSERT:
+INSERT INTO activity_detection_event (
+    event_id,           -- Unique ID from Jetson
+    session_id,         -- Session from Jetson (one session = one detector run)
+    farm_id,            -- Resolved from device auth
+    device_id,          -- Resolved from device auth
+    camera_id,          -- Provided by Jetson
+    activity_type_id,   -- Resolved from "FEEDING" or "SCRAPPING" → integer ID
+    event_type,         -- "START_CANDIDATE" / "FRAME_AGGREGATE" / "END_CANDIDATE"
+    event_time,         -- When event actually happened (UTC)
+    ai_confidence,      -- 0.92 (or whatever model confidence was)
+    payload,            -- JSON with objects, zones, metadata
+    created_at          -- When backend received it
+)
+
+IMPORTANT: activity_instance_id is NULL at this stage
+(it will be filled in by the aggregator)
+
+================================================================================
+🔗 STEP 3: ACTIVITY AGGREGATOR PROCESSES EVENTS (activity_aggregator.py)
+================================================================================
+
+WHERE: Backend (runs periodically, called PHASE-5)
+
+TRIGGER: Scheduled job or manual run
+
+WHAT IT DOES:
+
+Finds all events in activity_detection_event that are NOT yet linked to an
+activity_instance (activity_instance_id IS NULL), then processes them:
+
+─────────────────────────────────────────────────────────────────────────────
+FOR START_CANDIDATE:
+─────────────────────────────────────────────────────────────────────────────
+
+Step 1: Check if active instance already exists for (farm, zone, activity_type)
+        - YES → Reuse it (don't create new one)
+        - NO  → Go to Step 2
+
+Step 2: Check if we should MERGE with recently ended activity
+        - Look for recently ended activities (within 3-12 minutes depending on type)
+        - If found and gap is small → Resume that instance (smart merging)
+        - Otherwise → Create NEW instance
+
+Step 3: Create or Resume Instance
+
+If Creating New:
+INSERT INTO activity_instance (
+    farm_id,
+    zone_id,
+    activity_type_id,
+    activity_date,          -- Date in farm timezone (for grouping)
+    status,                 -- "IN_PROGRESS"
+    actual_start_at,        -- From event_time
+    last_seen_at,           -- From event_time
+    source,                 -- "AI"
+    created_at,
+    updated_at
+)
+
+If Resuming Previous:
+UPDATE activity_instance
+SET status = 'IN_PROGRESS',
+    actual_end_at = NULL,
+    last_seen_at = event_time,
+    updated_at = utc_now()
+WHERE id = previous_instance_id
+
+Step 4: Link the event
+UPDATE activity_detection_event
+SET activity_instance_id = instance_id
+WHERE id = event_row_id
+
+─────────────────────────────────────────────────────────────────────────────
+FOR FRAME_AGGREGATE:
+─────────────────────────────────────────────────────────────────────────────
+
+Simply find the active instance and update timestamp:
+UPDATE activity_instance
+SET last_seen_at = event_time,
+    updated_at = utc_now()
+WHERE farm_id = e.farm_id
+  AND zone_id = e.zone_id
+  AND activity_type_id = e.activity_type_id
+  AND status = 'IN_PROGRESS'
+
+This shows "activity just happened"
+
+─────────────────────────────────────────────────────────────────────────────
+FOR END_CANDIDATE:
+─────────────────────────────────────────────────────────────────────────────
+
+Link the event to active instance (similar to START_CANDIDATE):
+UPDATE activity_detection_event
+SET activity_instance_id = instance_id
+WHERE id = event_row_id
+
+Instance remains IN_PROGRESS (Cron finalizes status later)
+
+================================================================================
+📦 DATABASE TABLES EXPLAINED
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TABLE: activity_detection_event — Append-Only Event Log
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Column Name           | Purpose
+──────────────────────┼──────────────────────────────────────────
+event_id              | Unique event ID generated by Jetson
+session_id            | Jetson session (one session = one detector run)
+event_type            | START_CANDIDATE / FRAME_AGGREGATE / END_CANDIDATE
+ai_confidence         | How confident was detection (0.0 to 1.0)
+activity_instance_id  | Links to instance (NULL until aggregator processes)
+farm_id               | Which farm
+device_id             | Which camera/device
+camera_id             | Camera ID
+activity_type_id      | 1=MILKING, 2=FEEDING, 3=SCRAPPING
+payload               | JSON: {objects, zones, metadata}
+created_at            | When backend received it
+
+KEY PROPERTY: NEVER UPDATED once inserted (append-only)
+- This is an immutable audit log
+- Adding new events is fine, changing old ones is not allowed
+- Used for histor and debugging
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TABLE: activity_instance — Single Source of Truth
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Column Name         | Purpose
+────────────────────┼──────────────────────────────────────────
+id                  | Instance unique ID
+farm_id             | Which farm
+zone_id             | Which ROI zone (FEEDING zone / SCRAPPING zone)
+activity_type_id    | 1=MILKING, 2=FEEDING, 3=SCRAPPING
+activity_date       | Date in farm timezone (for grouping by day)
+actual_start_at     | When activity truly started (UTC)
+actual_end_at       | When activity truly ended (NULL while IN_PROGRESS)
+status              | IN_PROGRESS / COMPLETED / MISSED
+source              | "AI" (from detector) or "MANUAL" (user input)
+created_at          | When instance created
+updated_at          | When last updated
+
+KEY PROPERTY: Single source of truth for reporting
+- This is THE record you query for activity reports
+- It gets updated as new events arrive
+- Final status is set by the Cron job
+
+================================================================================
+⏰ STEP 4: MISSED ACTIVITY CRON FINALIZES (missed_activity_cron.py)
+================================================================================
+
+WHEN: Runs every night (e.g., 2 AM)
+
+WHAT IT DOES:
+
+For each scheduled activity in the farm schedule:
+1. Check: Does activity_instance exist for (farm, schedule, date)?
+   - YES → Update status to "COMPLETED" (activity was detected)
+   - NO  → Create new instance with status "MISSED" (activity was scheduled but not detected)
+
+2. Mark instances that ended:
+
+UPDATE activity_instance
+SET status = 'COMPLETED',
+    actual_end_at = [computed end time]
+WHERE status = 'IN_PROGRESS'
+  AND last_seen_at < [cutoff time]
+
+This finalizes all instances and marks what was missed.
+
+================================================================================
+📋 COMPLETE TIMELINE EXAMPLE
+================================================================================
+
+Time    Event                      What Happens
+────────────────────────────────────────────────────────────────────────────
+10:30   🎥 Jetson detects          Cow enters FEEDING zone
+        SCRAPPING → YES            Zone detection triggered
+
+10:30   📤 Jetson sends            HTTP POST START_CANDIDATE event
+
+10:30   ✅ Backend receives        Inserts into activity_detection_event
+                                   activity_instance_id = NULL
+
+10:35   🔗 Aggregator runs         Processes unlinked events
+        (PHASE-5)                  Creates activity_instance
+                                   Status = IN_PROGRESS
+                                   Links event to instance
+
+10:40   📡 Jetson sends            FRAME_AGGREGATE event
+        (every 10 sec)             (activity still happening)
+
+10:45   🔄 Aggregator runs         Updates last_seen_at = 10:45
+        again                      Shows activity was just detected
+
+10:55   📡 Jetson sends            END_CANDIDATE event
+                                   (activity stopped)
+
+11:00   🔗 Aggregator runs         Links END event to instance
+                                   Instance still IN_PROGRESS
+                                   (waiting for Cron)
+
+02:00   ⏰ Night Cron runs          Finalizes status = COMPLETED
+        (next day)                 actual_end_at = 10:55
+                                   Activity is now closed
+
+Query Result:
+SELECT * FROM activity_instance
+WHERE farm_id = X AND activity_date = '2026-02-14'
+
+Result:
+┌────────────────────────────────────────────────────────────────┐
+│ id | farm_id | zone_id | activity_type_id | actual_start_at   │
+├────────────────────────────────────────────────────────────────┤
+│ 42 | 101     | 5       | 2 (FEEDING)     | 2026-02-14 10:30 │
+│    | actual_end_at      | status      | source                 │
+│    | 2026-02-14 10:55   | COMPLETED   | AI                     │
+└────────────────────────────────────────────────────────────────┘
+
+================================================================================
+🎯 KEY FILES & THEIR ROLES
+================================================================================
+
+File                        | Role                              | Key Output
+────────────────────────────┼───────────────────────────────────┼───────────────────────
+edge_detector.py            | Detects activities, emits events  | START/FRAME/END events
+                            |                                   | via HTTP POST
+────────────────────────────┼───────────────────────────────────┼───────────────────────
+event_ingest_api.py         | Receives events, authenticates,   | Rows in
+                            | stores them                       | activity_detection_event
+────────────────────────────┼───────────────────────────────────┼───────────────────────
+activity_aggregator.py      | Links events to instances,        | Rows in
+                            | creates/updates instances        | activity_instance
+────────────────────────────┼───────────────────────────────────┼───────────────────────
+missed_activity_cron.py     | Finalizes instances, marks        | Status = COMPLETED/MISSED
+                            | missed activities                 |
+
+================================================================================
+💡 WHY THIS DESIGN?
+================================================================================
+
+✅ Separation of Concerns
+   - Jetson only detects and sends raw events
+   - Backend handles all organizing and linking
+   - Easy to test and debug each component
+
+✅ Fault Tolerant
+   - Lost events don't break system (can replay from log)
+   - If aggregator crashes, events stay in activity_detection_event
+   - Re-run aggregator to process them again
+
+✅ Scalable
+   - Append-only log is efficient (no complex updates)
+   - Can handle high-frequency events
+   - Database is optimized for logging
+
+✅ Auditable
+   - Every detection is logged forever in activity_detection_event
+   - Can replay history
+   - Can debug false positives/negatives
+
+✅ Correctable
+   - Can delete bad instances and re-aggregate
+   - Can mark false detections
+   - Can manually create instances
+
+================================================================================
+🔄 DATA FLOW DIAGRAM
+================================================================================
+
+Jetson Device
+    ↓
+🎥 edge_detector.py
+    └─→ Detects SCRAPPING/FEEDING
+        └─→ Emits START_CANDIDATE / FRAME_AGGREGATE / END_CANDIDATE
+            ↓
+📡 Backend: event_ingest_api.py
+    ├─→ Authenticates device
+    ├─→ Validates event
+    └─→ Inserts into activity_detection_event (append-only)
+        └─→ activity_instance_id = NULL
+            ↓
+🔗 Backend: activity_aggregator.py (PHASE-5)
+    ├─→ Reads unlinked events (where activity_instance_id IS NULL)
+    ├─→ For START_CANDIDATE:
+    │   ├─→ Check if active instance exists
+    │   ├─→ If yes: reuse it
+    │   ├─→ If no: check merge logic
+    │   └─→ Create or resume instance
+    ├─→ For FRAME_AGGREGATE:
+    │   └─→ Update last_seen_at
+    ├─→ For END_CANDIDATE:
+    │   └─→ Link to instance
+    └─→ Updates activity_instance table
+        └─→ Status = IN_PROGRESS
+            ↓
+📦 Database: activity_instance
+    └─→ Single source of truth
+        ├─→ farm_id, zone_id, activity_type_id
+        ├─→ actual_start_at, actual_end_at
+        └─→ status = IN_PROGRESS
+            ↓
+⏰ Backend: missed_activity_cron.py (nightly)
+    ├─→ For each scheduled activity:
+    ├─→ Check: Does instance exist?
+    ├─→ If yes: Update status = COMPLETED
+    ├─→ If no: Create with status = MISSED
+    └─→ Finalize all IN_PROGRESS instances
+        └─→ Status = COMPLETED / MISSED
+            ↓
+✅ Final Records Ready for Reporting
+    ├─→ Dashboard queries
+    ├─→ Reports
+    └─→ Analytics
+
+================================================================================
+📌 SUMMARY
+================================================================================
+
+The workflow has 4 main phases:
+
+1. DETECTION (Jetson)
+   - Edge detector identifies activities and sends raw events
+
+2. INGESTION (Backend API)
+   - Backend receives and stores events in append-only log
+
+3. AGGREGATION (Activity Aggregator - PHASE-5)
+   - Backend links events to instances, creates instances
+
+4. FINALIZATION (Missed Activity Cron)
+   - Backend marks activities as completed or missed
+
+Result: activity_instance table contains all activities with final status
+
+================================================================================
+End of Document
+================================================================================
