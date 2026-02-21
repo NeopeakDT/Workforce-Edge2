@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#jetson/test_activity_motion_detection.py
 """
 Jetson Activity Logic Tester
 ---------------------------------
@@ -24,19 +25,22 @@ from ultralytics import YOLO
 # CONFIG
 # ============================================================
 
-VIDEO_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/rahuri_video-4.mp4"
+VIDEO_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full video (17-2-26)/GRP_2__TMR_way_17-2-26.mp4"
 MODEL_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/models/WF_V1.3_best.pt"
-OUTPUT_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/outputs/rahuri_video-4.1_motion_test.mp4"
+OUTPUT_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full video (17-2-26)/GRP_2__TMR_way_17-2-26_output-3.mp4"
 
 DEVICE = "cuda"  # Jetson
 CONF_THRES = 0.25
 IMG_SIZE = 416
+TARGET_WIDTH = 1280
+TARGET_HEIGHT = 720
 
 # ---- Activity Parameters ----
 SCRAP_DIST_PX = 120
-MOTION_THRESHOLD_PX_PER_SEC = 5
-MIN_MOTION_DURATION_SEC = 3
-AREA_THRESHOLD_PX2_PER_SEC = 1200
+MOTION_THRESHOLD_PX_PER_SEC = 1.5  # Lowered to detect slow lateral movement
+MIN_MOTION_DURATION_SEC = 1
+AREA_THRESHOLD_PX2_PER_SEC = 400  # Lowered to detect subtle forward/backward motion
+MEMORY_GRACE_PERIOD_SEC = 3  # Keep motion memory for 3 seconds after object leaves ROI
 # ---- ROI (Normalized 0–1 coordinates) ----
 """
 Your current video resolution is: 2560 × 1440
@@ -44,19 +48,52 @@ Your current video resolution is: 2560 × 1440
 But your ROI normalized values were calculated from: 1600 × 720.
 """
 FEEDING_ROI = [
-    {"x": 0.63125, "y": 0.05277777777777778},
-    {"x": 0.14625, "y": 0.9944444444444445},
-    {"x": 0.61375, "y": 0.9958333333333333},
-    {"x": 0.6775, "y": 0.06944444444444445},
-    {"x": 0.6325, "y": 0.04722222222222222},
+    {
+        "x": 0.668,
+        "y": 0.1
+    },
+    {
+        "x": 0.594,
+        "y": 0.994
+    },
+    {
+        "x": 0.008,
+        "y": 0.982
+    },
+    {
+        "x": 0.609,
+        "y": 0.071
+    },
+    {
+        "x": 0.667,
+        "y": 0.102
+    }
 ]
 SCRAPPING_ROI = [
-    {"x": 0.7025, "y": 0.08055555555555556},
-    {"x": 0.65875, "y": 0.9888888888888889},
-    {"x": 0.9325, "y": 0.9972222222222222},
-    {"x": 0.926875, "y": 0.48055555555555557},
-    {"x": 0.748125, "y": 0.08472222222222223},
-    {"x": 0.7025, "y": 0.07777777777777778},
+    {
+        "x": 0.7,
+        "y": 0.111
+    },
+    {
+        "x": 0.641,
+        "y": 0.994
+    },
+    {
+        "x": 0.993,
+        "y": 0.988
+    },
+    {
+        "x": 0.999,
+        "y": 0.593
+    },
+    {
+        "x": 0.758,
+        "y": 0.125
+    },
+    {
+        "x": 0.7,
+        "y": 0.112
+    }
 ]
 
 
@@ -150,7 +187,8 @@ def detect_feeding_motion(objects, current_ts):
                     "prev_centroid": (cx, cy),
                     "prev_area": current_area,
                     "prev_ts": current_ts,
-                    "moving_since": None
+                    "moving_since": None,
+                    "last_seen": current_ts
                 }
                 continue
 
@@ -169,6 +207,7 @@ def detect_feeding_motion(objects, current_ts):
             mem["prev_centroid"] = (cx, cy)
             mem["prev_area"] = current_area
             mem["prev_ts"] = current_ts
+            mem["last_seen"] = current_ts
             mem["last_velocity"] = velocity
             mem["last_area_velocity"] = area_velocity
 
@@ -203,9 +242,10 @@ def main():
         raise FileNotFoundError(VIDEO_PATH)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print("Video resolution:", w, h)
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print("Video resolution:", src_w, src_h)
+    print("Processing resolution:", TARGET_WIDTH, TARGET_HEIGHT)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     next_log_percent = 10
     if total_frames > 0:
@@ -217,7 +257,7 @@ def main():
         OUTPUT_PATH,
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (w, h)
+        (TARGET_WIDTH, TARGET_HEIGHT)
     )
 
     names = model.names
@@ -227,13 +267,13 @@ def main():
     scrapping_roi_poly = None
 
     if FEEDING_ROI:
-        feeding_roi_poly = build_pixel_roi(FEEDING_ROI, w, h)
+        feeding_roi_poly = build_pixel_roi(FEEDING_ROI, TARGET_WIDTH, TARGET_HEIGHT)
         feeding_roi_poly = cv2.convexHull(
             np.array(feeding_roi_poly, dtype=np.int32)
         )
 
     if SCRAPPING_ROI:
-        scrapping_roi_poly = build_pixel_roi(SCRAPPING_ROI, w, h)
+        scrapping_roi_poly = build_pixel_roi(SCRAPPING_ROI, TARGET_WIDTH, TARGET_HEIGHT)
         scrapping_roi_poly = cv2.convexHull(
             np.array(scrapping_roi_poly, dtype=np.int32)
         )
@@ -244,6 +284,8 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
+
+        frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
 
         frame_index += 1
         ts = frame_index / fps
@@ -276,13 +318,13 @@ def main():
 
                 # ---- ROI Filtering (BBox overlap based) ----
                 if scrapping_roi_poly is not None:
-                    if bbox_roi_overlap(box, scrapping_roi_poly, frame.shape, 0.15):
+                    if bbox_roi_overlap(box, scrapping_roi_poly, frame.shape, 0.03):
                         objects_scrap[cls].append(box)
                 else:
                     objects_scrap[cls].append(box)
 
                 if feeding_roi_poly is not None:
-                    if bbox_roi_overlap(box, feeding_roi_poly, frame.shape, 0.15):
+                    if bbox_roi_overlap(box, feeding_roi_poly, frame.shape, 0.03):
                         objects_feed[cls].append(box)
                 else:
                     objects_feed[cls].append(box)
@@ -303,10 +345,11 @@ def main():
         scrapping = detect_scrapping(objects_scrap)
         feeding = detect_feeding_motion(objects_feed, ts)
 
-        # Clean stale memory if object disappears
-        active_classes = set(objects_feed.keys())
+        # Clean stale memory only after grace period (prevents timer reset on brief ROI exit)
         for cls in list(MOTION_MEMORY.keys()):
-            if cls not in active_classes:
+            mem = MOTION_MEMORY[cls]
+            time_since_last_seen = ts - mem.get("last_seen", ts)
+            if time_since_last_seen > MEMORY_GRACE_PERIOD_SEC:
                 MOTION_MEMORY.pop(cls)
 
         # ---- Status Overlay ----
@@ -342,8 +385,13 @@ def main():
         for cls, mem in MOTION_MEMORY.items():
             vel = mem.get("last_velocity", 0)
             area_vel = mem.get("last_area_velocity", 0)
-
-            debug_text = f"{cls} V:{vel:.1f} A:{area_vel:.0f}"
+            moving_since = mem.get("moving_since")
+            
+            if moving_since is not None:
+                duration = ts - moving_since
+                debug_text = f"{cls} V:{vel:.1f} A:{area_vel:.0f} T:{duration:.1f}s"
+            else:
+                debug_text = f"{cls} V:{vel:.1f} A:{area_vel:.0f}"
             
             # Get text size for background
             font = cv2.FONT_HERSHEY_SIMPLEX

@@ -100,19 +100,33 @@ def main():
             fatal(f"Missing required config key: {key}")
 
     # Per-camera validation
+    # SMART FALLBACK: Camera must have EITHER rtsp_url OR (nvr_rtsp_base + nvr_channel)
     for cam in cfg["cameras"]:
-        st = cam.get("stream_type")
+        st = cam.get("stream_type", "AUTO").upper()
+        has_rtsp_url = bool(cam.get("rtsp_url"))
+        has_nvr_config = bool(cam.get("nvr_rtsp_base") and cam.get("nvr_channel"))
 
-        if st == "RTSP" and not cam.get("rtsp_url"):
-            fatal(f"RTSP camera {cam['camera_id']} missing rtsp_url")
-
-        if st == "NVR_CHANNEL" and (
-            not cam.get("nvr_rtsp_base") or not cam.get("nvr_channel")
-        ):
-            fatal(f"NVR camera {cam['camera_id']} missing base or channel")
-
+        # FILE streams (testing)
         if st == "FILE":
-            pass  # handled locally
+            pass  # Handled locally, injected later
+
+        # EXPLICIT RTSP
+        elif st == "RTSP":
+            if not has_rtsp_url:
+                fatal(f"RTSP camera {cam['camera_id']} missing rtsp_url")
+
+        # EXPLICIT NVR_CHANNEL
+        elif st == "NVR_CHANNEL":
+            if not has_nvr_config:
+                fatal(f"NVR camera {cam['camera_id']} missing nvr_rtsp_base or nvr_channel")
+
+        # AUTO or unspecified: Smart fallback
+        elif st in ["AUTO", "UNKNOWN", None]:
+            if not has_rtsp_url and not has_nvr_config:
+                fatal(
+                    f"Camera {cam['camera_id']}: Must provide either "
+                    "rtsp_url OR (nvr_rtsp_base + nvr_channel)"
+                )
 
         if not cam.get("fps"):
             fatal(f"Camera {cam['camera_id']} missing FPS")
@@ -122,9 +136,10 @@ def main():
 
     # -------------------------------------------------
     # Inject test video path for FILE streams
+    # EDIT VIDEO PATH HERE ONLY ↓
     # -------------------------------------------------
     PROJECT_ROOT = BASE_DIR.parent
-    TEST_VIDEO_PATH = PROJECT_ROOT / "test_data" / "Full_scrapping_video.mp4"
+    TEST_VIDEO_PATH = PROJECT_ROOT / "test_data" / "Full_scrapping_video_2.mp4"  # ← EDIT THIS
 
     for cam in cfg["cameras"]:
         if cam["stream_type"] == "FILE":

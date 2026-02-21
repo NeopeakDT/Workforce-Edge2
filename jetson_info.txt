@@ -94,6 +94,21 @@ neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$
 #To insert data in activity_detection_event table .
 (torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$ curl -X POST http://192.168.31.134:8000/api/v1/ingest/event   -H "X-DEVICE-KEY: 25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab"   -H "Content-Type: application/json"   --data-binary "@event_ok.json"
 
+------------------------------------------------------------------------------------------------------
+17/2/2026
+python ops/device_provisioning.py \
+  --farm-id b38b09a7-adac-4f84-970e-6c21e80e54e7 \ --  NEOPEAK DAIRY
+  --device-name "NEOPEAK DAIRY 01" \
+  --device-code "NEOPEAK-D-01"
+✅ Device provisioned successfully
+Device ID      : 87b91fdc-256e-4002-943e-8c0281b4cf80
+Device Name    : NEOPEAK DAIRY 01
+Device Code    : NEOPEAK-D-01
+API Key (SAVE) : 247f01b3e80b3391657ac3ecc39a37399154ef270bdba4da8d5c49015179d186
+
+⚠️  WARNING: Save this API key now!
+   It will NOT be shown again.
+   Store it securely on the Jetson device.
 
 =====================================================================================================
 STEP 3.2 — Runtime Config Sync (IN SHORT) ( it stores data in local_cache.py)
@@ -428,7 +443,7 @@ END → updates same instance
 1. Run the command - curl -X GET http://localhost:8000/api/v1/edge/runtime-config \  -H "X-DEVICE-CODE: HD_TEST_01"
  This is in file - edge_runtime_config_api.py
 
- 2. run python edge_config_sync.py file then load_cache.py file will be created.
+ 2. run file then load_cache.py file will be created.
 
  =========================================================================================================
  # IMPORTANT OPERATIONAL NOTE (VERY IMPORTANT)
@@ -439,16 +454,7 @@ So right now:
     • F1-CAMERA-4 config is valid but unused
 This is expected given your TODO comment, but be aware during testing.
 =====================================================================================================
-can you explain how this will get or how would i compute it -
-| Field                   | Why it’s null            | Impact      |
-| ----------------------- | ------------------------ | ----------- |
-| `roi_polygon`           | ROI override not defined | ❌ No impact |
-| `activity_zones[*].roi` | Using full zone polygon  | ❌ No impact |
-| `resolution`            | Decoder auto-detects     | ❌ No impact |
-| `motion_sensitivity`    | Motion model not used    | ❌ No impact |
-
-means take 
-1. roi_polygon -this is for per camera so it wants 4 coordinates right?
-how will i provide the coordinates  and i think this is 1 time activity? once a roi is defined for a camera then it will not change 
-2. roi(for activity_zone) - this is for zone wise? but what is actually there in my farm i will tell you, there is 1 zone se 'scrapping_zone' and for that zone there are 5 cameras at the moment then how to do that or for each camera tell that this coordinates are for this zones , beacuse 1 camera can show 2 or more zones.
-3. motion_sensitivity - what is this what will be in this tell me in simple and easy words.
+ 
+ sudo systemctl stop nvargus-daemon
+ sudo nvpmodel -m 0
+ sudo jetson_clocks

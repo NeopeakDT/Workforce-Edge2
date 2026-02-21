@@ -39,3 +39,7 @@ Data-cleanup-SQL.txt
 # backend/.env.example
 # */.env
 # **/.env
+
+complete_project_code.zip/
+complete_project_code.zip
+
