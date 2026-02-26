@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#jetson/test_activity_motion_detection.py
+#jetson/
 """
 Jetson Activity Logic Tester
 ---------------------------------
@@ -25,77 +25,79 @@ from ultralytics import YOLO
 # CONFIG
 # ============================================================
 
-VIDEO_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full video (17-2-26)/GRP_2__TMR_way_17-2-26.mp4"
-MODEL_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/models/WF_V1.3_best.pt"
-OUTPUT_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full video (17-2-26)/GRP_2__TMR_way_17-2-26_output-3.mp4"
+VIDEO_PATH = "test_data/Full video (17-2-26)/GRP_1_Front_left_17-2-26.mp4"
+MODEL_PATH = "models/WF_V1.4_best.engine" # trained and exported with imgsz=512
+OUTPUT_PATH = "test_data/Full video (17-2-26)/GRP_1_Front_left_17-2-26_output-1.1.mp4"
 
 DEVICE = "cuda"  # Jetson
-CONF_THRES = 0.25
-IMG_SIZE = 416
+CONF_THRES = 0.5
+IMG_SIZE = 512
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
 
+
 # ---- Activity Parameters ----
 SCRAP_DIST_PX = 120
-MOTION_THRESHOLD_PX_PER_SEC = 1.5  # Lowered to detect slow lateral movement
-MIN_MOTION_DURATION_SEC = 1
-AREA_THRESHOLD_PX2_PER_SEC = 400  # Lowered to detect subtle forward/backward motion
-MEMORY_GRACE_PERIOD_SEC = 3  # Keep motion memory for 3 seconds after object leaves ROI
+# ---- Feeding Motion Parameters (Frame-based) ----
+MIN_VELOCITY = 0.005        # normalized: relative to bbox diagonal (perspective-invariant)
+VELOCITY_WINDOW = 2         # sliding window
+MIN_ACTIVE_FRAMES = 2       # sustain
+CENTROID_SMOOTH_ALPHA = 0.6 # centroid smoothing factor
 # ---- ROI (Normalized 0–1 coordinates) ----
 """
 Your current video resolution is: 2560 × 1440
 
 But your ROI normalized values were calculated from: 1600 × 720.
 """
-FEEDING_ROI = [
+FEEDING_ROI =[
     {
-        "x": 0.668,
-        "y": 0.1
+        "x": 0.0,
+        "y": 0.397
     },
     {
-        "x": 0.594,
-        "y": 0.994
+        "x": 0.139,
+        "y": 0.991
     },
     {
-        "x": 0.008,
-        "y": 0.982
+        "x": 0.752,
+        "y": 0.992
     },
     {
-        "x": 0.609,
-        "y": 0.071
+        "x": 0.794,
+        "y": 0.838
     },
     {
-        "x": 0.667,
-        "y": 0.102
-    }
-]
-SCRAPPING_ROI = [
-    {
-        "x": 0.7,
-        "y": 0.111
+        "x": 0.006,
+        "y": 0.156
     },
     {
-        "x": 0.641,
-        "y": 0.994
-    },
-    {
-        "x": 0.993,
-        "y": 0.988
-    },
-    {
-        "x": 0.999,
-        "y": 0.593
-    },
-    {
-        "x": 0.758,
-        "y": 0.125
-    },
-    {
-        "x": 0.7,
-        "y": 0.112
+        "x": 0.002,
+        "y": 0.395
     }
 ]
 
+SCRAPPING_ROI = [
+    {
+        "x": 0.074,
+        "y": 0.122
+    },
+    {
+        "x": 0.867,
+        "y": 0.476
+    },
+    {
+        "x": 0.794,
+        "y": 0.833
+    },
+    {
+        "x": 0.025,
+        "y": 0.147
+    },
+    {
+        "x": 0.073,
+        "y": 0.122
+    }
+]
 
 # Example:  
 # FEEDING_ROI = [
@@ -109,7 +111,36 @@ SCRAPPING_ROI = [
 # Motion Memory
 # ============================================================
 
-MOTION_MEMORY = {}
+CLASS_MOTION_MEMORY = {
+    "tractor": {
+        "prev_center": None,
+        "velocity_buffer": [],
+        "motion_frames": 0
+    },
+    "tmr_machine": {
+        "prev_center": None,
+        "velocity_buffer": [],
+        "motion_frames": 0
+    }
+}
+
+# ============================================================
+# Feeding State Hysteresis
+# ============================================================
+
+FEEDING_STATE = {
+    "counter": 0,
+    "active": False
+}
+
+# ============================================================
+# Scrapping State Hysteresis
+# ============================================================
+
+SCRAPPING_STATE = {
+    "counter": 0,
+    "active": False
+}
 
 # ============================================================
 # Helpers
@@ -125,30 +156,34 @@ def euclidean(a, b):
 def build_pixel_roi(normalized_roi, w, h):
     return [(int(p["x"] * w), int(p["y"] * h)) for p in normalized_roi]
 
-def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.2):
-    h, w = frame_shape[:2]
-    x1, y1, x2, y2 = map(int, box)
+def bbox_overlap_ratio(box, roi_polygon):
+    """Calculate intersection area ratio for bbox-ROI overlap.
+    Returns ratio of intersection area to bbox area.
+    """
+    x1, y1, x2, y2 = box
 
-    x1 = max(0, min(w - 1, x1))
-    y1 = max(0, min(h - 1, y1))
-    x2 = max(0, min(w, x2))
-    y2 = max(0, min(h, y2))
+    bbox_poly = np.array([
+        [x1, y1],
+        [x2, y1],
+        [x2, y2],
+        [x1, y2]
+    ], dtype=np.float32)
 
-    bbox_w = x2 - x1
-    bbox_h = y2 - y1
-    if bbox_w <= 0 or bbox_h <= 0:
-        return False
+    inter_area, _ = cv2.intersectConvexConvex(
+        roi_polygon,
+        bbox_poly
+    )
 
-    roi_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(roi_mask, [roi_polygon], 1)
+    bbox_area = (x2 - x1) * (y2 - y1)
 
-    bbox_mask = np.zeros_like(roi_mask)
-    bbox_mask[y1:y2, x1:x2] = 1
+    if bbox_area <= 0:
+        return 0.0
 
-    intersection = np.logical_and(roi_mask, bbox_mask).sum()
-    bbox_area = bbox_w * bbox_h
-    overlap_ratio = intersection / bbox_area
-    return overlap_ratio >= min_overlap_ratio
+    return inter_area / bbox_area
+
+def bbox_roi_overlap(box, roi_polygon, min_overlap_ratio=0.05):
+    """Check if bbox overlaps with ROI above threshold (deprecated, kept for scrapping)."""
+    return bbox_overlap_ratio(box, roi_polygon) >= min_overlap_ratio
 
 # ============================================================
 # Scrapping Logic
@@ -156,73 +191,114 @@ def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.2):
 
 def detect_scrapping(objects):
     persons = objects.get("person", [])
-    tools = objects.get("scrapping_tool", [])
+    # Try both common class names for shovels
+    tools = objects.get("shovel", []) or objects.get("scrapping_tool", [])
 
+    scrapping_candidate = False
     for p in persons:
         pc = bbox_center(p)
         for t in tools:
             if euclidean(pc, bbox_center(t)) <= SCRAP_DIST_PX:
-                return True
-    return False
+                scrapping_candidate = True
+                break
+        if scrapping_candidate:
+            break
+
+    # Apply hysteresis to prevent flicker
+    if scrapping_candidate:
+        SCRAPPING_STATE["counter"] += 1
+    else:
+        SCRAPPING_STATE["counter"] -= 1
+
+    SCRAPPING_STATE["counter"] = max(0, min(20, SCRAPPING_STATE["counter"]))
+
+    if SCRAPPING_STATE["counter"] > 10:
+        SCRAPPING_STATE["active"] = True
+    elif SCRAPPING_STATE["counter"] < 3:
+        SCRAPPING_STATE["active"] = False
+
+    return SCRAPPING_STATE["active"]
 
 # ============================================================
-# Feeding Motion Logic (Velocity-based)
+# Feeding Motion Logic (Class-based)
 # ============================================================
 
-def detect_feeding_motion(objects, current_ts):
-    global MOTION_MEMORY
+def detect_feeding_motion(objects_feed):
+    feeding_candidate = False
 
-    feeding = False
+    for cls in ["tractor", "tmr_machine"]:
+        boxes = objects_feed.get(cls, [])
+        if not boxes:
+            # decay motion instead of reset
+            mem = CLASS_MOTION_MEMORY[cls]
+            mem["motion_frames"] = max(0, mem["motion_frames"] - 1)
+            # Clear velocity buffer when object leaves ROI
+            mem["velocity_buffer"].clear()
+            mem["prev_center"] = None
+            continue
 
-    for cls in ["tmr_machine", "tractor"]:
-        for box in objects.get(cls, []):
+        box = max(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
+        raw_cx, raw_cy = bbox_center(box)
 
-            cx, cy = bbox_center(box)
-            current_area = (box[2] - box[0]) * (box[3] - box[1])
+        mem = CLASS_MOTION_MEMORY[cls]
 
-            mem = MOTION_MEMORY.get(cls)
+        # Apply centroid smoothing
+        if mem["prev_center"] is not None:
+            cx = CENTROID_SMOOTH_ALPHA * raw_cx + (1 - CENTROID_SMOOTH_ALPHA) * mem["prev_center"][0]
+            cy = CENTROID_SMOOTH_ALPHA * raw_cy + (1 - CENTROID_SMOOTH_ALPHA) * mem["prev_center"][1]
+        else:
+            cx, cy = raw_cx, raw_cy
 
-            if mem is None:
-                MOTION_MEMORY[cls] = {
-                    "prev_centroid": (cx, cy),
-                    "prev_area": current_area,
-                    "prev_ts": current_ts,
-                    "moving_since": None,
-                    "last_seen": current_ts
-                }
-                continue
+        if mem["prev_center"] is None:
+            mem["prev_center"] = (cx, cy)
+            continue
 
-            # ---- TIME ----
-            delta_t = max(current_ts - mem["prev_ts"], 1e-6)
+        px, py = mem["prev_center"]
+        dx = cx - px
+        dy = cy - py
 
-            # ---- TRANSLATION MOTION ----
-            displacement = euclidean(mem["prev_centroid"], (cx, cy))
-            velocity = displacement / delta_t
+        # Normalize velocity by bbox diagonal (perspective-invariant)
+        bbox_w = box[2] - box[0]
+        bbox_h = box[3] - box[1]
+        bbox_diag = math.sqrt(bbox_w*bbox_w + bbox_h*bbox_h)
+        bbox_diag = max(bbox_diag, 1)
+        
+        velocity = math.sqrt(dx*dx + dy*dy) / bbox_diag
 
-            # ---- AREA MOTION ----
-            area_delta = abs(current_area - mem["prev_area"])
-            area_velocity = area_delta / delta_t
+        mem["velocity_buffer"].append(velocity)
 
-            # ---- UPDATE MEMORY ----
-            mem["prev_centroid"] = (cx, cy)
-            mem["prev_area"] = current_area
-            mem["prev_ts"] = current_ts
-            mem["last_seen"] = current_ts
-            mem["last_velocity"] = velocity
-            mem["last_area_velocity"] = area_velocity
+        if len(mem["velocity_buffer"]) > VELOCITY_WINDOW:
+            mem["velocity_buffer"].pop(0)
 
-            translation_motion = velocity >= MOTION_THRESHOLD_PX_PER_SEC
-            area_motion = area_velocity >= AREA_THRESHOLD_PX2_PER_SEC
+        avg_velocity = sum(mem["velocity_buffer"]) / len(mem["velocity_buffer"])
 
-            if translation_motion or area_motion:
-                if mem["moving_since"] is None:
-                    mem["moving_since"] = current_ts
-                elif current_ts - mem["moving_since"] >= MIN_MOTION_DURATION_SEC:
-                    feeding = True
-            else:
-                mem["moving_since"] = None
+        # Direction constraint: relaxed to allow diagonal motion
+        horizontal_ratio = abs(dx) / (abs(dy) + 1e-6)
 
-    return feeding
+        if avg_velocity > MIN_VELOCITY and horizontal_ratio > 0.8:
+            mem["motion_frames"] += 1
+        else:
+            mem["motion_frames"] = max(0, mem["motion_frames"] - 1)
+
+        mem["prev_center"] = (cx, cy)
+
+        if mem["motion_frames"] >= MIN_ACTIVE_FRAMES:
+            feeding_candidate = True
+
+    # Apply hysteresis to prevent flicker
+    if feeding_candidate:
+        FEEDING_STATE["counter"] += 1
+    else:
+        FEEDING_STATE["counter"] -= 1
+
+    FEEDING_STATE["counter"] = max(0, min(20, FEEDING_STATE["counter"]))
+
+    if FEEDING_STATE["counter"] > 10:
+        FEEDING_STATE["active"] = True
+    elif FEEDING_STATE["counter"] < 3:
+        FEEDING_STATE["active"] = False
+
+    return FEEDING_STATE["active"]
 
 # ============================================================
 # Main
@@ -230,12 +306,9 @@ def detect_feeding_motion(objects, current_ts):
 
 def main():
     model = YOLO(MODEL_PATH)
-    
-    # Fuse model and convert to FP16 (match production ModelRunner)
-    model.fuse()
-    model.to(DEVICE)
-    if DEVICE == "cuda":
-        model.model.half()
+    print("\nModel class names:")
+    print(model.names)
+    print()
 
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
@@ -262,48 +335,55 @@ def main():
 
     names = model.names
 
-    # ---- ROI Setup ----
+    # ---- ROI Setup (use original frame dimensions for detection) ----
     feeding_roi_poly = None
     scrapping_roi_poly = None
-
+    
+    # Build ROI polygons for original resolution (detection)
     if FEEDING_ROI:
-        feeding_roi_poly = build_pixel_roi(FEEDING_ROI, TARGET_WIDTH, TARGET_HEIGHT)
-        feeding_roi_poly = cv2.convexHull(
-            np.array(feeding_roi_poly, dtype=np.int32)
-        )
+        feeding_roi_poly = build_pixel_roi(FEEDING_ROI, src_w, src_h)
+        feeding_roi_poly = np.array(feeding_roi_poly, dtype=np.float32)
+        feeding_roi_poly = cv2.convexHull(feeding_roi_poly)
 
     if SCRAPPING_ROI:
-        scrapping_roi_poly = build_pixel_roi(SCRAPPING_ROI, TARGET_WIDTH, TARGET_HEIGHT)
-        scrapping_roi_poly = cv2.convexHull(
-            np.array(scrapping_roi_poly, dtype=np.int32)
-        )
+        scrapping_roi_poly = build_pixel_roi(SCRAPPING_ROI, src_w, src_h)
+        scrapping_roi_poly = np.array(scrapping_roi_poly, dtype=np.float32)
+        scrapping_roi_poly = cv2.convexHull(scrapping_roi_poly)
 
     frame_index = 0
+    
+    # Start timing for performance measurement
+    start_time = time.time()
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
+        # Keep original for inference, only resize for display
+        orig_frame = frame.copy()
 
         frame_index += 1
-        ts = frame_index / fps
         if total_frames > 0:
             progress = (frame_index / total_frames) * 100
             if progress >= next_log_percent:
                 print(f"Progress: {next_log_percent}%")
                 next_log_percent += 10
 
-        result = model(
-            frame,
+        # Run detection on original resolution (single resize in model)
+        result = model.track(
+            orig_frame,
             imgsz=IMG_SIZE,
             conf=CONF_THRES,
             device=DEVICE,
-            half=(DEVICE == "cuda"),
-            stream=False,
-            verbose=False
+            persist=True,
+            tracker="bytetrack.yaml",
+            verbose=False,
+            half=True
         )[0]
+        
+        # Resize only for display/output
+        frame = cv2.resize(orig_frame, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
 
         objects_all = defaultdict(list)
         objects_scrap = defaultdict(list)
@@ -316,26 +396,39 @@ def main():
 
                 objects_all[cls].append(box)
 
-                # ---- ROI Filtering (BBox overlap based) ----
+                # ---- ROI Filtering ----
+                # Scrapping: use bbox overlap ratio (0.03 threshold)
                 if scrapping_roi_poly is not None:
-                    if bbox_roi_overlap(box, scrapping_roi_poly, frame.shape, 0.03):
+                    if bbox_roi_overlap(box, scrapping_roi_poly, 0.03):
                         objects_scrap[cls].append(box)
                 else:
                     objects_scrap[cls].append(box)
 
+                # Feeding: use intersection area ratio (0.08 threshold - sensitive for distant vehicles)
                 if feeding_roi_poly is not None:
-                    if bbox_roi_overlap(box, feeding_roi_poly, frame.shape, 0.03):
+                    overlap = bbox_overlap_ratio(box, feeding_roi_poly)
+                    if overlap >= 0.08:
                         objects_feed[cls].append(box)
                 else:
                     objects_feed[cls].append(box)
 
+                # Scale bbox coordinates to display resolution for drawing
+                scale_x = TARGET_WIDTH / src_w
+                scale_y = TARGET_HEIGHT / src_h
+                scaled_box = [
+                    int(box[0] * scale_x),
+                    int(box[1] * scale_y),
+                    int(box[2] * scale_x),
+                    int(box[3] * scale_y)
+                ]
+                
                 # Draw bounding box
-                cv2.rectangle(frame, box[:2], box[2:], (0, 255, 0), 2)
+                cv2.rectangle(frame, scaled_box[:2], scaled_box[2:], (0, 255, 0), 2)
 
                 cv2.putText(
                     frame,
                     cls,
-                    (box[0], box[1] - 5),
+                    (scaled_box[0], scaled_box[1] - 5),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 255, 0),
@@ -343,14 +436,7 @@ def main():
                 )
 
         scrapping = detect_scrapping(objects_scrap)
-        feeding = detect_feeding_motion(objects_feed, ts)
-
-        # Clean stale memory only after grace period (prevents timer reset on brief ROI exit)
-        for cls in list(MOTION_MEMORY.keys()):
-            mem = MOTION_MEMORY[cls]
-            time_since_last_seen = ts - mem.get("last_seen", ts)
-            if time_since_last_seen > MEMORY_GRACE_PERIOD_SEC:
-                MOTION_MEMORY.pop(cls)
+        feeding = detect_feeding_motion(objects_feed)
 
         # ---- Status Overlay ----
         def draw_status(label, value, y):
@@ -382,16 +468,8 @@ def main():
 
         # ---- Motion Debug Overlay ----
         y_offset = 100
-        for cls, mem in MOTION_MEMORY.items():
-            vel = mem.get("last_velocity", 0)
-            area_vel = mem.get("last_area_velocity", 0)
-            moving_since = mem.get("moving_since")
-            
-            if moving_since is not None:
-                duration = ts - moving_since
-                debug_text = f"{cls} V:{vel:.1f} A:{area_vel:.0f} T:{duration:.1f}s"
-            else:
-                debug_text = f"{cls} V:{vel:.1f} A:{area_vel:.0f}"
+        for cls, mem in CLASS_MOTION_MEMORY.items():
+            debug_text = f"{cls}: MF:{mem['motion_frames']}"
             
             # Get text size for background
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -415,18 +493,26 @@ def main():
             
             y_offset += 30  # Move down for next entry
 
-        # ---- Draw ROI On Frame ----
+        # ---- Draw ROI On Frame (scaled to display resolution) ----
+        scale_x = TARGET_WIDTH / src_w
+        scale_y = TARGET_HEIGHT / src_h
+        
         if feeding_roi_poly is not None:
-            cv2.polylines(frame, [feeding_roi_poly], True, (255, 0, 0), 2)
+            scaled_feeding_roi = (feeding_roi_poly * np.array([scale_x, scale_y])).astype(np.int32)
+            cv2.polylines(frame, [scaled_feeding_roi], True, (255, 0, 0), 2)
 
         if scrapping_roi_poly is not None:
-            cv2.polylines(frame, [scrapping_roi_poly], True, (0, 0, 255), 2)
+            scaled_scrapping_roi = (scrapping_roi_poly * np.array([scale_x, scale_y])).astype(np.int32)
+            cv2.polylines(frame, [scaled_scrapping_roi], True, (0, 0, 255), 2)
 
         writer.write(frame)
 
     cap.release()
     writer.release()
-
+    
+    # End timing and report performance
+    end_time = time.time()
+    print(f"\nTotal processing time (min): {(end_time - start_time)/60:.2f}")
     print("Saved to:", OUTPUT_PATH)
 
 if __name__ == "__main__":

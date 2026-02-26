@@ -7,6 +7,10 @@ Edge responsibility:
 - Detect activities
 - Emit START_CANDIDATE / FRAME_AGGREGATE / END_CANDIDATE
 - NEVER decide lifecycle
+
+# Run backend with the below command-
+uvicorn app:app --log-level warning
+
 """
 
 import cv2
@@ -16,7 +20,13 @@ import os
 import json
 import sqlite3
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import numpy as np
+import logging
+from logging.handlers import QueueHandler, QueueListener
+import queue
+from collections import defaultdict
 from datetime import datetime, timezone
 from queue import Queue
 from threading import Thread
@@ -44,7 +54,7 @@ try:
     ROI_ENABLED = True
 except ImportError:
     ROI_ENABLED = False
-    print("[WARNING] ROI filtering disabled - roi_utils not available")
+    # Lazy log: will be captured when we setup logger
     def filter_by_roi(detections, polygon, frame_shape, min_overlap_ratio=0.05, roi_mask=None):
         """Fallback: return all detections if ROI not available"""
         return detections
@@ -82,9 +92,45 @@ assert API_BASE.endswith("/api/v1"), (
 HEADERS = {"X-DEVICE-KEY": DEVICE_KEY}
 
 # ------------------------------------------------------------------
-# Thread-safe inference lock (GPU/TensorRT)
+# HTTP Session (Connection Pooling)
 # ------------------------------------------------------------------
-INFER_LOCK = threading.Lock()
+SESSION = requests.Session()
+
+# HTTP connection pool tuning for burst performance
+adapter = HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=10,
+    max_retries=Retry(total=2, backoff_factor=0.1),
+)
+SESSION.mount("http://", adapter)
+SESSION.mount("https://", adapter)
+
+# ------------------------------------------------------------------
+# Buffered Logging Configuration (Non-blocking, QueueHandler)
+# ------------------------------------------------------------------
+LOG_LEVEL = os.getenv("EDGE_LOG_LEVEL", "INFO").upper()
+log_queue = queue.Queue(maxsize=10000)  # Bounded queue to prevent memory leak
+queue_handler = QueueHandler(log_queue)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+)
+console_handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+logger = logging.getLogger("edge")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger.addHandler(queue_handler)
+logger.propagate = False  # Prevent duplicate logging
+
+# Start listener thread (daemon, non-blocking writes)
+log_listener = QueueListener(log_queue, console_handler, respect_handler_level=True)
+log_listener.start()
+
+# ------------------------------------------------------------------
+# GPU Inference Pipeline (Queue-based, removes INFER_LOCK)
+# ------------------------------------------------------------------
+FRAME_QUEUE = Queue(maxsize=100)
 
 # ------------------------------------------------------------------
 # Async event queue (CRITICAL for performance)
@@ -92,9 +138,19 @@ INFER_LOCK = threading.Lock()
 EVENT_QUEUE = Queue(maxsize=10000)
 
 # ------------------------------------------------------------------
+# Performance Monitoring
+# ------------------------------------------------------------------
+STATS = {
+    "frames_processed": 0,
+    "events_sent": 0,
+}
+CAMERA_STATS = defaultdict(lambda: {"frames": 0})
+STATS_LOCK = threading.Lock()
+
+# ------------------------------------------------------------------
 # Video Configuration
 # ------------------------------------------------------------------
-PROCESSING_FPS = float(os.getenv("EDGE_PROCESSING_FPS", "10.0"))
+PROCESSING_FPS = float(os.getenv("EDGE_PROCESSING_FPS", "5.0"))
 
 # ------------------------------------------------------------------
 # Utils
@@ -191,7 +247,7 @@ def resend_failed_events():
             for row_id, payload_json in rows:
                 payload = json.loads(payload_json)
                 try:
-                    r = requests.post(
+                    r = SESSION.post(
                         f"{API_BASE.rstrip('/')}/ingest/event",
                         json=payload,
                         headers=HEADERS,
@@ -204,6 +260,37 @@ def resend_failed_events():
                     break  # stop on first failure
 
 
+# ------------------------------------------------------------------
+# GPU Inference Worker — Dedicated Thread for TensorRT
+# ------------------------------------------------------------------
+def inference_worker(runner):
+    """
+    Dedicated GPU worker thread.
+    - Pops frames from FRAME_QUEUE
+    - Runs inference (no lock needed)
+    - Returns detections via callback
+    - Keeps GPU fully utilized
+    """
+    while True:
+        try:
+            item = FRAME_QUEUE.get()
+            if item is None:  # Sentinel value to stop
+                break
+
+            camera_id, frame, callback = item
+
+            try:
+                detections = runner.infer(frame)
+                callback(detections)
+            except Exception as e:
+                logger.error("[GPU_WORKER] Inference error for camera %s: %s", camera_id, str(e))
+                callback([])
+            finally:
+                FRAME_QUEUE.task_done()
+        except Exception as e:
+            logger.critical("[GPU_WORKER] Critical error: %s", str(e))
+            FRAME_QUEUE.task_done()
+
 
 # ------------------------------------------------------------------
 # FIX 3: Thread Supervisor with Auto-Restart (Production Grade)
@@ -215,7 +302,7 @@ def camera_supervisor(camera, runner, person_classes, tool_classes, tmr_classes,
     
     while True:
         try:
-            print(f"[SUPERVISOR] Starting camera: {camera_code}")
+            logger.info("[SUPERVISOR] Starting camera: %s", camera_code)
             process_camera(
                 camera,
                 runner,
@@ -226,12 +313,12 @@ def camera_supervisor(camera, runner, person_classes, tool_classes, tmr_classes,
                 max_dist,
             )
             # If process_camera returns normally (EOF reached), exit supervisor
-            print(f"[SUPERVISOR] Camera {camera_code} finished normally")
+            logger.info("[SUPERVISOR] Camera %s finished normally", camera_code)
             break
         except Exception as e:
             restart_count += 1
-            print(f"[SUPERVISOR] ⚠️  Camera {camera_code} crashed (attempt #{restart_count}): {str(e)[:150]}")
-            print(f"[SUPERVISOR] Restarting in 5 seconds...")
+            logger.warning("[SUPERVISOR] Camera %s crashed (attempt #%d): %s", camera_code, restart_count, str(e)[:150])
+            logger.info("[SUPERVISOR] Restarting in 5 seconds...")
             time.sleep(5)
 
 
@@ -245,11 +332,15 @@ def event_sender():
 
     while True:
         try:
+            # Queue backlog monitoring
+            if EVENT_QUEUE.qsize() > 2000:
+                logger.warning("[EDGE] Queue backlog: %d", EVENT_QUEUE.qsize())
+
             resend_failed_events()
 
             payload = EVENT_QUEUE.get()
             try:
-                r = requests.post(
+                r = SESSION.post(
                     f"{API_BASE.rstrip('/')}/ingest/event",
                     json=payload,
                     headers=HEADERS,
@@ -258,16 +349,20 @@ def event_sender():
 
                 if r.status_code != 200:
                     raise Exception(f"Non-200: {r.status_code}")
+                
+                # Track successful event sends
+                with STATS_LOCK:
+                    STATS["events_sent"] += 1
 
             except Exception as e:
-                print(f"[EDGE][EVENT-SENDER] failed → saving locally: {str(e)[:200]}")
+                logger.warning("[EDGE] Event send failed, saving locally: %s", str(e)[:200])
                 save_failed_event(payload)
 
             finally:
                 EVENT_QUEUE.task_done()
 
         except Exception as e:
-            print(f"[EDGE][EVENT-SENDER] CRITICAL LOOP ERROR: {e}")
+            logger.critical("[EDGE] Event sender critical loop error: %s", str(e))
             time.sleep(2)
 
 def bbox_center(b):
@@ -330,9 +425,9 @@ def process_camera(camera, runner, person_classes, tool_classes, tmr_classes, tr
     try:
         _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_classes, tractor_classes, max_dist)
     except Exception as e:
-        print(f"[CAMERA {camera['camera_id']}] CRITICAL ERROR in camera thread: {str(e)[:200]}")
+        logger.critical("[CAMERA %s] Critical error in camera thread: %s", camera['camera_id'], str(e)[:200])
         import traceback
-        traceback.print_exc()
+        logger.debug(traceback.format_exc())
         # Let supervisor handle restart
         raise
 
@@ -381,17 +476,19 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     # Log video source information
     stream_type = camera.get("stream_type", "AUTO").upper()
     video_source = camera.get("video_file_path") or camera.get("rtsp_url") or "Unknown"
-    print(f"\n[CAMERA {camera_id}] Opening video stream...")
-    print(f"  Stream Type: {stream_type}")
-    print(f"  Source: {video_source}")
+    logger.info("[CAMERA %s] started", camera.get('code', camera_id))
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("  Stream Type: %s", stream_type)
+        logger.debug("  Source: %s", video_source)
     
     # Get actual frame resolution from video
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_resolution = f"{frame_w}x{frame_h}" if frame_w > 0 and frame_h > 0 else "Unknown"
     config_resolution = camera.get("resolution", "N/A")
-    print(f"  Config Resolution: {config_resolution}")
-    print(f"  Actual Resolution: {actual_resolution}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("  Config Resolution: %s", config_resolution)
+        logger.debug("  Actual Resolution: %s", actual_resolution)
 
     # Determine if stream is live (RTSP/NVR) or recorded (FILE)
     # Smart detection: explicit stream_type OR infer from config
@@ -417,14 +514,18 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     )
     processing_fps = PROCESSING_FPS if frame_skip_ratio > 1 else video_fps
 
-    print(f"[CAMERA {camera_id}] Starting video processing: {total_frames} frames @ {video_fps:.2f} FPS")
-    print(f"[CAMERA {camera_id}] Processing FPS: {processing_fps:.2f}, Frame skip: {frame_skip_ratio}")
-    print("=" * 80)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("[CAMERA %s] Starting video processing: %d frames @ %.2f FPS", camera_id, total_frames, video_fps)
+        logger.debug("[CAMERA %s] Processing FPS: %.2f, Frame skip: %d", camera_id, processing_fps, frame_skip_ratio)
 
     frame_count = 0
     processed_frame_count = 0
     start_time = time.time()
     total_processing_time = 0.0
+
+    # Log cooldowns to prevent spam
+    last_timeout_log = 0
+    last_thermal_log = 0
 
     scrap_roi_cfg = camera.get("activity_zones", {}).get("SCRAPPING", {}).get("roi")
     feed_roi_cfg = camera.get("activity_zones", {}).get("FEEDING", {}).get("roi")
@@ -453,26 +554,15 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             reconnect_attempt += 1
             backoff_delay = min(MAX_BACKOFF_SEC, 2 ** reconnect_attempt)
 
-            print(
-                f"[CAMERA {camera_id}] Stream lost. "
-                f"Reconnect attempt #{reconnect_attempt} "
-                f"(waiting {backoff_delay}s)..."
-            )
-
+            logger.warning("[CAMERA %s] Stream lost. Reconnect attempt #%d (waiting %ds)...", camera_id, reconnect_attempt, backoff_delay)
             try:
+                time.sleep(backoff_delay)
                 stream.release()
-            except:
-                pass
-
-            time.sleep(backoff_delay)
-
-            try:
                 stream = open_stream(camera)
-                print(f"[CAMERA {camera_id}] Reconnected successfully.")
                 reconnect_attempt = 0  # reset after success
                 continue
             except Exception as e:
-                print(f"[CAMERA {camera_id}] Reconnect failed: {str(e)[:200]}")
+                logger.warning("[CAMERA %s] Reconnect failed: %s", camera_id, str(e)[:200])
                 continue
 
         frame_count += 1
@@ -488,9 +578,13 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                 continue
 
         processed_frame_count += 1
+        with STATS_LOCK:
+            STATS["frames_processed"] += 1
+            CAMERA_STATS[camera_id]["frames"] += 1
+        
         t0 = time.time()
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).copy()
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # -------------------------------
         # Thermal Protection
@@ -500,18 +594,44 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             gpu_temp = telemetry.get("gpu_temp_c")
 
             if gpu_temp and gpu_temp > 90:
-                print(f"[THERMAL] CRITICAL GPU TEMP {gpu_temp}C — throttling 2s")
+                now_ts = time.time()
+                if now_ts - last_thermal_log > 10:
+                    logger.critical("[THERMAL] CRITICAL GPU TEMP %sC — throttling 2s", gpu_temp)
+                    last_thermal_log = now_ts
                 time.sleep(2)
             elif gpu_temp and gpu_temp > 85:
-                print(f"[THERMAL] High GPU TEMP {gpu_temp}C — slowing down")
+                now_ts = time.time()
+                if now_ts - last_thermal_log > 10:
+                    logger.warning("[THERMAL] High GPU TEMP %sC — slowing down", gpu_temp)
+                    last_thermal_log = now_ts
                 time.sleep(0.5)
 
         # -------------------------------
-        # Inference
+        # Inference (Queue-based Pipeline)
         # -------------------------------
-        # Thread-safe inference with shared model
-        with INFER_LOCK:
-            detections = runner.infer(frame)
+        # Non-blocking: push frame to GPU worker, continue processing
+        result = {}
+        done_event = threading.Event()
+
+        def set_detections(dets):
+            result["detections"] = dets
+            done_event.set()
+
+        try:
+            FRAME_QUEUE.put((camera_id, frame, set_detections), block=False)
+        except:
+            # Drop frame if GPU overloaded (acceptable in real-time)
+            detections = []
+        else:
+            # Wait for inference result with proper blocking (no busy-wait)
+            if not done_event.wait(timeout=5.0):
+                now_ts = time.time()
+                if now_ts - last_timeout_log > 10:
+                    logger.warning("[CAMERA %s] Inference timeout, skipping frame", camera_id)
+                    last_timeout_log = now_ts
+                detections = []
+            else:
+                detections = result.get("detections", [])
 
         # Apply ROI filtering if enabled and ROI polygons are configured
         frame_h, frame_w = frame.shape[:2]
@@ -555,15 +675,6 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         else:
             ts = video_timestamp(frame_count)
 
-        if detections and processed_frame_count % 50 == 0:
-            classes = sorted({d["class"] for d in detections})
-            print(
-                f"[CAMERA {camera_id}] Frame {processed_frame_count:5d} | "
-                f"Time: {ts:6.2f}s | "
-                f"Classes: [{', '.join(classes)}] | "
-                f"Process: {frame_processing_time*1000:.1f}ms"
-            )
-
         now = time.time()
 
         # ------------------------------------------------------------------
@@ -582,12 +693,9 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             payload = build_event_payload("SCRAPPING", "START_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
-                print(f"[CAMERA {camera_id}][SCRAPPING] START_CANDIDATE emitted | session_id={state['session_id'][:8]}...")
+                logger.info("[CAMERA %s][SCRAPPING] START_CANDIDATE emitted | session_id=%s...", camera_id, state['session_id'][:8])
             except Exception as e:
-                print(
-                    f"[EDGE][WARNING] Event queue full. "
-                    f"Event dropped. Error: {str(e)[:100]}"
-                )
+                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
 
         # 2. END transition: ACTIVE -> INACTIVE
         elif zone_scrapping and sig == "END" and state["state"] == "ACTIVE":
@@ -595,12 +703,9 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             payload = build_event_payload("SCRAPPING", "END_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
-                print(f"[CAMERA {camera_id}][SCRAPPING] END_CANDIDATE emitted | session_id={session_id_short}...")
+                logger.info("[CAMERA %s][SCRAPPING] END_CANDIDATE emitted | session_id=%s...", camera_id, session_id_short)
             except Exception as e:
-                print(
-                    f"[EDGE][WARNING] Event queue full. "
-                    f"Event dropped. Error: {str(e)[:100]}"
-                )
+                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
 
             state["state"] = "INACTIVE"
             state["session_id"] = None
@@ -613,13 +718,10 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                     payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
                     try:
                         EVENT_QUEUE.put(payload, block=False)
-                        if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
-                            print(f"[CAMERA {camera_id}][SCRAPPING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
+                        if processed_frame_count % 50 == 0:  # Log every 50 frames to avoid spam
+                            logger.debug("[CAMERA %s][SCRAPPING] FRAME_AGGREGATE emitted | session_id=%s...", camera_id, state['session_id'][:8])
                     except Exception as e:
-                        print(
-                            f"[EDGE][WARNING] Event queue full. "
-                            f"Event dropped. Error: {str(e)[:100]}"
-                        )
+                        logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
                 state["last_frame_emit"] = now
 
         # ------------------------------------------------------------------
@@ -652,12 +754,9 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             payload = build_event_payload("FEEDING", "START_CANDIDATE", camera_id, zone_feeding, detections_feed, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
-                print(f"[CAMERA {camera_id}][FEEDING] START_CANDIDATE emitted | session_id={state['session_id'][:8]}...")
+                logger.info("[CAMERA %s][FEEDING] START_CANDIDATE emitted | session_id=%s...", camera_id, state['session_id'][:8])
             except Exception as e:
-                print(
-                    f"[EDGE][WARNING] Event queue full. "
-                    f"Event dropped. Error: {str(e)[:100]}"
-                )
+                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
 
         # 2. END transition: ACTIVE -> INACTIVE
         elif zone_feeding and sig == "END" and state["state"] == "ACTIVE":
@@ -665,12 +764,9 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             payload = build_event_payload("FEEDING", "END_CANDIDATE", camera_id, zone_feeding, detections_feed, state["session_id"])
             try:
                 EVENT_QUEUE.put(payload, block=False)
-                print(f"[CAMERA {camera_id}][FEEDING] END_CANDIDATE emitted | session_id={session_id_short}...")
+                logger.info("[CAMERA %s][FEEDING] END_CANDIDATE emitted | session_id=%s...", camera_id, session_id_short)
             except Exception as e:
-                print(
-                    f"[EDGE][WARNING] Event queue full. "
-                    f"Event dropped. Error: {str(e)[:100]}"
-                )
+                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
 
             state["state"] = "INACTIVE"
             state["session_id"] = None
@@ -683,13 +779,10 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                     payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, zone_feeding, detections_feed, state["session_id"])
                     try:
                         EVENT_QUEUE.put(payload, block=False)
-                        if processed_frame_count % 50 == 0:  # Print every 50 frames to avoid spam
-                            print(f"[CAMERA {camera_id}][FEEDING] FRAME_AGGREGATE emitted | session_id={state['session_id'][:8]}...")
+                        if processed_frame_count % 50 == 0:  # Log every 50 frames to avoid spam
+                            logger.debug("[CAMERA %s][FEEDING] FRAME_AGGREGATE emitted | session_id=%s...", camera_id, state['session_id'][:8])
                     except Exception as e:
-                        print(
-                            f"[EDGE][WARNING] Event queue full. "
-                            f"Event dropped. Error: {str(e)[:100]}"
-                        )
+                        logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
                 state["last_frame_emit"] = now
 
         # MILKING disabled - model doesn't support it yet
@@ -699,15 +792,52 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     # Summary
     video_duration = video_timestamp(frame_count)  # Use actual video frame count for duration
     total_elapsed = time.time() - start_time
-    print(f"\n{'='*80}")
-    print(f"[CAMERA {camera_id}] Video Processing Finished")
-    print(f"{'='*80}")
-    print(f"Total Video Frames: {frame_count}")
-    print(f"Processed Frames: {processed_frame_count}")
-    print(f"Video Duration: {video_duration:.2f}s (at {video_fps:.2f} FPS)")
-    print(f"Total Processing Time: {total_processing_time:.2f}s")
-    print(f"Average Processing Speed: {processed_frame_count / total_processing_time:.2f} FPS" if total_processing_time > 0 else "N/A")
-    print(f"{'='*80}\n")
+    logger.info("="*80)
+    logger.info("[CAMERA %s] Video Processing Finished", camera_id)
+    logger.info("="*80)
+    logger.info("Total Video Frames: %d", frame_count)
+    logger.info("Processed Frames: %d", processed_frame_count)
+    logger.info("Video Duration: %.2fs (at %.2f FPS)", video_duration, video_fps)
+    logger.info("Total Processing Time: %.2fs", total_processing_time)
+    avg_speed = processed_frame_count / total_processing_time if total_processing_time > 0 else 0.0
+    logger.info("Average Processing Speed: %.2f FPS", avg_speed)
+    logger.info("="*80)
+
+
+# ------------------------------------------------------------------
+# Performance Monitor
+# ------------------------------------------------------------------
+def performance_monitor():
+    """
+    Lightweight monitoring thread that logs system health every 5 seconds.
+    Tracks: GPU throughput (FPS), event send rate, queue health.
+    """
+    last_frames = 0
+    last_time = time.time()
+
+    while True:
+        time.sleep(5)
+
+        now = time.time()
+        elapsed = now - last_time
+
+        with STATS_LOCK:
+            total_frames = STATS["frames_processed"]
+            events = STATS["events_sent"]
+
+        delta_frames = total_frames - last_frames
+        fps = delta_frames / elapsed if elapsed > 0 else 0
+
+        logger.info(
+            "[MONITOR] Total FPS: %.2f | Events Sent: %d | FrameQ: %d | EventQ: %d",
+            fps,
+            events,
+            FRAME_QUEUE.qsize(),
+            EVENT_QUEUE.qsize(),
+        )
+
+        last_frames = total_frames
+        last_time = now
 
 
 # ------------------------------------------------------------------
@@ -735,21 +865,44 @@ def main():
         except Exception:
             device = "cpu"
 
-    print(f"🔧 Edge Detector: Using device: {device}")
+    logger.info("Edge Detector: Using device: %s", device)
 
     model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
 
     # Create shared ModelRunner (once per device, NOT per camera)
     shared_runner = ModelRunner(model_path, device=device)
-    print(f"✅ Model loaded once: {model_path}")
+    logger.info("Model loaded once: %s", model_path)
 
-    # Start async event sender (daemon thread)
-    Thread(target=event_sender, daemon=True).start()
+    # Warmup TensorRT engine (avoids first-frame latency spike)
+    logger.info("Warming up TensorRT engine...")
+    dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+    for _ in range(5):
+        try:
+            shared_runner.infer(dummy)
+        except:
+            pass
+    logger.info("TensorRT engine warmed up")
+
+    # Start dedicated GPU inference worker (removes INFER_LOCK bottleneck)
+    Thread(target=inference_worker, args=(shared_runner,), daemon=True).start()
+    logger.info("Started GPU inference worker (queue-based pipeline)")
+    logger.info("   Tip: For dairy cameras, consider imgsz=512 (30-40 percent faster than 640)")
+    logger.info("   To enable: edit backend/runtime/model_loader.py, change 'imgsz': 416 to 512")
+
+    # Start multiple async event sender threads (parallel HTTP sends)
+    SENDER_THREADS = int(os.getenv("EDGE_SENDER_THREADS", "3"))
+    for i in range(SENDER_THREADS):
+        Thread(target=event_sender, daemon=True).start()
+    logger.info("Started %d event sender threads", SENDER_THREADS)
+
+    # Start performance monitoring thread
+    Thread(target=performance_monitor, daemon=True).start()
+    logger.info("Started performance monitor thread")
 
     # Print input video information
-    print("\n" + "="*80)
-    print("📹 INPUT VIDEO CONFIGURATION")
-    print("="*80)
+    logger.info("=" * 80)
+    logger.info("INPUT VIDEO CONFIGURATION")
+    logger.info("=" * 80)
     for camera in cfg.get("cameras", []):
         camera_id = camera["camera_id"]
         camera_code = camera.get("code", "N/A")
@@ -758,17 +911,17 @@ def main():
         rtsp_url = camera.get("rtsp_url", "N/A")
         resolution = camera.get("resolution", "N/A")
         
-        print(f"\n[CAMERA] {camera_code}")
-        # print(f"  ID: {camera_id}")
-        # print(f"  Stream Type: {stream_type}")
-        print(f"  Resolution: {resolution}")
+        logger.info("[CAMERA] %s", camera_code)
+        # logger.debug("  ID: %s", camera_id)
+        # logger.debug("  Stream Type: %s", stream_type)
+        logger.info("  Resolution: %s", resolution)
         if stream_type == "FILE":
-            print(f"  Video File: {video_path}")
+            logger.info("  Video File: %s", video_path)
         elif stream_type == "RTSP":
-            print(f"  RTSP URL: {rtsp_url}")
+            logger.info("  RTSP URL: %s", rtsp_url)
         else:
-            print(f"  Video Path/URL: {video_path if video_path != 'N/A' else rtsp_url}")
-    print("="*80 + "\n")
+            logger.info("  Video Path/URL: %s", video_path if video_path != 'N/A' else rtsp_url)
+    logger.info("=" * 80)
 
     # Start camera threads with supervisor (auto-restart on crash)
     camera_threads = []

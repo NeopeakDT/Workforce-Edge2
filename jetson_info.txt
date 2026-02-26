@@ -456,5 +456,231 @@ This is expected given your TODO comment, but be aware during testing.
 =====================================================================================================
  
  sudo systemctl stop nvargus-daemon
- sudo nvpmodel -m 0
+ sudo nvpmodel -m 1
  sudo jetson_clocks
+ ================================================================================================================
+23/2/26 - 
+
+Here are the issues in simple, precise points:
+
+1️⃣ Why 6-hour offline replay happens
+    • You have 1 TensorRT engine
+    • GPU can process only one inference at a time
+    • 5 cameras compete for it
+    • Effective throughput = 1 / inference_time
+    • With ~180ms per inference → ~5.5 FPS total
+    • 120k frames ÷ 5.5 FPS ≈ 6 hours
+It’s not a bug. It’s math.
+
+2️⃣ Why INFER_LOCK caused slowdown
+    • All camera threads try to infer simultaneously
+    • Lock forces strict serialization
+    • Threads context-switch constantly
+    • CPU overhead increases
+    • GPU sits idle between thread switches
+Result: lower effective throughput.
+
+3️⃣ Why your first queue-based pipeline still didn’t help much
+    • Each camera pushes frame
+    • Immediately blocks waiting for result
+    • So behavior is still serialized
+    • Added queue + polling overhead
+    • No real parallelism gained
+You changed structure, not physics.
+
+4️⃣ Why MAXN gave over-current warning
+    • GPU tried to draw higher power
+    • Your adapter/carrier board limited current
+    • Firmware throttled clocks
+    • Performance capped artificially
+That’s power limitation, not software.
+
+5️⃣ Why backend is NOT the bottleneck
+    • Event sending is async
+    • Inference happens before event creation
+    • Inference time >> HTTP time
+    • So GPU dominates runtime
+
+6️⃣ Core Reality
+Your system throughput is bounded by:
+Total FPS = 1 / inference_time
+If inference = 40ms → max 25 FPS total
+If inference = 180ms → max 5.5 FPS total
+With 5 cameras:
+Divide that across cameras.
+
+7️⃣ What Actually Controls Performance
+Only these matter:
+    • Resolution (640 vs 512)
+    • TensorRT vs PyTorch
+    • Power mode (15W vs MAXN)
+    • Number of cameras
+    • Processing FPS
+Threading tricks don’t change GPU physics.
+
+===============================================================================================
+24/2/26 -
+Looking at your logs and code, here's the step-by-step execution flow for multi-camera processing:
+
+STARTUP PHASE (happens once at 11:20am)
+    1. Load Configuration → Read local_cache.json with all camera configs
+    2. Load ML Model → Create ONE shared ModelRunner (TensorRT model)
+    3. Start Background Workers:
+        ◦ 1 GPU inference worker (processes all cameras' frames)
+        ◦ 3 event sender threads (send events to backend)
+        ◦ 1 performance monitor (logs FPS every 5 seconds)
+
+CAMERA THREAD EXECUTION (all run in parallel)
+Each camera gets its own thread (see line 899-914):
+for camera in cfg.get("cameras", []):
+    t = Thread(target=camera_supervisor, args=(...))
+    t.start()  # ALL cameras start at once
+Step 1: Open Video Stream
+    • Opens video file OR RTSP stream
+    • Reads frame resolution, FPS
+Step 2: Frame Capture + Throttling
+    • Read frame from video
+    • Skip frames based on PROCESSING_FPS (5 FPS by default)
+    • Live streams: time-based throttling
+    • Recorded files: frame-based throttling
+Step 3: GPU Inference (SHARED BOTTLENECK)
+    • Push frame to FRAME_QUEUE (line 609)
+    • GPU worker processes ONE frame at a time (line 261-285)
+    • Camera thread waits for result (5 sec timeout)
+    • All cameras compete for GPU time here
+Step 4: ROI Filtering
+    • Apply region-of-interest masks for SCRAPPING/FEEDING zones
+    • Filter detections that fall outside ROI polygons
+Step 5: Activity Detection
+    • SCRAPPING: Check if person + tool proximity (line 487)
+    • FEEDING: Check if TMR/tractor has motion (line 651-668)
+    • Update temporal smoother (5-frame consensus)
+Step 6: State Machine (per activity, per camera)
+    • INACTIVE → ACTIVE: Emit START_CANDIDATE + new session_id
+    • ACTIVE: Emit FRAME_AGGREGATE every 10 seconds
+    • ACTIVE → INACTIVE: Emit END_CANDIDATE
+Step 7: Event Queuing (non-blocking)
+    • Push event to EVENT_QUEUE (line 694, 712, 736, etc.)
+    • Never waits - if queue full, drops event
+
+EVENT SENDING (parallel background threads)
+Step 8: HTTP POST to Backend
+    • 3 sender threads pull from EVENT_QUEUE (line 297-333)
+    • POST to http://<backend>/api/v1/ingest/event
+    • If fails → save to SQLite, retry later
+
+BACKEND PROCESSING (backend/api/event_ingest_api.py)
+Step 9: Event Ingestion
+    • Validate event structure
+    • Insert into activity_detection_event table
+    • Run backend state machine (START → FRAME_AGG → END)
+    • Create/close activities in activity table
+
+WHY MULTIPLE CAMERAS APPEAR IN LOGS
+Your logs show 4 cameras running simultaneously:
+    • 75bc9fb9... (Camera 1)
+    • f5e093ef... (Camera 2)
+    • c6ba130f... (Camera 3)
+    • 7792f15f... (Camera 4)
+    • 8d44df12... (Camera 5 - reconnecting)
+They all process frames at the same time (parallel threads), but:
+    • GPU processes ONE frame at a time → FrameQ: 2 means 2 cameras waiting
+    • Event sending is parallel → EventQ: 0 means no backlog
+
+PERFORMANCE BOTTLENECK
+From your logs:
+	Total FPS: 14.35 | FrameQ: 2
+Why 14 FPS total across 5 cameras?
+    • GPU processes 1 frame at ~70ms
+    • 5 cameras × 5 FPS target = 25 FPS needed
+    • GPU can only do ~14 FPS → cameras wait in queue
+Solution: Lower PROCESSING_FPS to 3 or use smaller model resolution (see line 878).
+
+SEQUENCE DIAGRAM
+CAMERA 1 ──┐
+CAMERA 2 ──┤
+CAMERA 3 ──┼──> FRAME_QUEUE ──> GPU Worker (1 thread) ──> Results back to cameras
+CAMERA 4 ──┤
+CAMERA 5 ──┘
+
+CAMERA 1/2/3/4/5 ──> EVENT_QUEUE ──> Sender Threads (3) ──> Backend API ──> Database
+Key Point: Cameras are parallel, but GPU is sequential (one frame at a time).
+===================================================================================================
+STATUS VALUES & LOGIC
+1. IN_PROGRESS
+Set in: activity_aggregator.py
+
+Logic: When START_CANDIDATE event arrives
+# Line 103-142
+if etype == "START_CANDIDATE":
+    # Create new instance with status='IN_PROGRESS'
+    INSERT INTO activity_instance (
+        status = 'IN_PROGRESS',
+        actual_start_at = event_time
+    )
+Meaning: Activity has started, waiting for END_CANDIDATE
+-------------------------------------------------------------
+2. EARLY / ON_TIME / LATE
+Set in: activity_schedule_resolver.py
+
+Logic: When activity ends (END_CANDIDATE received), compare actual times with scheduled times
+# Line 112-157
+# Build ideal window from activity_schedule
+ideal_start_utc = ideal_start_local.astimezone(timezone.utc)
+ideal_end_utc = ideal_end_local.astimezone(timezone.utc)
+
+# Calculate offsets in MINUTES
+started_offset = (actual_start_utc - ideal_start_utc) / 60 seconds
+ended_offset = (actual_end_utc - ideal_end_utc) / 60 seconds
+
+# Determine status based on tolerance
+if started_offset < -tolerance_early_min:
+    status = "EARLY"      # Started too early
+elif started_offset > tolerance_late_min:
+    status = "LATE"       # Started too late
+else:
+    status = "ON_TIME"    # Within tolerance
+
+Example:
+Schedule: Ideal start = 09:00 AM, tolerance_early = 5 min, tolerance_late = 10 min
+
+Actual start 08:58 → offset = -2 min → EARLY (< -5)
+Actual start 08:55 → offset = -5 min → ON_TIME (-5 to +10)
+Actual start 09:05 → offset = +5 min → ON_TIME (-5 to +10)
+Actual start 09:15 → offset = +15 min → LATE (> +10)
+-------------------------------------------------------------
+
+3. MISSED
+Set in: missed_activity_cron.py
+
+Logic: When activity schedule window expires with NO activity detected
+# Line 53-109
+# For each active schedule:
+
+# 1. Calculate ideal_end_time + tolerance_late_min = CUTOFF
+late_cutoff_utc = ideal_end_local + timedelta(minutes=tolerance_late_min)
+
+# 2. Check if cutoff has passed
+if now_utc > late_cutoff_utc:
+    
+    # 3. Check if any activity exists for this schedule on this date
+    WHERE NOT EXISTS (
+        SELECT 1 FROM activity_instance
+        WHERE farm_id = %s
+          AND activity_schedule_id = %s
+          AND activity_date = %s
+    )
+    
+    # 4. If NO activity found, create MISSED
+    INSERT INTO activity_instance (
+        status = 'MISSED',
+        source = 'SYSTEM'
+    )
+
+Example:
+Schedule: Ideal end = 02:00 PM, tolerance_late = 15 min
+Cutoff = 02:15 PM
+
+If now > 02:15 PM AND no activity exists
+→ Create MISSED activity
+
