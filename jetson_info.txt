@@ -684,3 +684,5 @@ Cutoff = 02:15 PM
 If now > 02:15 PM AND no activity exists
 → Create MISSED activity
 
+======================================================================================================
+git archive --format=zip --output=project_code.zip HEAD

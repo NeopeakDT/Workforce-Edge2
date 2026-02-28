@@ -8,6 +8,7 @@ Activities/01-Milking/best.pt
 
 input_videos/
 test_data/
+models/
 runs/
 project_code.zip
 
@@ -42,4 +43,6 @@ Data-cleanup-SQL.txt
 
 complete_project_code.zip/
 complete_project_code.zip
+project_code.zip
+
 

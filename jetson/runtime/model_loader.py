@@ -82,21 +82,22 @@ class ModelRunner:
     
     def infer(self, frame):
         """
-        Run inference on a single frame.
-
+        Run inference on a single frame or batch of frames.
+        
         Args:
-            frame: Input frame (numpy array or image)
-
+            frame: Single frame (HWC numpy array) or list/tuple of frames
+            
         Returns:
-            List of detection dictionaries, each containing:
-                - class: Detected class name (e.g., "milking", "scraping")
-                - confidence: Detection confidence score (0.0 to 1.0)
-                - bbox: Bounding box coordinates [x1, y1, x2, y2]
+            - If single frame: List[Dict] of detections
+            - If batch: List[List[Dict]] (one list per input frame)
         """
+        is_batch = isinstance(frame, (list, tuple))
+        inputs = frame if is_batch else [frame]
         # Prepare inference parameters based on model type
         inference_kwargs = {
-            "imgsz": 416,  # Further reduced for Jetson memory constraints
+            "imgsz": 512,  # Slightly larger for better accuracy, still Jetson-friendly
             "conf": 0.25,  # Default confidence threshold
+            "max_det": 100,  # Limit max detections per frame to stabilize latency
         }
 
         # Handle different model formats
@@ -114,19 +115,25 @@ class ModelRunner:
         # CRITICAL: stream=False to prevent GPU/DMA aliasing issues
         # Explicitly set stream=False and verbose=False (not in kwargs to ensure they're not overridden)
         results = self.model(
-            frame,
+            inputs,
             stream=False,
             verbose=False,
             **inference_kwargs
-        )[0]
+        )
+
+        # Ultralytics returns a list of results when given a list of inputs
+        if not isinstance(results, list):
+            results = [results]
+
+        batch_detections = []
+        for res in results:
+            dets = []
+            for b in res.boxes:
+                dets.append({
+                    "class": self.model.names[int(b.cls)],
+                    "confidence": float(b.conf),
+                    "bbox": list(map(float, b.xyxy[0])),
+                })
+            batch_detections.append(dets)
         
-        detections = []
-        
-        for b in results.boxes:
-            detections.append({
-                "class": self.model.names[int(b.cls)],
-                "confidence": float(b.conf),
-                "bbox": list(map(float, b.xyxy[0])),
-            })
-        
-        return detections
+        return batch_detections if is_batch else batch_detections[0]

@@ -151,6 +151,7 @@ STATS_LOCK = threading.Lock()
 # Video Configuration
 # ------------------------------------------------------------------
 PROCESSING_FPS = float(os.getenv("EDGE_PROCESSING_FPS", "5.0"))
+EDGE_MODE = os.getenv("EDGE_MODE", "LIVE")  # LIVE or BATCH
 
 # ------------------------------------------------------------------
 # Utils
@@ -249,8 +250,8 @@ def resend_failed_events():
                 try:
                     r = SESSION.post(
                         f"{API_BASE.rstrip('/')}/ingest/event",
-                        json=payload,
-                        headers=HEADERS,
+            json=payload,
+            headers=HEADERS,
                         timeout=3,
                     )
                     if r.status_code == 200:
@@ -265,31 +266,60 @@ def resend_failed_events():
 # ------------------------------------------------------------------
 def inference_worker(runner):
     """
-    Dedicated GPU worker thread.
-    - Pops frames from FRAME_QUEUE
-    - Runs inference (no lock needed)
-    - Returns detections via callback
-    - Keeps GPU fully utilized
+    Batched GPU worker for better utilization.
+    Safe for Orin NX 8GB with batch=2 engine.
     """
+    BATCH_SIZE = 2  # Match your exported engine
+
     while True:
+        batch = []
+        callbacks = []
+
         try:
             item = FRAME_QUEUE.get()
-            if item is None:  # Sentinel value to stop
+            if item is None:
+                FRAME_QUEUE.task_done()
                 break
 
             camera_id, frame, callback = item
+            batch.append(frame)
+            callbacks.append(callback)
 
-            try:
-                detections = runner.infer(frame)
-                callback(detections)
-            except Exception as e:
-                logger.error("[GPU_WORKER] Inference error for camera %s: %s", camera_id, str(e))
-                callback([])
-            finally:
-                FRAME_QUEUE.task_done()
+            # Allow micro-wait window to fill batch
+            batch_deadline = time.time() + 0.003  # 3ms accumulation window
+
+            while len(batch) < BATCH_SIZE:
+                try:
+                    timeout = max(0, batch_deadline - time.time())
+                    if timeout <= 0:
+                        break
+
+                    item = FRAME_QUEUE.get(timeout=timeout)
+                except Exception:
+                    break
+
+                cid, frm, cb = item
+                batch.append(frm)
+                callbacks.append(cb)
+
         except Exception as e:
-            logger.critical("[GPU_WORKER] Critical error: %s", str(e))
-            FRAME_QUEUE.task_done()
+            logger.error("[GPU_WORKER] Batch build error: %s", str(e))
+            continue
+
+        try:
+            results = runner.infer(batch)
+
+            for dets, cb in zip(results, callbacks):
+                cb(dets)
+
+        except Exception as e:
+            logger.error("[GPU_WORKER] Batch inference error: %s", str(e))
+            for cb in callbacks:
+                cb([])
+
+        finally:
+            for _ in batch:
+                FRAME_QUEUE.task_done()
 
 
 # ------------------------------------------------------------------
@@ -546,6 +576,7 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     # Reconnect backoff control
     reconnect_attempt = 0
     MAX_BACKOFF_SEC = 60
+    thermal_check_counter = 0
 
     while True:
         ret, frame = stream.read()
@@ -567,8 +598,12 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
 
         frame_count += 1
 
-        # Hybrid frame throttling: time-based for live, frame-based for recorded
-        if is_live:
+        # Hybrid frame throttling: time-based for live, frame-based for recorded,
+        # with optional pure BATCH mode (no skipping for offline benchmarking).
+        if not is_live and EDGE_MODE == "BATCH":
+            # Pure GPU benchmark mode — no frame skipping
+            pass
+        elif is_live:
             now_wall = time.time()
             if now_wall - last_processed_time < frame_interval:
                 continue
@@ -582,14 +617,22 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             STATS["frames_processed"] += 1
             CAMERA_STATS[camera_id]["frames"] += 1
         
+        # Start full frame timing (include resize + inference)
         t0 = time.time()
+
+        # ----------------------------------
+        # Resize BEFORE inference (major gain)
+        # ----------------------------------
+        frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_AREA)
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # -------------------------------
-        # Thermal Protection
+        # Thermal Protection (throttled)
         # -------------------------------
-        if collect_telemetry:
+        thermal_check_counter += 1
+
+        if collect_telemetry and thermal_check_counter % 30 == 0:
             telemetry = collect_telemetry()
             gpu_temp = telemetry.get("gpu_temp_c")
 
@@ -599,6 +642,7 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                     logger.critical("[THERMAL] CRITICAL GPU TEMP %sC — throttling 2s", gpu_temp)
                     last_thermal_log = now_ts
                 time.sleep(2)
+
             elif gpu_temp and gpu_temp > 85:
                 now_ts = time.time()
                 if now_ts - last_thermal_log > 10:
@@ -619,12 +663,12 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
 
         try:
             FRAME_QUEUE.put((camera_id, frame, set_detections), block=False)
-        except:
+        except Exception:
             # Drop frame if GPU overloaded (acceptable in real-time)
             detections = []
         else:
             # Wait for inference result with proper blocking (no busy-wait)
-            if not done_event.wait(timeout=5.0):
+            if not done_event.wait(timeout=1.5):
                 now_ts = time.time()
                 if now_ts - last_timeout_log > 10:
                     logger.warning("[CAMERA %s] Inference timeout, skipping frame", camera_id)
@@ -803,7 +847,7 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     logger.info("Average Processing Speed: %.2f FPS", avg_speed)
     logger.info("="*80)
 
-
+ 
 # ------------------------------------------------------------------
 # Performance Monitor
 # ------------------------------------------------------------------
