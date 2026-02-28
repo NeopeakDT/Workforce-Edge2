@@ -1,7 +1,5 @@
-
-
-#!/usr/bin/env python3
 """
+jetson/edge_heartbeat_agent.py
 Edge Heartbeat Agent (FINAL, TELEMETRY-AWARE)
 
 Responsibilities:

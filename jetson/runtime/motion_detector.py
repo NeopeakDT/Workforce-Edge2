@@ -1,5 +1,5 @@
 """
-runtime/motion_detector.py
+jetson/runtime/motion_detector.py
 
 Reusable motion detector for tracked objects.
 No dependency on model, ROI, or activity logic.
