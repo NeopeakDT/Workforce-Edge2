@@ -1,0 +1,13 @@
+# CPU-only requirements for running jetson/test_activity_motion_detection.py on a normal PC
+# Python version: 3.10 or 3.11 recommended
+# NOTE: Use a .pt model on PC/CPU. TensorRT .engine files will not run.
+
+# To run - pip install -r jetson/requirements_cpu_pc.txt
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.6.0
+torchvision==0.21.0
+ultralytics==8.3.61
+opencv-python==4.11.0.86
+numpy==1.26.4

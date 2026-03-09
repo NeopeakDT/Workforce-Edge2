@@ -29,23 +29,6 @@ MERGE_GAP_MINUTES = {
 }
 
 
-def resolve_zone_id(cur, farm_id, camera_id, activity_type_id):
-    cur.execute(
-        """
-        SELECT zone_id
-        FROM camera_activity_zone
-        WHERE farm_id = %s
-          AND camera_id = %s
-          AND activity_type_id = %s
-          AND is_active = true
-        LIMIT 1
-        """,
-        (farm_id, camera_id, activity_type_id),
-    )
-    row = cur.fetchone()
-    return row["zone_id"] if row else None
-
-
 def compute_activity_date(cur, farm_id, event_time_utc):
     cur.execute("SELECT timezone FROM farm WHERE id = %s", (farm_id,))
     tz = pytz.timezone(cur.fetchone()["timezone"])
@@ -156,6 +139,16 @@ def run():
                 activity_type_id = e["activity_type_id"]
                 session_id = e["session_id"]
 
+                # --------------------------------------------------
+                # Compute farm-local activity_date
+                # --------------------------------------------------
+                if farm_id not in farm_tz_cache:
+                    cur.execute("SELECT timezone FROM farm WHERE id = %s", (farm_id,))
+                    farm_tz_cache[farm_id] = pytz.timezone(cur.fetchone()["timezone"])
+
+                tz = farm_tz_cache[farm_id]
+                activity_date = event_time.astimezone(tz).date()
+
                 # Cached zone lookup
                 zone_key = (farm_id, camera_id, activity_type_id)
                 if zone_key not in zone_cache:
@@ -190,10 +183,12 @@ def run():
                         WHERE farm_id = %s
                           AND zone_id = %s
                           AND activity_type_id = %s
+                          AND activity_date = %s
                           AND status = 'IN_PROGRESS'
+                        ORDER BY actual_start_at DESC
                         LIMIT 1
                         """,
-                        (farm_id, zone_id, activity_type_id),
+                        (farm_id, zone_id, activity_type_id, activity_date),
                     )
                     active = cur.fetchone()
 
@@ -212,12 +207,13 @@ def run():
                             WHERE farm_id = %s
                               AND zone_id = %s
                               AND activity_type_id = %s
+                              AND activity_date = %s
                               AND status != 'IN_PROGRESS'
                               AND actual_end_at IS NOT NULL
                             ORDER BY actual_end_at DESC
                             LIMIT 1
                             """,
-                            (farm_id, zone_id, activity_type_id),
+                            (farm_id, zone_id, activity_type_id, activity_date),
                         )
                         prev = cur.fetchone()
 
@@ -302,10 +298,12 @@ def run():
                         WHERE farm_id = %s
                           AND zone_id = %s
                           AND activity_type_id = %s
+                          AND activity_date = %s
                           AND status = 'IN_PROGRESS'
+                        ORDER BY actual_start_at DESC
                         LIMIT 1
                         """,
-                        (farm_id, zone_id, activity_type_id),
+                        (farm_id, zone_id, activity_type_id, activity_date),
                     )
                     row = cur.fetchone()
                     if not row:

@@ -38,7 +38,6 @@ from config.local_cache import load_config
 from runtime.model_loader import ModelRunner
 from runtime.temporal_smoother import TemporalSmoother
 from runtime.video_stream import open_stream
-from runtime.motion_detector import MotionDetector
 
 # Thermal protection
 try:
@@ -130,7 +129,7 @@ log_listener.start()
 # ------------------------------------------------------------------
 # GPU Inference Pipeline (Queue-based, removes INFER_LOCK)
 # ------------------------------------------------------------------
-FRAME_QUEUE = Queue(maxsize=100)
+FRAME_QUEUE = Queue(maxsize=20)
 
 # ------------------------------------------------------------------
 # Async event queue (CRITICAL for performance)
@@ -188,7 +187,7 @@ def build_event_payload(activity, event_type, camera_id, zone_id, detections, se
     else:
         confidence = 0.7
 
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    now_utc = datetime.now(timezone.utc)
     event_time = now_utc.isoformat().replace("+00:00", "Z")
 
     # Generate unique event_id and use it as idempotency_key
@@ -274,12 +273,14 @@ def inference_worker(runner):
     while True:
         batch = []
         callbacks = []
+        queue_items_count = 0
 
         try:
             item = FRAME_QUEUE.get()
             if item is None:
                 FRAME_QUEUE.task_done()
                 break
+            queue_items_count += 1
 
             camera_id, frame, callback = item
             batch.append(frame)
@@ -301,24 +302,36 @@ def inference_worker(runner):
                 cid, frm, cb = item
                 batch.append(frm)
                 callbacks.append(cb)
+                queue_items_count += 1
 
         except Exception as e:
             logger.error("[GPU_WORKER] Batch build error: %s", str(e))
             continue
 
         try:
+            actual_batch = len(batch)
+
+            # TensorRT static engine requires fixed batch
+            if actual_batch < BATCH_SIZE:
+                # duplicate last frame to pad batch
+                while len(batch) < BATCH_SIZE:
+                    batch.append(batch[-1])
+                    callbacks.append(None)
+
             results = runner.infer(batch)
 
-            for dets, cb in zip(results, callbacks):
-                cb(dets)
+            for dets, cb in zip(results[:actual_batch], callbacks[:actual_batch]):
+                if cb:
+                    cb(dets)
 
         except Exception as e:
             logger.error("[GPU_WORKER] Batch inference error: %s", str(e))
-            for cb in callbacks:
-                cb([])
+            for cb in callbacks[:actual_batch]:
+                if cb:
+                    cb([])
 
         finally:
-            for _ in batch:
+            for _ in range(queue_items_count):
                 FRAME_QUEUE.task_done()
 
 
@@ -359,6 +372,7 @@ def event_sender():
     This MUST NEVER block inference.
     """
     init_retry_db()
+    last_retry = 0.0
 
     while True:
         try:
@@ -366,7 +380,10 @@ def event_sender():
             if EVENT_QUEUE.qsize() > 2000:
                 logger.warning("[EDGE] Queue backlog: %d", EVENT_QUEUE.qsize())
 
-            resend_failed_events()
+            now_ts = time.time()
+            if now_ts - last_retry > 30:
+                resend_failed_events()
+                last_retry = now_ts
 
             payload = EVENT_QUEUE.get()
             try:
@@ -465,15 +482,11 @@ def process_camera(camera, runner, person_classes, tool_classes, tmr_classes, tr
 def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_classes, tractor_classes, max_dist):
     camera_id = camera["camera_id"]
 
-    # Motion tracking configuration
-    motion_threshold_px = camera.get("motion_sensitivity", 8)
-    min_motion_duration_sec = 5.0  # start conservative
-
-    motion_detector = MotionDetector(
-        velocity_threshold_px=motion_threshold_px,
-        area_velocity_threshold=1500,
-        min_motion_duration_sec=min_motion_duration_sec,
-    )
+    # Per-camera motion memory for FEEDING detection
+    CLASS_MOTION_MEMORY = {
+        "tractor": None,
+        "tmr_machine": None,
+    }
 
     smoothers = {
         "SCRAPPING": TemporalSmoother(),
@@ -501,6 +514,11 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     # Open video stream (FILE / RTSP / NVR_CHANNEL)
     # --------------------------------------------------
     stream = open_stream(camera)
+
+    # warmup decoder
+    for _ in range(5):
+        stream.read()
+
     cap = stream.cap  # required for FPS / metadata only
 
     # Log video source information
@@ -582,6 +600,11 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         ret, frame = stream.read()
 
         if not ret:
+            # FILE streams should stop cleanly at EOF (no reconnect loop)
+            if stream_type == "FILE":
+                logger.info("[CAMERA %s] End of file reached. Stopping FILE stream.", camera_id)
+                break
+
             reconnect_attempt += 1
             backoff_delay = min(MAX_BACKOFF_SEC, 2 ** reconnect_attempt)
 
@@ -617,15 +640,8 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             STATS["frames_processed"] += 1
             CAMERA_STATS[camera_id]["frames"] += 1
         
-        # Start full frame timing (include resize + inference)
+        # Start full frame timing (include inference)
         t0 = time.time()
-
-        # ----------------------------------
-        # Resize BEFORE inference (major gain)
-        # ----------------------------------
-        frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_AREA)
-
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # -------------------------------
         # Thermal Protection (throttled)
@@ -665,10 +681,11 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             FRAME_QUEUE.put((camera_id, frame, set_detections), block=False)
         except Exception:
             # Drop frame if GPU overloaded (acceptable in real-time)
+            logger.debug("[CAMERA %s] GPU queue full — dropping frame", camera_id)
             detections = []
         else:
             # Wait for inference result with proper blocking (no busy-wait)
-            if not done_event.wait(timeout=1.5):
+            if not done_event.wait(timeout=0.5):
                 now_ts = time.time()
                 if now_ts - last_timeout_log > 10:
                     logger.warning("[CAMERA %s] Inference timeout, skipping frame", camera_id)
@@ -725,7 +742,7 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         # SCRAPPING - State Machine (using ROI-filtered detections)
         # ------------------------------------------------------------------
         scrapping = detect_scrapping(detections_scrap, person_classes, tool_classes, max_dist)
-        sig = smoothers["SCRAPPING"].update(detections_scrap if scrapping else [])
+        sig = smoothers["SCRAPPING"].update(scrapping, ts)
         state = activity_state["SCRAPPING"]
 
         # 1. START transition: INACTIVE -> ACTIVE
@@ -771,22 +788,63 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         # ------------------------------------------------------------------
         # FEEDING - State Machine (using ROI-filtered detections)
         # ------------------------------------------------------------------
+        # Motion-based detection: Requires sustained movement of tractor/TMR
         feeding = False
-        active_ids = set()
 
-        for det in detections_feed:
-            cls = det["class"].lower()
+        for cls in ["tractor", "tmr_machine"]:
+            boxes = [
+                d["bbox"]
+                for d in detections_feed
+                if d["class"].lower() == cls
+            ]
 
-            if cls in tmr_classes or cls in tractor_classes:
-                object_id = det.get("track_id", cls)
-                active_ids.add(object_id)
+            if not boxes:
+                CLASS_MOTION_MEMORY[cls] = None
+                continue
 
-                if motion_detector.update(object_id, det["bbox"], ts):
+            # Choose largest box (most stable reference)
+            box = max(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
+
+            cx = (box[0] + box[2]) / 2
+            cy = (box[1] + box[3]) / 2
+            area = (box[2] - box[0]) * (box[3] - box[1])
+
+            mem = CLASS_MOTION_MEMORY[cls]
+
+            if mem is None:
+                CLASS_MOTION_MEMORY[cls] = {
+                    "prev_center": (cx, cy),
+                    "prev_area": area,
+                    "prev_ts": ts,
+                    "moving_since": None,
+                }
+                continue
+
+            dt = max(ts - mem["prev_ts"], 1e-6)
+
+            dx = cx - mem["prev_center"][0]
+            dy = cy - mem["prev_center"][1]
+            velocity = (dx*dx + dy*dy)**0.5 / dt
+
+            area_delta = abs(area - mem["prev_area"])
+            area_velocity = area_delta / dt
+
+            mem["prev_center"] = (cx, cy)
+            mem["prev_area"] = area
+            mem["prev_ts"] = ts
+
+            translation_motion = velocity > 3
+            area_motion = area_velocity > 1000
+
+            if translation_motion or area_motion:
+                if mem["moving_since"] is None:
+                    mem["moving_since"] = ts
+                elif ts - mem["moving_since"] >= 3:
                     feeding = True
+            else:
+                mem["moving_since"] = None
 
-        motion_detector.cleanup(active_ids)
-
-        sig = smoothers["FEEDING"].update(detections_feed if feeding else [])
+        sig = smoothers["FEEDING"].update(feeding, ts)
         state = activity_state["FEEDING"]
 
         # 1. START transition: INACTIVE -> ACTIVE
@@ -919,10 +977,10 @@ def main():
 
     # Warmup TensorRT engine (avoids first-frame latency spike)
     logger.info("Warming up TensorRT engine...")
-    dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+    dummy = np.zeros((512, 512, 3), dtype=np.uint8)
     for _ in range(5):
         try:
-            shared_runner.infer(dummy)
+            shared_runner.infer([dummy, dummy])
         except:
             pass
     logger.info("TensorRT engine warmed up")

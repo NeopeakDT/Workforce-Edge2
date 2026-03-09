@@ -19,8 +19,21 @@ ON activity_instance (farm_id, zone_id, activity_type_id)
 WHERE status = 'IN_PROGRESS'
   AND activity_schedule_id IS NULL;
 
+-- Safety index: prevent cross-day instance reuse
+-- Guarantees max 1 active instance per (farm, zone, activity_type, activity_date)
+-- Even if aggregator crashes or logic has bugs
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_instance_per_day
+ON activity_instance (
+  farm_id,
+  zone_id,
+  activity_type_id,
+  activity_date
+)
+WHERE status = 'IN_PROGRESS';
+
 -- Notes:
 -- - Partial indexes only include rows matching the WHERE clause
 -- - This prevents duplicate IN_PROGRESS instances at DB level
 -- - Critical for merge-on-start correctness
+-- - uniq_active_instance_per_day ensures no cross-day merges
 -- - Safe to run multiple times (IF NOT EXISTS)

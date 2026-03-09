@@ -35,9 +35,16 @@ CREATE INDEX IF NOT EXISTS idx_activity_instance_merged_into
 ON activity_instance(merged_into_instance_id) 
 WHERE merged_into_instance_id IS NOT NULL;
 
+-- 6. Partial index for aggregator performance
+--    (only indexes unprocessed events - drastically reduces scan size)
+CREATE INDEX IF NOT EXISTS idx_event_instance_null
+ON activity_detection_event (activity_instance_id)
+WHERE activity_instance_id IS NULL;
+
 -- Notes:
 -- - event_id is the primary idempotency mechanism (DB-enforced)
 -- - session_id groups events from the same activity run
 -- - All operations are transactional (single transaction per event)
 -- - merged_into_instance_id tracks merged instances (immutable records)
 -- - last_seen_at tracks liveness for stale-close
+-- - idx_event_instance_null helps aggregator query scale efficiently

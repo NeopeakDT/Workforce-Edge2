@@ -67,6 +67,11 @@ def ingest_event(
     validate_utc(payload.event_time)
     activity_type_id = resolve_activity_type_id(payload.activity_type)
 
+    # Extract zone_id from payload.zones.primary
+    zone_id = None
+    if payload.zones and "primary" in payload.zones:
+        zone_id = payload.zones["primary"]
+
     with get_cursor() as cur:
         try:
             cur.execute(
@@ -81,10 +86,11 @@ def ingest_event(
                     event_type,
                     event_time,
                     ai_confidence,
+                    zone_id,
                     payload,
                     created_at
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     str(payload.event_id),
@@ -96,6 +102,7 @@ def ingest_event(
                     payload.event_type,
                     payload.event_time,
                     payload.confidence,
+                    zone_id,
                     Json({
                         "objects": payload.objects,
                         "zones": payload.zones,

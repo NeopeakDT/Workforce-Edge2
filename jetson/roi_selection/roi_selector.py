@@ -1,4 +1,5 @@
 """
+jetson/roi_selection/roi_selector.py
 1️⃣ How Do You Actually Get Coordinates When Drawing Polygon?
 
 - You need an interactive mouse callback.
@@ -48,11 +49,11 @@ from pathlib import Path
 from datetime import datetime
 
 # -------- CONFIG --------
-SOURCE = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/rahuri_video-7.mp4"
+# SOURCE = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/rahuri_video-7.mp4"
 # SOURCE = "jetson/roi_selection/GRP-1-front-right-2.png"
-# SOURCE = "rtsp://your_rtsp_here"
+SOURCE = "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101"
 # OUTPUT_FILE where coordinates will be saved
-OUTPUT_FILE = "jetson/roi_selection/roi_coordinates.txt"
+OUTPUT_FILE = "jetson/roi_selection/rtsp_roi_coordinates.txt"
 # ------------------------
 
 points = []

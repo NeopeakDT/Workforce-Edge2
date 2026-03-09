@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 
 
-def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.05, roi_mask=None):
+def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.02, roi_mask=None):
     """
     Fast bbox-ROI overlap using mask intersection.
 
@@ -35,7 +35,7 @@ def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.05, roi_
     return overlap_ratio >= min_overlap_ratio
 
 
-def filter_by_roi(detections, roi_polygon, frame_shape, min_overlap_ratio=0.05, roi_mask=None):
+def filter_by_roi(detections, roi_polygon, frame_shape, min_overlap_ratio=0.03, roi_mask=None):
     """
     Filter detections using bbox overlap logic.
 
