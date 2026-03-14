@@ -455,10 +455,6 @@ So right now:
 This is expected given your TODO comment, but be aware during testing.
 =====================================================================================================
  
- sudo systemctl stop nvargus-daemon
- sudo nvpmodel -m 1
- sudo jetson_clocks
- ================================================================================================================
 23/2/26 - 
 
 Here are the issues in simple, precise points:
@@ -737,7 +733,7 @@ NvMapMemHandleAlloc: error 0
 [03/06/2026-12:34:00] [TRT] [E] [checkMacros.cpp::catchCudaError::212] Error Code 1: Cuda Runtime (out of memory)
 Segmentation fault (core dumped)
 (torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ 
-================================================================================================
+===============================================================================================================
 6-3-26 
 
 Now — Step 5 Backend Implementation (Remaining Work)
@@ -884,3 +880,40 @@ select * from alert_log order by created_at desc limit 10;
 If all working:
 
 You now have full pipeline running 24/7.
+=============================================================================================
+Kill All GPU Processes: sudo fuser -v /dev/nvhost-*
+sudo systemctl restart nvargus-daemon
+sudo systemctl stop nvargus-daemon
+ sudo systemctl stop nvargus-daemon
+ sudo nvpmodel -m 1
+ sudo jetson_clocks
+ ==========================================================================================
+# 11-3-26
+Your edge stack is correctly designed for production:
+
+Pipeline:
+
+RTSP stream
+   ↓
+GStreamer hardware decode
+   ↓
+Frame throttling
+   ↓
+GPU queue
+   ↓
+TensorRT inference worker
+   ↓
+ROI filter
+   ↓
+Temporal smoother
+   ↓
+START / FRAME_AGGREGATE / END
+   ↓
+Async event queue
+   ↓
+HTTP sender threads
+   ↓
+Backend ingestion
+
+This is exactly what a Jetson multi-camera production pipeline should look like.
+=============================================================================================

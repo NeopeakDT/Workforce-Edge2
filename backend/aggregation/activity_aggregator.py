@@ -103,6 +103,7 @@ def run():
     # In-memory caching for performance
     zone_cache = {}
     farm_tz_cache = {}
+    active_instance_cache = {}
 
     with get_cursor() as cur:
         while True:
@@ -171,112 +172,107 @@ def run():
                 if not zone_id:
                     continue  # cannot build instance without zone
 
+                instance_key = (farm_id, zone_id, activity_type_id, activity_date)
+
                 # -------------------------------------------------
                 # START_CANDIDATE
                 # -------------------------------------------------
                 if etype == "START_CANDIDATE":
-                    # 1. Active instance exists → reuse
-                    cur.execute(
-                        """
-                        SELECT id
-                        FROM activity_instance
-                        WHERE farm_id = %s
-                          AND zone_id = %s
-                          AND activity_type_id = %s
-                          AND activity_date = %s
-                          AND status = 'IN_PROGRESS'
-                        ORDER BY actual_start_at DESC
-                        LIMIT 1
-                        """,
-                        (farm_id, zone_id, activity_type_id, activity_date),
-                    )
-                    active = cur.fetchone()
+                    instance_id = active_instance_cache.get(instance_key)
 
-                    if active:
-                        instance_id = active["id"]
-                    else:
-                        # 2. Merge-on-start (recent ended)
-                        gap = timedelta(
-                            minutes=MERGE_GAP_MINUTES.get(activity_type_id, 10)
-                        )
-
+                    if instance_id is None:
+                        # 1. Active instance exists in DB → reuse and cache
                         cur.execute(
                             """
-                            SELECT id, actual_end_at
+                            SELECT id
                             FROM activity_instance
                             WHERE farm_id = %s
                               AND zone_id = %s
                               AND activity_type_id = %s
                               AND activity_date = %s
-                              AND status != 'IN_PROGRESS'
-                              AND actual_end_at IS NOT NULL
-                            ORDER BY actual_end_at DESC
+                              AND status = 'IN_PROGRESS'
+                              AND actual_end_at IS NULL
+                            ORDER BY actual_start_at DESC
                             LIMIT 1
                             """,
                             (farm_id, zone_id, activity_type_id, activity_date),
                         )
-                        prev = cur.fetchone()
+                        active = cur.fetchone()
 
-                        if prev and event_time - prev["actual_end_at"] <= gap:
-                            cur.execute(
-                                """
-                                UPDATE activity_instance
-                                SET status = 'IN_PROGRESS',
-                                    actual_end_at = NULL,
-                                    last_seen_at = %s,
-                                    updated_at = %s
-                                WHERE id = %s
-                                """,
-                                (event_time, utc_now(), prev["id"]),
-                            )
-                            instance_id = prev["id"]
+                        if active:
+                            instance_id = active["id"]
+                            active_instance_cache[instance_key] = instance_id
                         else:
-                            # Cached timezone lookup
-                            if farm_id not in farm_tz_cache:
-                                cur.execute(
-                                    "SELECT timezone FROM farm WHERE id = %s",
-                                    (farm_id,),
-                                )
-                                farm_tz_cache[farm_id] = pytz.timezone(
-                                    cur.fetchone()["timezone"]
-                                )
-
-                            tz = farm_tz_cache[farm_id]
-                            activity_date = event_time.astimezone(tz).date()
+                        # 2. Merge-on-start (recent ended)
+                            gap = timedelta(
+                                minutes=MERGE_GAP_MINUTES.get(activity_type_id, 10)
+                            )
 
                             cur.execute(
                                 """
-                                INSERT INTO activity_instance (
-                                    farm_id,
-                                    zone_id,
-                                    activity_type_id,
-                                    activity_date,
-                                    status,
-                                    actual_start_at,
-                                    last_seen_at,
-                                    source,
-                                    created_at,
-                                    updated_at
-                                )
-                                VALUES (%s,%s,%s,%s,
-                                        'IN_PROGRESS',
-                                        %s,%s,
-                                        'AI',
-                                        %s,%s)
-                                RETURNING id
+                                SELECT id, actual_end_at
+                                FROM activity_instance
+                                WHERE farm_id = %s
+                                  AND zone_id = %s
+                                  AND activity_type_id = %s
+                                  AND activity_date = %s
+                                  AND actual_end_at IS NOT NULL
+                                ORDER BY actual_end_at DESC
+                                LIMIT 1
                                 """,
-                                (
-                                    farm_id,
-                                    zone_id,
-                                    activity_type_id,
-                                    activity_date,
-                                    event_time,
-                                    event_time,
-                                    utc_now(),
-                                    utc_now(),
-                                ),
+                                (farm_id, zone_id, activity_type_id, activity_date),
                             )
-                            instance_id = cur.fetchone()["id"]
+                            prev = cur.fetchone()
+
+                            if prev and event_time - prev["actual_end_at"] <= gap:
+                                cur.execute(
+                                    """
+                                    UPDATE activity_instance
+                                    SET status = 'IN_PROGRESS',
+                                        actual_end_at = NULL,
+                                        last_seen_at = %s,
+                                        updated_at = %s
+                                    WHERE id = %s
+                                    """,
+                                    (event_time, utc_now(), prev["id"]),
+                                )
+                                instance_id = prev["id"]
+                                active_instance_cache[instance_key] = instance_id
+                            else:
+                                cur.execute(
+                                    """
+                                    INSERT INTO activity_instance (
+                                        farm_id,
+                                        zone_id,
+                                        activity_type_id,
+                                        activity_date,
+                                        status,
+                                        actual_start_at,
+                                        last_seen_at,
+                                        source,
+                                        created_at,
+                                        updated_at
+                                    )
+                                    VALUES (%s,%s,%s,%s,
+                                            'IN_PROGRESS',
+                                            %s,%s,
+                                            'AI',
+                                            %s,%s)
+                                    RETURNING id
+                                    """,
+                                    (
+                                        farm_id,
+                                        zone_id,
+                                        activity_type_id,
+                                        activity_date,
+                                        event_time,
+                                        event_time,
+                                        utc_now(),
+                                        utc_now(),
+                                    ),
+                                )
+                                instance_id = cur.fetchone()["id"]
+                                active_instance_cache[instance_key] = instance_id
 
                     cur.execute(
                         """
@@ -291,23 +287,48 @@ def run():
                 # FRAME / END
                 # -------------------------------------------------
                 else:
-                    cur.execute(
-                        """
-                        SELECT id, actual_start_at
-                        FROM activity_instance
-                        WHERE farm_id = %s
-                          AND zone_id = %s
-                          AND activity_type_id = %s
-                          AND activity_date = %s
-                          AND status = 'IN_PROGRESS'
-                        ORDER BY actual_start_at DESC
-                        LIMIT 1
-                        """,
-                        (farm_id, zone_id, activity_type_id, activity_date),
-                    )
-                    row = cur.fetchone()
-                    if not row:
-                        continue
+                    instance_id = active_instance_cache.get(instance_key)
+                    actual_start_at = None
+
+                    if instance_id is None:
+                        cur.execute(
+                            """
+                            SELECT id, actual_start_at
+                            FROM activity_instance
+                            WHERE farm_id = %s
+                              AND zone_id = %s
+                              AND activity_type_id = %s
+                              AND activity_date = %s
+                              AND status = 'IN_PROGRESS'
+                              AND actual_end_at IS NULL
+                            ORDER BY actual_start_at DESC
+                            LIMIT 1
+                            """,
+                            (farm_id, zone_id, activity_type_id, activity_date),
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            continue
+                        instance_id = row["id"]
+                        actual_start_at = row["actual_start_at"]
+                        active_instance_cache[instance_key] = instance_id
+                    elif etype == "END_CANDIDATE":
+                        # END needs start time for duration calculation.
+                        cur.execute(
+                            """
+                            SELECT actual_start_at
+                            FROM activity_instance
+                            WHERE id = %s
+                              AND status = 'IN_PROGRESS'
+                              AND actual_end_at IS NULL
+                            """,
+                            (instance_id,),
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            active_instance_cache.pop(instance_key, None)
+                            continue
+                        actual_start_at = row["actual_start_at"]
 
                     if etype == "FRAME_AGGREGATE":
                         cur.execute(
@@ -317,14 +338,14 @@ def run():
                                 updated_at = %s
                             WHERE id = %s
                             """,
-                            (event_time, utc_now(), row["id"]),
+                            (event_time, utc_now(), instance_id),
                         )
 
                     elif etype == "END_CANDIDATE":
                         duration = max(
                             0,
                             int(
-                                (event_time - row["actual_start_at"]).total_seconds()
+                                (event_time - actual_start_at).total_seconds()
                             ),
                         )
                         cur.execute(
@@ -341,9 +362,10 @@ def run():
                                 duration,
                                 event_time,
                                 utc_now(),
-                                row["id"],
+                                instance_id,
                             ),
                         )
+                        active_instance_cache.pop(instance_key, None)
 
                     cur.execute(
                         """
@@ -351,7 +373,7 @@ def run():
                         SET activity_instance_id = %s
                         WHERE id = %s
                         """,
-                        (row["id"], e["event_row_id"]),
+                        (instance_id, e["event_row_id"]),
                     )
 
             cur.connection.commit()
