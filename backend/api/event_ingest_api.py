@@ -11,6 +11,11 @@ Responsibilities:
 NO instance creation here.
 """
 
+import os
+import time
+import threading
+from collections import defaultdict, deque
+
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
@@ -25,6 +30,13 @@ from common.time_utils import utc_now
 from common.device_auth import resolve_device_from_headers, DeviceAuthError
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
+
+MAX_EVENTS_PER_CAMERA_PER_MIN = int(
+    os.getenv("INGEST_MAX_EVENTS_PER_CAMERA_PER_MIN", "120")
+)
+RATE_WINDOW_SECONDS = 60
+_rate_limit_lock = threading.Lock()
+_camera_event_windows = defaultdict(deque)
 
 
 class DetectionEventIn(BaseModel):
@@ -45,13 +57,43 @@ def validate_utc(ts: datetime):
         raise HTTPException(400, "event_time must be UTC")
 
 
+_activity_type_cache: dict = {}
+
+
 def resolve_activity_type_id(code: str) -> int:
+    if code in _activity_type_cache:
+        return _activity_type_cache[code]
+
     with get_cursor() as cur:
         cur.execute("SELECT id FROM activity_type WHERE code=%s", (code,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(400, f"Unknown activity_type {code}")
-        return row["id"]
+
+    if not row:
+        raise HTTPException(400, f"Unknown activity_type {code}")
+
+    _activity_type_cache[code] = row["id"]
+    return row["id"]
+
+
+def rate_exceeded(camera_id: str):
+    if MAX_EVENTS_PER_CAMERA_PER_MIN <= 0:
+        return False, None
+
+    now = time.monotonic()
+    cutoff = now - RATE_WINDOW_SECONDS
+
+    with _rate_limit_lock:
+        window = _camera_event_windows[camera_id]
+
+        while window and window[0] <= cutoff:
+            window.popleft()
+
+        if len(window) >= MAX_EVENTS_PER_CAMERA_PER_MIN:
+            retry_after = max(1, int(RATE_WINDOW_SECONDS - (now - window[0])))
+            return True, retry_after
+
+        window.append(now)
+        return False, None
 
 
 @router.post("/event")
@@ -66,6 +108,20 @@ def ingest_event(
 
     validate_utc(payload.event_time)
     activity_type_id = resolve_activity_type_id(payload.activity_type)
+    
+    print(f"[INGEST] {payload.event_type} | {payload.camera_id} | {payload.event_time}")
+
+    exceeded, retry_after = rate_exceeded(str(payload.camera_id))
+    if exceeded:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Event rate exceeded for camera. "
+                "Reduce edge event volume or increase ingest limit."
+            ),
+
+            headers={"Retry-After": str(retry_after)},
+        )
 
     # Extract zone_id from payload.zones.primary
     zone_id = None

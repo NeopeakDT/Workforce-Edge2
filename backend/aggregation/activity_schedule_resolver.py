@@ -42,12 +42,19 @@ def resolve():
         # --------------------------------------------------
         # Pick ended, unresolved AI instances
         # --------------------------------------------------
+        # 🔥 CRITICAL FIX: 
+        # 1. Removed "activity_schedule_id IS NULL" condition
+        #    (Aggregator now sets activity_schedule_id at instance creation)
+        # 2. Added reprocessing guard "started_offset_min IS NULL"
+        #    (Prevent recomputing already resolved instances)
+        # --------------------------------------------------
         cur.execute(
             """
             SELECT
                 ai.id,
                 ai.farm_id,
                 ai.activity_type_id,
+                ai.activity_schedule_id,
                 ai.actual_start_at,
                 ai.actual_end_at,
                 ai.activity_date,
@@ -56,8 +63,8 @@ def resolve():
             JOIN farm f ON f.id = ai.farm_id
             WHERE ai.actual_end_at IS NOT NULL
               AND ai.status = 'IN_PROGRESS'
-              AND ai.activity_schedule_id IS NULL
               AND ai.source = 'AI'
+              AND ai.started_offset_min IS NULL
             """
         )
 
@@ -103,8 +110,11 @@ def resolve():
             activity_date = start_local.date()
 
             # --------------------------------------------------
-            # Fetch schedules
+            # CRITICAL: Use existing activity_schedule_id
+            # (set by aggregator, not recomputed here)
             # --------------------------------------------------
+            schedule_id = ai["activity_schedule_id"]
+            
             cur.execute(
                 """
                 SELECT
@@ -114,77 +124,54 @@ def resolve():
                     s.tolerance_early_min,
                     s.tolerance_late_min
                 FROM activity_schedule s
-                WHERE s.farm_id = %s
-                  AND s.activity_type_id = %s
-                  AND s.is_active = true
-                ORDER BY s.ideal_start_time
+                WHERE s.id = %s
                 """,
-                (ai["farm_id"], ai["activity_type_id"]),
+                (schedule_id,)
+            )
+            
+            schedule_row = cur.fetchone()
+            if not schedule_row:
+                # Schedule deleted? Mark as LATE and skip
+                cur.execute(
+                    """
+                    UPDATE activity_instance
+                    SET status = 'LATE',
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (now_utc, ai["id"]),
+                )
+                continue
+
+            s = schedule_row
+
+            # ------- Compute offsets --------
+            # Build ideal window in FARM LOCAL TIME
+            ideal_start_naive = datetime.combine(
+                activity_date, s["ideal_start_time"]
+            )
+            ideal_end_naive = datetime.combine(
+                activity_date, s["ideal_end_time"]
             )
 
-            schedules = cur.fetchall()
-            if not schedules:
-                continue
+            ideal_start_local = farm_tz.localize(ideal_start_naive)
+            ideal_end_local = farm_tz.localize(ideal_end_naive)
 
-            best = None
-            best_score = None
+            # Cross-midnight handling
+            if ideal_end_local <= ideal_start_local:
+                ideal_end_local += timedelta(days=1)
 
-            for s in schedules:
+            # Convert ideal window to UTC
+            ideal_start_utc = ideal_start_local.astimezone(timezone.utc)
+            ideal_end_utc = ideal_end_local.astimezone(timezone.utc)
 
-                # ----------------------------------------------
-                # Build ideal window in FARM LOCAL TIME
-                # ----------------------------------------------
-                ideal_start_naive = datetime.combine(
-                    activity_date, s["ideal_start_time"]
-                )
-                ideal_end_naive = datetime.combine(
-                    activity_date, s["ideal_end_time"]
-                )
-
-                ideal_start_local = farm_tz.localize(ideal_start_naive)
-                ideal_end_local = farm_tz.localize(ideal_end_naive)
-
-                # ----------------------------------------------
-                # Cross-midnight handling
-                # ----------------------------------------------
-                if ideal_end_local <= ideal_start_local:
-                    ideal_end_local += timedelta(days=1)
-
-                # ----------------------------------------------
-                # Convert ideal window to UTC
-                # ----------------------------------------------
-                ideal_start_utc = ideal_start_local.astimezone(timezone.utc)
-                ideal_end_utc = ideal_end_local.astimezone(timezone.utc)
-
-                # ----------------------------------------------
-                # Compute offsets in UTC (authoritative)
-                # ----------------------------------------------
-                started_offset = int(
-                    (actual_start_utc - ideal_start_utc).total_seconds() / 60
-                )
-                ended_offset = int(
-                    (actual_end_utc - ideal_end_utc).total_seconds() / 60
-                )
-
-                # ----------------------------------------------
-                # Scoring (start priority, slight end weight)
-                # ----------------------------------------------
-                score = abs(started_offset) + (0.3 * abs(ended_offset))
-
-                if best is None or score < best_score:
-                    best = {
-                        "schedule": s,
-                        "started_offset": started_offset,
-                        "ended_offset": ended_offset,
-                    }
-                    best_score = score
-
-            if best is None:
-                continue
-
-            s = best["schedule"]
-            started_offset = best["started_offset"]
-            ended_offset = best["ended_offset"]
+            # Compute offsets in UTC (authoritative)
+            started_offset = int(
+                (actual_start_utc - ideal_start_utc).total_seconds() / 60
+            )
+            ended_offset = int(
+                (actual_end_utc - ideal_end_utc).total_seconds() / 60
+            )
 
             # --------------------------------------------------
             # Final Status Resolution
@@ -196,22 +183,19 @@ def resolve():
             else:
                 final_status = "ON_TIME"
 
-
             # --------------------------------------------------
             # Persist resolution
             # --------------------------------------------------
             cur.execute(
                 """
                 UPDATE activity_instance
-                SET activity_schedule_id = %s,
-                    started_offset_min = %s,
+                SET started_offset_min = %s,
                     ended_offset_min = %s,
                     status = %s,
                     updated_at = %s
                 WHERE id = %s
                 """,
                 (
-                    s["id"],
                     started_offset,
                     ended_offset,
                     final_status,

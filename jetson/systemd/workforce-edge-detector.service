@@ -1,0 +1,23 @@
+[Unit]
+Description=Workforce Edge Detector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+WorkingDirectory=/opt/workforce/Workforce-Detection/jetson
+Environment=PYTHONUNBUFFERED=1
+Environment=EDGE_FRAME_QUEUE_MAXSIZE=20
+Environment=EDGE_EVENT_QUEUE_MAXSIZE=10000
+ExecStartPre=/opt/workforce/Workforce-Detection/.venv/bin/python /opt/workforce/Workforce-Detection/jetson/edge_config_sync.py
+ExecStart=/opt/workforce/Workforce-Detection/.venv/bin/python /opt/workforce/Workforce-Detection/jetson/edge_detector.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

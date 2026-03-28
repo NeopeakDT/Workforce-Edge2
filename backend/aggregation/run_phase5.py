@@ -40,7 +40,7 @@ from aggregation.missed_activity_cron import detect_missed_activities
 
 def run():
     print("[PHASE-5] STEP-4: aggregating activities…")
-    step4_aggregator()
+    step4_aggregator(max_loops=1)
 
     print("[PHASE-5] STEP-5A: resolving schedules & status…")
     step5a_resolver()

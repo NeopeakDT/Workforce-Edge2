@@ -1,146 +1,14 @@
-
-  {
+{
   "device_id": "3259cd10-d54c-42e3-88d6-b85a05e262be",
   "farm_id": "07dbc890-2076-4018-b5fc-9f93cf2900e3",
   "farm_timezone": "Asia/Kolkata",
   "cameras": [
     {
-      "camera_id": "f5e093ef-2730-46f7-824a-a1acff057462",
-      "code": "H-GRP-1-Front-left",
-      "stream_type": "RTSP",
-      "rtsp_url": "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101",
-      "nvr_rtsp_base": null,
-      "nvr_channel": null,
-      "resolution": null,
-      "fps": null,
-      "roi_polygon": null,
-      "motion_sensitivity": null,
-      "activity_zones": {
-        "FEEDING": {
-          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
-          "roi": null
-        },
-        "SCRAPPING": {
-          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
-          "roi": [
-            {
-              "x": 0.619,
-              "y": 0.101
-            },
-            {
-              "x": 0.933,
-              "y": 0.224
-            },
-            {
-              "x": 0.831,
-              "y": 0.997
-            },
-            {
-              "x": 0.004,
-              "y": 0.981
-            },
-            {
-              "x": 0.611,
-              "y": 0.101
-            }
-          ]
-        }
-      },
-      "video_file_path": null
-    },
-      {
-      "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
-      "code": "H-GRP-1-Front-center",
-      "stream_type": "RTSP",
-      "rtsp_url": "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101",
-      "nvr_rtsp_base": null,
-      "nvr_channel": null,
-      "resolution": "2560 x 1440",
-      "fps": 10,
-      "roi_polygon": null,
-      "motion_sensitivity": null,
-      "activity_zones": {
-        "FEEDING": {
-          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
-          "roi": null
-        },
-        "SCRAPPING": {
-          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
-          "roi": [
-            {
-              "x": 0.619,
-              "y": 0.101
-            },
-            {
-              "x": 0.933,
-              "y": 0.224
-            },
-            {
-              "x": 0.831,
-              "y": 0.997
-            },
-            {
-              "x": 0.004,
-              "y": 0.981
-            },
-            {
-              "x": 0.611,
-              "y": 0.101
-            }
-          ]
-        }
-      },
-      "video_file_path": null
-    },
-    {
-      "camera_id": "8d44df12-a056-4b70-919e-ff4735453582",
-      "code": "H-GRP-2-TMR-way",
-      "stream_type": "RTSP",
-      "rtsp_url": "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101",
-      "nvr_rtsp_base": null,
-      "nvr_channel": null,
-      "resolution": "2560 x 1440",
-      "fps": 10,
-      "roi_polygon": null,
-      "motion_sensitivity": null,
-      "activity_zones": {
-        "FEEDING": {
-          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
-          "roi": null
-        },
-        "SCRAPPING": {
-          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
-          "roi": [
-            {
-              "x": 0.619,
-              "y": 0.101
-            },
-            {
-              "x": 0.933,
-              "y": 0.224
-            },
-            {
-              "x": 0.831,
-              "y": 0.997
-            },
-            {
-              "x": 0.004,
-              "y": 0.981
-            },
-            {
-              "x": 0.611,
-              "y": 0.101
-            }
-          ]
-        }
-      },
-      "video_file_path": null
-    },
-    {
       "camera_id": "c6ba130f-a0b4-4f74-96bd-6a4407e6c64a",
       "code": "H-GRP-2-Front-Right",
-      "stream_type": "RTSP",
-      "rtsp_url": "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101",
+      "stream_type": "FILE",
+      "decode_mode": "GPU",
+      "rtsp_url": "rtsp://",
       "nvr_rtsp_base": null,
       "nvr_channel": null,
       "resolution": "2560 x 1440",
@@ -150,41 +18,67 @@
       "activity_zones": {
         "FEEDING": {
           "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
-          "roi": null
+          "roi": [
+            {
+              "x": 0.519,
+              "y": 0.173
+            },
+            {
+              "x": 0.648,
+              "y": 0.203
+            },
+            {
+              "x": 0.574,
+              "y": 0.99
+            },
+            {
+              "x": 0.006,
+              "y": 0.991
+            },
+            {
+              "x": 0.004,
+              "y": 0.843
+            },
+            {
+              "x": 0.517,
+              "y": 0.169
+            }
+          ]
         },
         "SCRAPPING": {
           "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
           "roi": [
             {
-              "x": 0.619,
-              "y": 0.101
+              "x": 0.681,
+              "y": 0.211
             },
             {
-              "x": 0.933,
-              "y": 0.224
+              "x": 0.622,
+              "y": 0.992
             },
             {
-              "x": 0.831,
-              "y": 0.997
+              "x": 0.998,
+              "y": 0.99
             },
             {
-              "x": 0.004,
-              "y": 0.981
+              "x": 0.834,
+              "y": 0.258
             },
             {
-              "x": 0.611,
-              "y": 0.101
+              "x": 0.68,
+              "y": 0.208
             }
           ]
         }
       },
-      "video_file_path": null
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_video(17-2-26)/GRP_2_Front_Right_17-2-26.mp4"
     },
     {
       "camera_id": "75bc9fb9-b3d9-4f3b-9091-11e6f18bc96e",
       "code": "H-GRP-1-Front-right",
-      "stream_type": "RTSP",
-      "rtsp_url": "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101",
+      "stream_type": "FILE",
+      "decode_mode": "GPU",
+      "rtsp_url": "rtsp://",
       "nvr_rtsp_base": null,
       "nvr_channel": null,
       "resolution": "2560 x 1440",
@@ -194,36 +88,271 @@
       "activity_zones": {
         "FEEDING": {
           "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
-          "roi": null
+          "roi": [
+            {
+              "x": 0.155,
+              "y": 0.994
+            },
+            {
+              "x": 0.941,
+              "y": 0.997
+            },
+            {
+              "x": 0.998,
+              "y": 0.458
+            },
+            {
+              "x": 0.999,
+              "y": 0.258
+            },
+            {
+              "x": 0.983,
+              "y": 0.25
+            },
+            {
+              "x": 0.154,
+              "y": 0.992
+            }
+          ]
         },
         "SCRAPPING": {
           "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
           "roi": [
             {
-              "x": 0.619,
-              "y": 0.101
-            },
-            {
-              "x": 0.933,
-              "y": 0.224
-            },
-            {
-              "x": 0.831,
+              "x": 0.109,
               "y": 0.997
             },
             {
-              "x": 0.004,
-              "y": 0.981
+              "x": 0.98,
+              "y": 0.242
             },
             {
-              "x": 0.611,
-              "y": 0.101
+              "x": 0.918,
+              "y": 0.221
+            },
+            {
+              "x": 0.004,
+              "y": 0.556
+            },
+            {
+              "x": 0.005,
+              "y": 0.991
+            },
+            {
+              "x": 0.108,
+              "y": 0.995
             }
           ]
         }
       },
-      "video_file_path": null
-    }  
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_video(17-2-26)/GRP_1_Front_Right_17-2-26.mp4"
+    },
+    {
+      "camera_id": "f5e093ef-2730-46f7-824a-a1acff057462",
+      "code": "H-GRP-1-Front-left",
+      "stream_type": "FILE",
+      "decode_mode": "CPU",
+      "rtsp_url": "rtsp://",
+      "nvr_rtsp_base": null,
+      "nvr_channel": null,
+      "resolution": "2560 x 1440",
+      "fps": 10,
+      "roi_polygon": null,
+      "motion_sensitivity": null,
+      "activity_zones": {
+        "FEEDING": {
+          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
+          "roi": [
+            {
+              "x": 0.0,
+              "y": 0.397
+            },
+            {
+              "x": 0.139,
+              "y": 0.991
+            },
+            {
+              "x": 0.752,
+              "y": 0.992
+            },
+            {
+              "x": 0.794,
+              "y": 0.838
+            },
+            {
+              "x": 0.006,
+              "y": 0.156
+            },
+            {
+              "x": 0.002,
+              "y": 0.395
+            }
+          ]
+        },
+        "SCRAPPING": {
+          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
+          "roi": [
+            {
+              "x": 0.074,
+              "y": 0.122
+            },
+            {
+              "x": 0.867,
+              "y": 0.476
+            },
+            {
+              "x": 0.794,
+              "y": 0.833
+            },
+            {
+              "x": 0.025,
+              "y": 0.147
+            },
+            {
+              "x": 0.073,
+              "y": 0.122
+            }
+          ]
+        }
+      },
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_video(17-2-26)/GRP_1_Front_left_17-2-26.mp4"
+    },
+    {
+      "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
+      "code": "H-GRP-1-Front-center",
+      "stream_type": "FILE",
+      "decode_mode": "CPU",
+      "rtsp_url": "rtsp://",
+      "nvr_rtsp_base": null,
+      "nvr_channel": null,
+      "resolution": "2560 x 1440",
+      "fps": 10,
+      "roi_polygon": null,
+      "motion_sensitivity": null,
+      "activity_zones": {
+        "FEEDING": {
+          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
+          "roi": [
+            {
+              "x": 0.052,
+              "y": 0.314
+            },
+            {
+              "x": 0.122,
+              "y": 0.271
+            },
+            {
+              "x": 0.996,
+              "y": 0.974
+            },
+            {
+              "x": 0.2,
+              "y": 0.983
+            },
+            {
+              "x": 0.052,
+              "y": 0.314
+            }
+          ]
+        },
+        "SCRAPPING": {
+          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
+          "roi": [
+            {
+              "x": 0.145,
+              "y": 0.263
+            },
+            {
+              "x": 0.237,
+              "y": 0.215
+            },
+            {
+              "x": 0.998,
+              "y": 0.472
+            },
+            {
+              "x": 0.998,
+              "y": 0.904
+            },
+            {
+              "x": 0.145,
+              "y": 0.267
+            }
+          ]
+        }
+      },
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_video(17-2-26)/GRP_1_Front_center_17-2-26.mp4"
+    },
+    {
+      "camera_id": "8d44df12-a056-4b70-919e-ff4735453582",
+      "code": "H-GRP-2-TMR-way",
+      "stream_type": "FILE",
+      "decode_mode": "CPU",
+      "rtsp_url": "rtsp://",
+      "nvr_rtsp_base": null,
+      "nvr_channel": null,
+      "resolution": "2560 x 1440",
+      "fps": 10,
+      "roi_polygon": null,
+      "motion_sensitivity": null,
+      "activity_zones": {
+        "FEEDING": {
+          "zone_id": "7306220d-1441-4d04-a1e3-699fd70a1921",
+          "roi": [
+            {
+              "x": 0.668,
+              "y": 0.1
+            },
+            {
+              "x": 0.594,
+              "y": 0.994
+            },
+            {
+              "x": 0.008,
+              "y": 0.982
+            },
+            {
+              "x": 0.609,
+              "y": 0.071
+            },
+            {
+              "x": 0.667,
+              "y": 0.102
+            }
+          ]
+        },
+        "SCRAPPING": {
+          "zone_id": "f7d1591b-7685-497f-a62a-546ab0b61de0",
+          "roi": [
+            {
+              "x": 0.7,
+              "y": 0.111
+            },
+            {
+              "x": 0.641,
+              "y": 0.994
+            },
+            {
+              "x": 0.993,
+              "y": 0.988
+            },
+            {
+              "x": 0.999,
+              "y": 0.593
+            },
+            {
+              "x": 0.758,
+              "y": 0.125
+            },
+            {
+              "x": 0.7,
+              "y": 0.112
+            }
+          ]
+        }
+      },
+      "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_video(17-2-26)/GRP_2__TMR_way_17-2-26.mp4"
+    }
   ],
   "device_model_assignment": {
     "ml_model_version_id": "bb91a462-ff2d-45b9-b5db-fc21a8e8cf26"

@@ -1,0 +1,22 @@
+[Unit]
+Description=Workforce Edge Watchdog
+After=workforce-edge-detector.service
+Wants=workforce-edge-detector.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/workforce/Workforce-Detection/jetson
+Environment=PYTHONUNBUFFERED=1
+Environment=EDGE_WATCHDOG_FILE=/tmp/workforce_edge_alive
+Environment=EDGE_WATCHDOG_TIMEOUT_SEC=60
+Environment=EDGE_WATCHDOG_CHECK_INTERVAL_SEC=15
+Environment=EDGE_DETECTOR_SERVICE_NAME=workforce-edge-detector.service
+ExecStart=/opt/workforce/Workforce-Detection/.venv/bin/python /opt/workforce/Workforce-Detection/jetson/edge_watchdog.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

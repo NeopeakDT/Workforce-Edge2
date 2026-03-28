@@ -454,67 +454,7 @@ So right now:
     • F1-CAMERA-4 config is valid but unused
 This is expected given your TODO comment, but be aware during testing.
 =====================================================================================================
- 
-23/2/26 - 
 
-Here are the issues in simple, precise points:
-
-1️⃣ Why 6-hour offline replay happens
-    • You have 1 TensorRT engine
-    • GPU can process only one inference at a time
-    • 5 cameras compete for it
-    • Effective throughput = 1 / inference_time
-    • With ~180ms per inference → ~5.5 FPS total
-    • 120k frames ÷ 5.5 FPS ≈ 6 hours
-It’s not a bug. It’s math.
-
-2️⃣ Why INFER_LOCK caused slowdown
-    • All camera threads try to infer simultaneously
-    • Lock forces strict serialization
-    • Threads context-switch constantly
-    • CPU overhead increases
-    • GPU sits idle between thread switches
-Result: lower effective throughput.
-
-3️⃣ Why your first queue-based pipeline still didn’t help much
-    • Each camera pushes frame
-    • Immediately blocks waiting for result
-    • So behavior is still serialized
-    • Added queue + polling overhead
-    • No real parallelism gained
-You changed structure, not physics.
-
-4️⃣ Why MAXN gave over-current warning
-    • GPU tried to draw higher power
-    • Your adapter/carrier board limited current
-    • Firmware throttled clocks
-    • Performance capped artificially
-That’s power limitation, not software.
-
-5️⃣ Why backend is NOT the bottleneck
-    • Event sending is async
-    • Inference happens before event creation
-    • Inference time >> HTTP time
-    • So GPU dominates runtime
-
-6️⃣ Core Reality
-Your system throughput is bounded by:
-Total FPS = 1 / inference_time
-If inference = 40ms → max 25 FPS total
-If inference = 180ms → max 5.5 FPS total
-With 5 cameras:
-Divide that across cameras.
-
-7️⃣ What Actually Controls Performance
-Only these matter:
-    • Resolution (640 vs 512)
-    • TensorRT vs PyTorch
-    • Power mode (15W vs MAXN)
-    • Number of cameras
-    • Processing FPS
-Threading tricks don’t change GPU physics.
-
-===============================================================================================
 24/2/26 -
 Looking at your logs and code, here's the step-by-step execution flow for multi-camera processing:
 
@@ -682,33 +622,6 @@ If now > 02:15 PM AND no activity exists
 
 ======================================================================================================
 git archive --format=zip --output=project_code.zip HEAD
-
-====================================================================================================
-4-3-2026
-
-# Final Architecture Summary-
-Your system is now: 
-
-Camera Threads (N)
-    │
-    │ NVDEC decode
-    ▼
-Frame Queue (size 10)
-    ▼
-GPU Worker (TensorRT batch=1–2)
-    ▼
-ROI Filter
-    ▼
-Motion Logic
-    ▼
-Temporal Smoother
-    ▼
-Activity State Machine
-    ▼
-Event Queue
-    ▼
-Async HTTP Senders
-This is exactly the architecture used in production edge AI systems.
 
 ==================================================================================================
 5/3/2026 - gst-launch-1.0 rtspsrc location=rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/102 latency=0 ! rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! autovideosink
@@ -884,7 +797,6 @@ You now have full pipeline running 24/7.
 Kill All GPU Processes: sudo fuser -v /dev/nvhost-*
 sudo systemctl restart nvargus-daemon
 sudo systemctl stop nvargus-daemon
- sudo systemctl stop nvargus-daemon
  sudo nvpmodel -m 1
  sudo jetson_clocks
  ==========================================================================================
@@ -917,3 +829,82 @@ Backend ingestion
 
 This is exactly what a Jetson multi-camera production pipeline should look like.
 =============================================================================================
+
+# 16-3-26
+
+FPS Looks Correct
+Your monitor:
+Total FPS: 13–14
+FrameQ: 0–3 / 20
+You configured:
+PROCESSING_FPS = 5
+cameras = 5
+Expected theoretical throughput:
+5 cameras × 5 FPS = 25 FPS input
+But you are doing:
+    • inference
+    • ROI filtering
+    • motion detection
+    • event generation
+    • HTTP sending
+So 13–14 FPS total is normal.
+Jetson Orin NX typically delivers:
+12–18 FPS total for 5 streams
+So performance is healthy.
+
+================================================================================================
+# 24/3/26 -
+1. FORCE camera stream format (MANDATORY)
+
+Never rely on default camera output
+
+👉 In camera/NVR settings:
+
+Codec: H.264 ONLY
+Profile: Main / Baseline
+Resolution: ≤ 1080p (prefer 720p)
+FPS: 10–15
+===========================================================================================
+# 25-3-26 ->
+
+┌──────────────────────────────────────┐
+│  AGGREGATOR (activity_aggregator.py) │
+│  - Schedule-based merge              │
+│  - Session mapping                   │
+│  - No reopen logic                   │
+│  - DB fallback for restart safety    │
+└──────────────────┬───────────────────┘
+                   │
+        ┌──────────v──────────┐
+        │ activity_instance   │
+        │ status='IN_PROGRESS'│
+        └──────────┬──────────┘
+                   │
+┌──────────────────────────────────────┐
+│ RESOLVER (activity_schedule_resolver)│
+│ - Bind to schedule                   │
+│ - Compute offsets                    │
+│ - Finalize status (EARLY/ON_TIME/...)│
+│ - Idempotent guard (started_offset..)│
+└──────────────────┬───────────────────┘
+                   │
+        ┌──────────v──────────┐
+        │ activity_instance   │
+        │ status='FINAL'      │
+        │ offsets populated   │
+        └──────────┬──────────┘
+                   │
+┌──────────────────────────────────────┐
+│ MISSED (missed_activity_cron.py)     │
+│ - Check for missed activities        │
+│ - UPSERT for race condition safety   │
+│ - Fully idempotent                   │
+└──────────────────┬───────────────────┘
+                   │
+        ┌──────────v──────────────────┐
+        │ activity_instance           │
+        │ COMPLETE (all statuses)     │
+        │ Ready for business logic    │
+        └─────────────────────────────┘
+
+===========================================================================================

@@ -1,6 +1,10 @@
 # jetson/rintime/video_stream.py
 import cv2
 import time
+import os
+
+# Suppress GStreamer warnings in production
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 class VideoStream:
 	def __init__(self, cap):
@@ -47,12 +51,12 @@ def build_pipeline(rtsp_url, codec):
 		depay = "rtph265depay ! h265parse"
 
 	return (
-		f"rtspsrc location={rtsp_url} latency=50 protocols=tcp "
+		f"rtspsrc location={rtsp_url} latency=0 protocols=tcp "
 		"drop-on-latency=true timeout=5000000 ! "
 		"queue ! "
 		f"{depay} ! "
 		"nvv4l2decoder ! "
-		"nvvidconv ! video/x-raw,width=1280,height=720,format=BGRx ! "
+		"nvvidconv ! video/x-raw,format=BGRx ! "
 		"videoconvert ! video/x-raw,format=BGR ! "
 		"appsink drop=true max-buffers=1 sync=false"
 	)
@@ -68,17 +72,23 @@ def open_file_nvdec(path):
 
 		# MPEG-PS + H265 (DVR export)
 		f'filesrc location="{path}" ! mpegpsdemux ! h265parse ! '
-		'nvv4l2decoder ! nvvidconv ! video/x-raw,width=1280,height=720,format=BGRx ! '
+		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
 		'videoconvert ! video/x-raw,format=BGR ! '
 		'appsink drop=true max-buffers=1 sync=false',
 
 		# MPEG-PS + H264
 		f'filesrc location="{path}" ! mpegpsdemux ! h264parse ! '
-		'nvv4l2decoder ! nvvidconv ! video/x-raw,width=1280,height=720,format=BGRx ! '
+		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
 		'videoconvert ! video/x-raw,format=BGR ! '
 		'appsink drop=true max-buffers=1 sync=false',
 
 		# MP4 container
+		f'filesrc location="{path}" ! qtdemux ! h265parse ! '
+		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
+		'videoconvert ! video/x-raw,format=BGR ! '
+		'appsink drop=true max-buffers=1 sync=false',
+
+		# MP4 container + H264
 		f'filesrc location="{path}" ! qtdemux ! h264parse ! '
 		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
 		'videoconvert ! video/x-raw,format=BGR ! '
@@ -94,7 +104,7 @@ def open_file_nvdec(path):
 		cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
 		# Force decoder buffer cleanup
-		time.sleep(0.2)
+		time.sleep(0.5)
 
 		if cap.isOpened():
 			time.sleep(0.3)
@@ -111,29 +121,43 @@ def open_file_nvdec(path):
 
 def open_rtsp_auto(rtsp_url):
 	"""
-	Open RTSP stream with H264 codec and GStreamer pipeline.
-	Uses hardware acceleration (nvv4l2decoder).
+	Open RTSP stream with hardware acceleration (nvv4l2decoder).
 	
+	Attempts both H.264 and H.265 codecs to handle varying camera/NVR configurations.
 	Includes 500ms warm-up delay for camera initialization.
 	"""
-	codec = "h264"
-	pipeline = build_pipeline(rtsp_url, codec)
 
-	cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+	# Try H.264 first, then fall back to H.265 if needed.
+	for codec in ("h264", "h265"):
+		pipeline = build_pipeline(rtsp_url, codec)
 
-	if not cap.isOpened():
-		raise RuntimeError("Failed to open RTSP stream")
+		# Retry loop to handle flaky RTSP connections / camera timeouts.
+		for attempt in range(3):
+			cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
-	time.sleep(0.5)
+			# Best-effort guard against latency buildup on backends that honor this prop.
+			try:
+				if cap.getBackendName() == "GStreamer":
+					cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+			except Exception:
+				pass
 
-	ret, _ = cap.read()
-	if not ret:
-		cap.release()
-		raise RuntimeError("RTSP stream opened but frame read failed")
+			if not cap.isOpened():
+				cap.release()
+				time.sleep(1)
+				continue
 
-	print(f"[STREAM] RTSP connected: {rtsp_url}")
+			time.sleep(0.5)
 
-	return cap
+			ret, _ = cap.read()
+			if ret:
+				print(f"[STREAM] RTSP connected ({codec}): {rtsp_url}")
+				return cap
+
+			cap.release()
+			time.sleep(1)
+
+	raise RuntimeError(f"Failed to open RTSP stream: {rtsp_url}")
 
 
 def open_stream(camera_cfg):
@@ -142,16 +166,13 @@ def open_stream(camera_cfg):
 	Supported stream_type:
 		- FILE
 		- RTSP
-		- NVR_CHANNEL
+		- NVR
 	
 	SMART FALLBACK:
 		If rtsp_url exists → use it directly
 		Else if nvr_channel exists → construct RTSP from base + channel
 	"""
-	# Validate GStreamer support before any stream operations
-	_validate_gstreamer()
-
-	stream_type = camera_cfg.get("stream_type")
+	stream_type = camera_cfg.get("stream_type", "AUTO").upper()
 	rtsp_url = None
 	determined_stream_type = None
 
@@ -162,7 +183,16 @@ def open_stream(camera_cfg):
 		path = camera_cfg.get("video_file_path")
 		if not path:
 			raise RuntimeError("FILE stream missing video_file_path in local_cache.json")
-		cap = open_file_nvdec(path)  # Use hardware decode for files
+		
+		decode_mode = camera_cfg.get("decode_mode", "AUTO").upper()
+		
+		if decode_mode == "CPU":
+			print(f"[STREAM] FILE → CPU decode (FFMPEG): {path}")
+			cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+		else:
+			print(f"[STREAM] FILE → GPU decode (NVDEC): {path}")
+			cap = open_file_nvdec(path)
+		
 		determined_stream_type = "FILE"
 
 	# --------------------------------------------------
@@ -183,7 +213,7 @@ def open_stream(camera_cfg):
 			# Example for Hikvision-style NVR:
 			# rtsp://ip:554/Streaming/Channels/101
 			rtsp_url = f"{nvr_base_rtsp}/Streaming/Channels/{channel}"
-			determined_stream_type = "NVR_CHANNEL"
+			determined_stream_type = "NVR"
 		
 		# No valid stream source found
 		else:
@@ -193,8 +223,45 @@ def open_stream(camera_cfg):
 				"Must provide at least one stream source."
 			)
 
-		# Open RTSP stream with auto-detected codec
-		cap = open_rtsp_auto(rtsp_url)
+		# Open RTSP stream with explicit decode mode control (FIX: Prevent NVDEC overload)
+		decode_mode = camera_cfg.get("decode_mode", "AUTO").upper()
+
+		if decode_mode == "CPU":
+			# FORCED CPU DECODE (FFMPEG - true CPU, not GStreamer)
+			print(f"[STREAM] Using CPU decode (FFMPEG forced): {rtsp_url}")
+			cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+			# Reduce buffering (critical for live streams)
+			try:
+				cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+			except:
+				pass
+
+		elif decode_mode == "GPU":
+			# FORCED GPU DECODE
+			print(f"[STREAM] Using GPU decode (forced): {rtsp_url}")
+			try:
+				cap = open_rtsp_auto(rtsp_url)
+			except Exception as e:
+				raise RuntimeError(f"GPU decode failed (forced): {rtsp_url} | {e}")
+
+		else:  # AUTO mode (default fallback)
+			# TRY GPU FIRST, FALLBACK TO CPU (FFMPEG)
+			try:
+				cap = open_rtsp_auto(rtsp_url)
+				print(f"[STREAM] Using GPU hardware decoder (AUTO): {rtsp_url}")
+			except Exception as e:
+				print(f"[STREAM] GPU decode failed (AUTO) → CPU fallback (FFMPEG): {e}")
+				cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+				try:
+					cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+				except:
+					pass
+
+		# Verify stream opened successfully
+		if not cap.isOpened():
+			raise RuntimeError(
+				f"Failed to open stream: {rtsp_url} | decode_mode={decode_mode}"
+			)
 
 	if not cap.isOpened():
 		raise RuntimeError(

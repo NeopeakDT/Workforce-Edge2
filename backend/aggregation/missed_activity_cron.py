@@ -157,7 +157,13 @@ def detect_missed_activities():
                 continue
     
             # -------------------------------------------------
-            # Insert MISSED (idempotent)
+            # Insert MISSED (fully idempotent with UPSERT)
+            # 🔥 CRITICAL FIX (FIX 4):
+            # Using UPSERT ON CONFLICT DO NOTHING ensures:
+            # ✔ No duplicates even under race conditions
+            # ✔ Parallel runs safe
+            # ✔ Retries safe
+            # ✔ Cron overlaps handled
             # -------------------------------------------------
             cur.execute(
                 """
@@ -171,22 +177,9 @@ def detect_missed_activities():
                     created_at,
                     updated_at
                 )
-                SELECT
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    'MISSED',
-                    'SYSTEM',
-                    %s,
-                    %s
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM activity_instance ai
-                    WHERE ai.farm_id = %s
-                      AND ai.activity_schedule_id = %s
-                      AND ai.activity_date = %s
-                )
+                VALUES (%s, %s, %s, %s, 'MISSED', 'SYSTEM', %s, %s)
+                ON CONFLICT (farm_id, activity_schedule_id, activity_date)
+                DO NOTHING
                 """,
                 (
                     farm_id,
@@ -195,9 +188,6 @@ def detect_missed_activities():
                     activity_date,
                     now_utc,
                     now_utc,
-                    farm_id,
-                    schedule_id,
-                    activity_date,
                 ),
             )
 
