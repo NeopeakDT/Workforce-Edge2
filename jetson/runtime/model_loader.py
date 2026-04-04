@@ -52,8 +52,13 @@ class ModelRunner:
             self.device = device if device else "cuda"
             print(f"🔧 ModelRunner: Using device: {self.device}")
         
+        # Normalize CUDA detection (supports "cuda", "cuda:0", etc.)
+        self.is_cuda = self.device == "cuda" or (
+            isinstance(self.device, str) and "cuda" in self.device
+        )
+
         # Validate CUDA availability if using CUDA
-        if self.device == "cuda" or (isinstance(self.device, str) and "cuda" in self.device):
+        if self.is_cuda:
             try:
                 import torch
                 if not torch.cuda.is_available():
@@ -71,7 +76,7 @@ class ModelRunner:
             # TensorRT engine files are already optimized for GPU
             # No PyTorch operations needed - TensorRT handles device placement
             print("✅ ModelRunner: TensorRT engine loaded (GPU-optimized)")
-        elif self.device == "cuda" or (isinstance(self.device, str) and "cuda" in self.device):
+        elif (not self.is_engine) and self.is_cuda:
             print("🔧 ModelRunner: Applying CUDA optimizations (FP16, fused)")
             self.model.fuse()
             self.model.to(self.device)
@@ -105,7 +110,7 @@ class ModelRunner:
         if self.is_engine:
             # TensorRT engine - device is already configured, don't specify half
             inference_kwargs["device"] = self.device
-        elif self.device == "cuda" or (isinstance(self.device, str) and "cuda" in self.device):
+        elif (not self.is_engine) and self.is_cuda:
             # PyTorch CUDA model - use FP16 optimizations (model is already FP16, frame stays uint8)
             inference_kwargs["device"] = self.device
             inference_kwargs["half"] = True

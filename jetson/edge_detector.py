@@ -74,6 +74,8 @@ load_dotenv(DOTENV_PATH)
 # Edge-side constants (standalone, no backend dependency)
 # ------------------------------------------------------------------
 FRAME_AGGREGATE_INTERVAL_SEC = 10  # seconds
+SCRAP_ACTIVE_BUFFER_SEC = float(os.getenv("SCRAP_ACTIVE_BUFFER_SEC", "10"))
+FEED_ACTIVE_BUFFER_SEC = float(os.getenv("FEED_ACTIVE_BUFFER_SEC", "15"))
 
 API_BASE = os.getenv("EDGE_API_BASE")
 DEVICE_KEY = os.getenv("EDGE_DEVICE_KEY")
@@ -134,6 +136,7 @@ log_listener.start()
 # ------------------------------------------------------------------
 FRAME_QUEUE_MAXSIZE = int(os.getenv("EDGE_FRAME_QUEUE_MAXSIZE", "20"))
 FRAME_QUEUE = Queue(maxsize=FRAME_QUEUE_MAXSIZE)
+INFERENCE_FRAME_SIZE = (640, 640)
 
 # ------------------------------------------------------------------
 # Async event queue (CRITICAL for performance)
@@ -148,7 +151,14 @@ STATS = {
     "frames_processed": 0,
     "events_sent": 0,
 }
-CAMERA_STATS = defaultdict(lambda: {"frames": 0})
+CAMERA_STATS = defaultdict(
+    lambda: {
+        "frames": 0,
+        "last_frames": 0,
+        "last_seen": None,
+        "fps": 0.0,
+    }
+)
 STATS_LOCK = threading.Lock()
 
 # ------------------------------------------------------------------
@@ -157,6 +167,7 @@ STATS_LOCK = threading.Lock()
 PROCESSING_FPS = float(os.getenv("EDGE_PROCESSING_FPS", "5.0"))
 EDGE_MODE = os.getenv("EDGE_MODE", "LIVE")  # LIVE or BATCH
 WATCHDOG_FILE_PATH = os.getenv("EDGE_WATCHDOG_FILE", "/tmp/workforce_edge_alive")
+PROCESS_STARTED_AT = time.time()
 
 # ------------------------------------------------------------------
 # Utils
@@ -176,6 +187,45 @@ def update_watchdog_heartbeat(extra=None):
         os.replace(tmp_path, WATCHDOG_FILE_PATH)
     except Exception:
         pass
+
+
+def build_watchdog_payload(state="running", camera_id=None, last_frame=None):
+    with STATS_LOCK:
+        total_frames = STATS["frames_processed"]
+        camera_last_seen = {
+            cam_id: stats.get("last_seen")
+            for cam_id, stats in CAMERA_STATS.items()
+        }
+
+    payload = {
+        "state": state,
+        "process_started_at": PROCESS_STARTED_AT,
+        "frame_queue": FRAME_QUEUE.qsize(),
+        "event_queue": EVENT_QUEUE.qsize(),
+        "total_frames": total_frames,
+        "camera_last_seen": camera_last_seen,
+    }
+
+    if camera_id is not None:
+        payload["camera_id"] = camera_id
+    if last_frame is not None:
+        payload["last_frame"] = last_frame
+
+    return payload
+
+
+def drop_oldest_frame_for_camera(camera_id):
+    """Drop the oldest queued frame for this camera without disturbing others."""
+    with FRAME_QUEUE.mutex:
+        for idx, item in enumerate(FRAME_QUEUE.queue):
+            if item and item[0] == camera_id:
+                del FRAME_QUEUE.queue[idx]
+                FRAME_QUEUE.unfinished_tasks = max(0, FRAME_QUEUE.unfinished_tasks - 1)
+                if FRAME_QUEUE.unfinished_tasks == 0:
+                    FRAME_QUEUE.all_tasks_done.notify_all()
+                FRAME_QUEUE.not_full.notify()
+                return True
+    return False
 
 
 def get_fps_ffprobe(path):
@@ -565,12 +615,17 @@ def process_camera(camera, runner, person_classes, tool_classes, tmr_classes, tr
 
 def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_classes, tractor_classes, max_dist):
     camera_id = camera["camera_id"]
+    camera_name = camera.get("code", camera_id)
+    with STATS_LOCK:
+        _ = CAMERA_STATS[camera_id]  # ensure camera stats entry exists
 
     # Per-camera motion memory for FEEDING detection
     CLASS_MOTION_MEMORY = {
         "tractor": None,
         "tmr_machine": None,
     }
+    last_seen_scrap_ts = None
+    last_seen_feed_ts = None
 
     smoothers = {
         "SCRAPPING": TemporalSmoother(),
@@ -597,19 +652,49 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     # --------------------------------------------------
     # Open video stream (FILE / RTSP / NVR_CHANNEL)
     # --------------------------------------------------
-    stream = open_stream(camera)
+    logger.info("[CAMERA INIT] Starting %s", camera_name)
+    stream = None
+    for attempt in range(1, 6):
+        try:
+            stream = open_stream(camera)
+            if stream and stream.cap and stream.cap.isOpened():
+                break
+        except Exception as e:
+            logger.warning(
+                "[CAMERA %s] Open stream attempt %d/5 failed: %s",
+                camera_name,
+                attempt,
+                str(e)[:200],
+            )
+
+        if attempt < 5:
+            time.sleep(2)
+
+    if not stream or not stream.cap or not stream.cap.isOpened():
+        logger.error("[CAMERA %s] FAILED after retries", camera_name)
+        # Raise so supervisor can restart this camera thread.
+        raise RuntimeError(f"[CAMERA {camera_name}] FAILED to open stream")
 
     # warmup decoder
     for _ in range(5):
         stream.read()
 
+    # START DELAY (lets stream settle + reduces synchronized GPU burst)
+    time.sleep(3)
+
     cap = stream.cap  # required for FPS / metadata only
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # FIX 4: Limit decode buffer for stability
+
+    ret, frame = stream.read()
+    if not ret:
+        logger.error(f"[CAMERA {camera_name}] STREAM OPEN FAILED")
+        stream.release()
+        return
 
     # Log video source information
     stream_type = camera.get("stream_type", "AUTO").upper()
     video_source = camera.get("video_file_path") or camera.get("rtsp_url") or "Unknown"
-    logger.info("[CAMERA %s] started", camera.get('code', camera_id))
+    logger.info("[CAMERA %s] started", camera_name)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("  Stream Type: %s", stream_type)
         logger.debug("  Source: %s", video_source)
@@ -673,6 +758,11 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         logger.debug("[CAMERA %s] Processing FPS: %.2f, Frame skip: %s", camera_id, processing_fps, "time-based (live)" if is_live else str(frame_skip_ratio))
 
     frame_count = 0
+    PROCESS_EVERY_N_FRAMES = (
+        max(1, int(video_fps / PROCESSING_FPS))
+        if PROCESSING_FPS > 0 and video_fps > 0
+        else 1
+    )
     processed_frame_count = 0
     start_time = time.time()
     total_processing_time = 0.0
@@ -683,11 +773,21 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
 
     scrap_roi_cfg = camera.get("activity_zones", {}).get("SCRAPPING", {}).get("roi")
     feed_roi_cfg = camera.get("activity_zones", {}).get("FEEDING", {}).get("roi")
+    inference_w, inference_h = INFERENCE_FRAME_SIZE
     scrap_polygon = None
     feed_polygon = None
     scrap_mask = None
     feed_mask = None
-    last_frame_size = None
+
+    if ROI_ENABLED and scrap_roi_cfg:
+        scrap_polygon = build_pixel_roi(scrap_roi_cfg, inference_w, inference_h)
+        scrap_mask = np.zeros((inference_h, inference_w), dtype=np.uint8)
+        cv2.fillPoly(scrap_mask, [np.array(scrap_polygon, dtype=np.int32)], 1)
+
+    if ROI_ENABLED and feed_roi_cfg:
+        feed_polygon = build_pixel_roi(feed_roi_cfg, inference_w, inference_h)
+        feed_mask = np.zeros((inference_h, inference_w), dtype=np.uint8)
+        cv2.fillPoly(feed_mask, [np.array(feed_polygon, dtype=np.int32)], 1)
 
     def video_timestamp(frame_idx):
         """Calculate actual video timestamp based on source frame index."""
@@ -703,13 +803,18 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     reconnect_attempt = 0
     MAX_BACKOFF_SEC = 60
     thermal_check_counter = 0
+    first_frame = frame
 
     while True:
-        try:
-            ret, frame = stream.read()
-        except Exception as e:
-            logger.warning("[CAMERA %s] Stream read exception: %s", camera_id, str(e)[:200])
-            ret, frame = False, None
+        if first_frame is not None:
+            ret, frame = True, first_frame
+            first_frame = None
+        else:
+            try:
+                ret, frame = stream.read()
+            except Exception as e:
+                logger.warning("[CAMERA %s] Stream read exception: %s", camera_id, str(e)[:200])
+                ret, frame = False, None
 
         if not ret:
             if is_live:
@@ -737,26 +842,37 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                 logger.warning("[CAMERA %s] Reconnect failed: %s", camera_id, str(e)[:200])
                 continue
 
+        frame_seen_at = time.time()
+        update_watchdog_heartbeat(
+            build_watchdog_payload(
+                state="running",
+                camera_id=camera_id,
+                last_frame=frame_seen_at,
+            )
+        )
+
         frame_count += 1
 
-        # FIX 2: Downscale before inference (1280x720) to reduce GPU waste
-        frame = cv2.resize(frame, (1280, 720))
+        if frame_count % PROCESS_EVERY_N_FRAMES != 0:
+            continue
 
-        # Frame throttling: LIVE → time-based only; FILE → frame-based only (or none in BATCH mode).
-        if is_live:
-            now_wall = time.time()
-            if now_wall - last_processed_time < frame_interval:
-                continue
-            last_processed_time = now_wall
-        elif EDGE_MODE != "BATCH":
-            # ONLY frame-based for recorded sources (skip if not the nth frame)
-            if frame_count % frame_skip_ratio != 0:
-                continue
+        # Hard FPS cap to stabilize GPU load (in addition to deterministic frame gating).
+        now_time = time.time()
+        if now_time - last_processed_time < frame_interval:
+            continue
+        last_processed_time = now_time
+
+        frame = cv2.resize(frame, INFERENCE_FRAME_SIZE)
+
+        # Deterministic GPU control is handled by:
+        # 1) frame_count % PROCESS_EVERY_N_FRAMES
+        # 2) hard FPS cap (frame_interval) above
 
         processed_frame_count += 1
         with STATS_LOCK:
             STATS["frames_processed"] += 1
             CAMERA_STATS[camera_id]["frames"] += 1
+            CAMERA_STATS[camera_id]["last_seen"] = frame_seen_at
         
         # Start full frame timing (include inference)
         t0 = time.time()
@@ -795,22 +911,19 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             result["detections"] = dets
             done_event.set()
 
+        if FRAME_QUEUE.full():
+            logger.debug("[CAMERA %s] GPU queue full — early drop before enqueue", camera_id)
+            continue
+
         try:
-
-            if FRAME_QUEUE.full():
-                try:
-                    FRAME_QUEUE.get_nowait()
-                except queue.Empty:
-                    pass
-
             FRAME_QUEUE.put((camera_id, frame, set_detections), block=False)
-        except Exception:
+        except queue.Full:
             # Drop frame if GPU overloaded (acceptable in real-time)
             logger.debug("[CAMERA %s] GPU queue full — dropping frame", camera_id)
             detections = []
         else:
             # Wait for inference result with proper blocking (no busy-wait)
-            if not done_event.wait(timeout=1.0):
+            if not done_event.wait(timeout=0.6):
                 now_ts = time.time()
                 if now_ts - last_timeout_log > 10:
                     logger.warning("[CAMERA %s] Inference timeout, skipping frame", camera_id)
@@ -821,31 +934,15 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
 
         # Apply ROI filtering if enabled and ROI polygons are configured
         frame_h, frame_w = frame.shape[:2]
-        frame_size = (frame_h, frame_w)
-
-        if last_frame_size != frame_size:
-            last_frame_size = frame_size
-            scrap_polygon = None
-            feed_polygon = None
-            scrap_mask = None
-            feed_mask = None
 
         # SCRAPPING ROI filtering (precompute polygon/mask on size change)
         if ROI_ENABLED and scrap_roi_cfg:
-            if scrap_polygon is None:
-                scrap_polygon = build_pixel_roi(scrap_roi_cfg, frame_w, frame_h)
-                scrap_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-                cv2.fillPoly(scrap_mask, [np.array(scrap_polygon, dtype=np.int32)], 1)
             detections_scrap = filter_by_roi(detections, scrap_polygon, frame.shape, roi_mask=scrap_mask)
         else:
             detections_scrap = detections
 
         # FEEDING ROI filtering (precompute polygon/mask on size change)
         if ROI_ENABLED and feed_roi_cfg:
-            if feed_polygon is None:
-                feed_polygon = build_pixel_roi(feed_roi_cfg, frame_w, frame_h)
-                feed_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-                cv2.fillPoly(feed_mask, [np.array(feed_polygon, dtype=np.int32)], 1)
             detections_feed = filter_by_roi(detections, feed_polygon, frame.shape, roi_mask=feed_mask)
         else:
             detections_feed = detections
@@ -866,7 +963,15 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         # ------------------------------------------------------------------
         # SCRAPPING - State Machine (using ROI-filtered detections)
         # ------------------------------------------------------------------
-        scrapping = detect_scrapping(detections_scrap, person_classes, tool_classes, max_dist)
+        scrapping_detected = detect_scrapping(
+            detections_scrap, person_classes, tool_classes, max_dist
+        )
+        if scrapping_detected:
+            last_seen_scrap_ts = ts
+        scrapping = (
+            last_seen_scrap_ts is not None
+            and (ts - last_seen_scrap_ts) < SCRAP_ACTIVE_BUFFER_SEC
+        )
         sig = smoothers["SCRAPPING"].update(scrapping, ts)
         state = activity_state["SCRAPPING"]
 
@@ -938,7 +1043,7 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         # FEEDING - State Machine (using ROI-filtered detections)
         # ------------------------------------------------------------------
         # Motion-based detection: Requires sustained movement of tractor/TMR
-        feeding = False
+        feeding_detected = False
 
         for cls in ["tractor", "tmr_machine"]:
             boxes = [
@@ -989,9 +1094,16 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                 if mem["moving_since"] is None:
                     mem["moving_since"] = ts
                 elif ts - mem["moving_since"] >= 3:
-                    feeding = True
+                    feeding_detected = True
             else:
                 mem["moving_since"] = None
+
+        if feeding_detected:
+            last_seen_feed_ts = ts
+        feeding = (
+            last_seen_feed_ts is not None
+            and (ts - last_seen_feed_ts) < FEED_ACTIVE_BUFFER_SEC
+        )
 
         sig = smoothers["FEEDING"].update(feeding, ts)
         state = activity_state["FEEDING"]
@@ -1102,6 +1214,16 @@ def performance_monitor():
         with STATS_LOCK:
             total_frames = STATS["frames_processed"]
             events = STATS["events_sent"]
+            camera_snapshot = []
+            for cam_id, stats in CAMERA_STATS.items():
+                frames = stats.get("frames", 0)
+                last_frames_cam = stats.get("last_frames", 0)
+                cam_fps = (frames - last_frames_cam) / elapsed if elapsed > 0 else 0.0
+                stats["fps"] = cam_fps
+                stats["last_frames"] = frames
+                camera_snapshot.append(
+                    (cam_id, cam_fps, stats.get("last_seen"))
+                )
 
         delta_frames = total_frames - last_frames
         fps = delta_frames / elapsed if elapsed > 0 else 0
@@ -1123,6 +1245,18 @@ def performance_monitor():
                 "[MONITOR] Frame queue pressure high: %d/%d",
                 frame_qsize,
                 FRAME_QUEUE_MAXSIZE,
+            )
+
+        for cam_id, cam_fps, last_seen in camera_snapshot:
+            if last_seen is None:
+                last_seen_ago = -1.0
+            else:
+                last_seen_ago = max(0.0, now - last_seen)
+            logger.info(
+                "[CAM_HEALTH] %s | FPS=%.2f | last_seen=%.1fs",
+                cam_id,
+                cam_fps,
+                last_seen_ago,
             )
 
         last_frames = total_frames

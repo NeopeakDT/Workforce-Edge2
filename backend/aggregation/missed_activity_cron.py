@@ -99,9 +99,8 @@ def detect_missed_activities():
     - Schedule window + late tolerance has passed
     - No activity_instance exists for that (farm, schedule, activity_date)
     """
-    # MISSED activity creation logic is currently disabled.
-    # To re-enable, remove/comment markers and restore the original
-    # implementation below. Keeping the code here for future reference.
+    # MISSED creation is enabled.
+    # Function is idempotent via INSERT ... ON CONFLICT DO NOTHING.
     
     now_utc = utc_now()
     
@@ -197,4 +196,4 @@ def detect_missed_activities():
 # -------------------------------------------------
 if __name__ == "__main__":
     # finalize_completed_activities()
-    detect_missed_activities()  # disabled: MISSED creation commented out
+    detect_missed_activities()

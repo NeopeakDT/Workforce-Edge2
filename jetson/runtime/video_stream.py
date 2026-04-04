@@ -2,19 +2,29 @@
 import cv2
 import time
 import os
+import threading
 
 # Suppress GStreamer warnings in production
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
+# Hardware-aware decode control: limit concurrent GPU-decoded streams.
+# NOTE: This is process-wide for the Jetson edge_detector process.
+MAX_GPU_STREAMS = 1
+gpu_stream_count = 0
+gpu_stream_count_lock = threading.Lock()
+
 class VideoStream:
-	def __init__(self, cap):
+	def __init__(self, cap, on_release=None):
 		self.cap = cap
+		self._on_release = on_release
 
 	def read(self):
 		return self.cap.read()
 
 	def release(self):
 		self.cap.release()
+		if self._on_release:
+			self._on_release()
 
 
 def _validate_gstreamer():
@@ -177,98 +187,128 @@ def open_stream(camera_cfg):
 	determined_stream_type = None
 
 	# --------------------------------------------------
-	# FILE (offline / testing)
+	# Decode selection with GPU stream limiting
 	# --------------------------------------------------
-	if stream_type == "FILE":
-		path = camera_cfg.get("video_file_path")
-		if not path:
-			raise RuntimeError("FILE stream missing video_file_path in local_cache.json")
-		
-		decode_mode = camera_cfg.get("decode_mode", "AUTO").upper()
-		
-		if decode_mode == "CPU":
-			print(f"[STREAM] FILE → CPU decode (FFMPEG): {path}")
-			cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+	decode_mode = camera_cfg.get("decode_mode", "AUTO").upper()
+
+	# Decide if this stream should use GPU decode.
+	# This caps the number of concurrent NVDEC/GStreamer GPU decodes.
+	use_gpu = False
+	global gpu_stream_count
+	with gpu_stream_count_lock:
+		if decode_mode == "GPU":
+			if gpu_stream_count < MAX_GPU_STREAMS:
+				gpu_stream_count += 1
+				use_gpu = True
+			else:
+				print("[STREAM] GPU limit reached → CPU fallback")
+		elif decode_mode == "CPU":
+			use_gpu = False
+		else:  # AUTO
+			use_gpu = False
+
+	on_release = None
+	if use_gpu:
+		def _on_release():
+			global gpu_stream_count
+			with gpu_stream_count_lock:
+				gpu_stream_count = max(0, gpu_stream_count - 1)
+		on_release = _on_release
+
+	def rollback_gpu_slot():
+		nonlocal on_release
+		if on_release:
+			on_release()
+			on_release = None
+
+	try:
+		# --------------------------------------------------
+		# FILE (offline / testing)
+		# --------------------------------------------------
+		if stream_type == "FILE":
+			path = camera_cfg.get("video_file_path")
+			if not path:
+				raise RuntimeError("FILE stream missing video_file_path in local_cache.json")
+
+			if use_gpu:
+				print(f"[STREAM] FILE → GPU decode (NVDEC): {path}")
+				cap = open_file_nvdec(path)
+			else:
+				print(f"[STREAM] FILE → CPU decode (FFMPEG): {path}")
+				cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+				ret, _ = cap.read()
+				if not ret:
+					cap.release()
+					raise RuntimeError(f"FILE stream read failed: {path}")
+				try:
+					cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+				except Exception:
+					pass
+			
+			determined_stream_type = "FILE"
+
+		# --------------------------------------------------
+		# SMART RTSP RESOLUTION (explicit or constructed)ex
+		# --------------------------------------------------
 		else:
-			print(f"[STREAM] FILE → GPU decode (NVDEC): {path}")
-			cap = open_file_nvdec(path)
-		
-		determined_stream_type = "FILE"
+			# Priority 1: Direct RTSP URL
+			if camera_cfg.get("rtsp_url"):
+				rtsp_url = camera_cfg["rtsp_url"]
+				determined_stream_type = "RTSP"
+			
+			# Priority 2: Construct from NVR channel
+			elif camera_cfg.get("nvr_channel") and camera_cfg.get("nvr_rtsp_base"):
+				nvr_base_rtsp = camera_cfg["nvr_rtsp_base"]   # e.g. rtsp://user:pass@192.168.1.10:554
+				channel = camera_cfg["nvr_channel"]           # e.g. 101 / ch01 / 1
 
-	# --------------------------------------------------
-	# SMART RTSP RESOLUTION (explicit or constructed)ex
-	# --------------------------------------------------
-	else:
-		# Priority 1: Direct RTSP URL
-		if camera_cfg.get("rtsp_url"):
-			rtsp_url = camera_cfg["rtsp_url"]
-			determined_stream_type = "RTSP"
-		
-		# Priority 2: Construct from NVR channel
-		elif camera_cfg.get("nvr_channel") and camera_cfg.get("nvr_rtsp_base"):
-			nvr_base_rtsp = camera_cfg["nvr_rtsp_base"]   # e.g. rtsp://user:pass@192.168.1.10:554
-			channel = camera_cfg["nvr_channel"]           # e.g. 101 / ch01 / 1
+				# Backend MUST provide final format rules
+				# Example for Hikvision-style NVR:
+				# rtsp://ip:554/Streaming/Channels/101
+				rtsp_url = f"{nvr_base_rtsp}/Streaming/Channels/{channel}"
+				determined_stream_type = "NVR"
+			
+			# No valid stream source found
+			else:
+				raise ValueError(
+					f"Camera {camera_cfg.get('camera_id', 'UNKNOWN')}: "
+					"Missing rtsp_url AND (nvr_rtsp_base + nvr_channel). "
+					"Must provide at least one stream source."
+				)
 
-			# Backend MUST provide final format rules
-			# Example for Hikvision-style NVR:
-			# rtsp://ip:554/Streaming/Channels/101
-			rtsp_url = f"{nvr_base_rtsp}/Streaming/Channels/{channel}"
-			determined_stream_type = "NVR"
-		
-		# No valid stream source found
-		else:
-			raise ValueError(
-				f"Camera {camera_cfg.get('camera_id', 'UNKNOWN')}: "
-				"Missing rtsp_url AND (nvr_rtsp_base + nvr_channel). "
-				"Must provide at least one stream source."
-			)
-
-		# Open RTSP stream with explicit decode mode control (FIX: Prevent NVDEC overload)
-		decode_mode = camera_cfg.get("decode_mode", "AUTO").upper()
-
-		if decode_mode == "CPU":
-			# FORCED CPU DECODE (FFMPEG - true CPU, not GStreamer)
-			print(f"[STREAM] Using CPU decode (FFMPEG forced): {rtsp_url}")
-			cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-			# Reduce buffering (critical for live streams)
-			try:
-				cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-			except:
-				pass
-
-		elif decode_mode == "GPU":
-			# FORCED GPU DECODE
-			print(f"[STREAM] Using GPU decode (forced): {rtsp_url}")
-			try:
-				cap = open_rtsp_auto(rtsp_url)
-			except Exception as e:
-				raise RuntimeError(f"GPU decode failed (forced): {rtsp_url} | {e}")
-
-		else:  # AUTO mode (default fallback)
-			# TRY GPU FIRST, FALLBACK TO CPU (FFMPEG)
-			try:
-				cap = open_rtsp_auto(rtsp_url)
-				print(f"[STREAM] Using GPU hardware decoder (AUTO): {rtsp_url}")
-			except Exception as e:
-				print(f"[STREAM] GPU decode failed (AUTO) → CPU fallback (FFMPEG): {e}")
+			# Open RTSP stream based on the GPU decode decision above.
+			if use_gpu:
+				# GPU decode: use GStreamer + nvv4l2decoder
+				try:
+					cap = open_rtsp_auto(rtsp_url)
+					if decode_mode in ("GPU", "AUTO"):
+						print(f"[STREAM] Using GPU hardware decoder: {rtsp_url}")
+				except Exception as e:
+					# If GPU decode fails, fall back to CPU decode for correctness.
+					rollback_gpu_slot()
+					print(f"[STREAM] GPU decode failed ({decode_mode}) → CPU fallback (FFMPEG): {e}")
+					cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+					# Reduce buffering (critical for live streams)
+					try:
+						cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+					except:
+						pass
+			else:
+				# CPU decode: FFMPEG via OpenCV
+				print(f"[STREAM] Using CPU decode (FFMPEG): {rtsp_url}")
 				cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+				# Reduce buffering (critical for live streams)
 				try:
 					cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 				except:
 					pass
 
-		# Verify stream opened successfully
 		if not cap.isOpened():
 			raise RuntimeError(
-				f"Failed to open stream: {rtsp_url} | decode_mode={decode_mode}"
+				f"Failed to open stream | type={determined_stream_type} | "
+				f"camera_id={camera_cfg.get('camera_id', 'UNKNOWN')}"
 			)
+	except Exception:
+		rollback_gpu_slot()
+		raise
 
-	if not cap.isOpened():
-		raise RuntimeError(
-			f"Failed to open stream | type={determined_stream_type} | "
-			f"camera_id={camera_cfg.get('camera_id', 'UNKNOWN')}"
-		)
-
-	return VideoStream(cap)
-
-
+	return VideoStream(cap, on_release=on_release)

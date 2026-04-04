@@ -1,0 +1,43 @@
+# ------------------------------------------------------------------------------
+# Workforce Edge Watchdog Service
+#
+# Purpose:
+# Runs the local watchdog as a background system service so the edge detector is
+# restarted automatically if its local heartbeat file stops updating.
+#
+# What it does:
+# - Runs jetson/edge_watchdog.py using the project virtual environment
+# - Monitors /tmp/workforce_edge_alive for fresh updates
+# - Restarts the edge detector service if the heartbeat becomes stale
+# - Auto-restarts on failure
+# - Logs output via journalctl
+#
+#To enable (do it for first time)-
+# sudo cp /home/neopeak/Desktop/WF-project/WF/Workforce-Detection/systemd/workforce-watchdog.service /etc/systemd/system/workforce-watchdog.service
+# sudo systemctl daemon-reload
+# sudo systemctl enable workforce-watchdog
+#
+# How to use:
+# Start:    sudo systemctl start workforce-watchdog
+# Stop:     sudo systemctl stop workforce-watchdog
+# Restart:  sudo systemctl restart workforce-watchdog
+# Status:   sudo systemctl status workforce-watchdog
+# Logs:     journalctl -u workforce-watchdog -f
+# ------------------------------------------------------------------------------
+[Unit]
+Description=Workforce Edge Watchdog
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
+ExecStart=/home/neopeak/torch_env/bin/python jetson/edge_watchdog.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+Environment=EDGE_DETECTOR_SERVICE_NAME=workforce-edge.service
+
+[Install]
+WantedBy=multi-user.target

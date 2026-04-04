@@ -456,91 +456,42 @@ This is expected given your TODO comment, but be aware during testing.
 =====================================================================================================
 
 24/2/26 -
-Looking at your logs and code, here's the step-by-step execution flow for multi-camera processing:
 
-STARTUP PHASE (happens once at 11:20am)
-    1. Load Configuration → Read local_cache.json with all camera configs
-    2. Load ML Model → Create ONE shared ModelRunner (TensorRT model)
-    3. Start Background Workers:
-        ◦ 1 GPU inference worker (processes all cameras' frames)
-        ◦ 3 event sender threads (send events to backend)
-        ◦ 1 performance monitor (logs FPS every 5 seconds)
+Updated execution flow (current system):
+    1. Startup (once)
+        ◦ Load local_cache.json
+        ◦ Create one shared ModelRunner
+        ◦ Start 1 GPU inference worker (micro-batch up to 2 frames)
+        ◦ Start EDGE_SENDER_THREADS (default 3) event senders
+        ◦ Start 1 performance monitor (logs every 15s)
+    2. Camera threads
+        ◦ One thread per camera, started with 1.5s stagger
+        ◦ Each thread opens stream and applies live/file-specific throttling
+    3. Frame pipeline
+        ◦ Camera pushes frame to shared FRAME_QUEUE
+        ◦ GPU worker pops and infers (single worker, batched)
+        ◦ Camera waits up to 0.6s for callback result
+    4. ROI + activity detection
+        ◦ ROI filtering per activity zone
+        ◦ SCRAPPING raw detect: person-tool proximity
+        ◦ FEEDING raw detect: motion (velocity > 3 or area_velocity > 1000 sustained)
+    5. Persistence + smoothing (important)
+        ◦ SCRAPPING persistence hold: 10s
+        ◦ FEEDING persistence hold: 15s
+        ◦ Then time-based smoother (START after 3s true, END after 5s false)
+    6. Event state machine (per camera/activity)
+        ◦ INACTIVE -> ACTIVE => START_CANDIDATE (new session_id)
+        ◦ ACTIVE => FRAME_AGGREGATE every 10s
+        ◦ ACTIVE -> INACTIVE => END_CANDIDATE
+        ◦ Events are queued non-blocking; drop if queue full
+    7. Event delivery
+        ◦ Sender threads POST to /api/v1/ingest/event
+        ◦ Failures stored in event_retry.db, retried later
+    8. Backend side
+        ◦ Ingest API is append-only into activity_detection_event
+        ◦ Aggregator service continuously builds/updates activity_instance
+        ◦ Phase-5 timer runs resolver + missed detection every minute
 
-CAMERA THREAD EXECUTION (all run in parallel)
-Each camera gets its own thread (see line 899-914):
-for camera in cfg.get("cameras", []):
-    t = Thread(target=camera_supervisor, args=(...))
-    t.start()  # ALL cameras start at once
-Step 1: Open Video Stream
-    • Opens video file OR RTSP stream
-    • Reads frame resolution, FPS
-Step 2: Frame Capture + Throttling
-    • Read frame from video
-    • Skip frames based on PROCESSING_FPS (5 FPS by default)
-    • Live streams: time-based throttling
-    • Recorded files: frame-based throttling
-Step 3: GPU Inference (SHARED BOTTLENECK)
-    • Push frame to FRAME_QUEUE (line 609)
-    • GPU worker processes ONE frame at a time (line 261-285)
-    • Camera thread waits for result (5 sec timeout)
-    • All cameras compete for GPU time here
-Step 4: ROI Filtering
-    • Apply region-of-interest masks for SCRAPPING/FEEDING zones
-    • Filter detections that fall outside ROI polygons
-Step 5: Activity Detection
-    • SCRAPPING: Check if person + tool proximity (line 487)
-    • FEEDING: Check if TMR/tractor has motion (line 651-668)
-    • Update temporal smoother (5-frame consensus)
-Step 6: State Machine (per activity, per camera)
-    • INACTIVE → ACTIVE: Emit START_CANDIDATE + new session_id
-    • ACTIVE: Emit FRAME_AGGREGATE every 10 seconds
-    • ACTIVE → INACTIVE: Emit END_CANDIDATE
-Step 7: Event Queuing (non-blocking)
-    • Push event to EVENT_QUEUE (line 694, 712, 736, etc.)
-    • Never waits - if queue full, drops event
-
-EVENT SENDING (parallel background threads)
-Step 8: HTTP POST to Backend
-    • 3 sender threads pull from EVENT_QUEUE (line 297-333)
-    • POST to http://<backend>/api/v1/ingest/event
-    • If fails → save to SQLite, retry later
-
-BACKEND PROCESSING (backend/api/event_ingest_api.py)
-Step 9: Event Ingestion
-    • Validate event structure
-    • Insert into activity_detection_event table
-    • Run backend state machine (START → FRAME_AGG → END)
-    • Create/close activities in activity table
-
-WHY MULTIPLE CAMERAS APPEAR IN LOGS
-Your logs show 4 cameras running simultaneously:
-    • 75bc9fb9... (Camera 1)
-    • f5e093ef... (Camera 2)
-    • c6ba130f... (Camera 3)
-    • 7792f15f... (Camera 4)
-    • 8d44df12... (Camera 5 - reconnecting)
-They all process frames at the same time (parallel threads), but:
-    • GPU processes ONE frame at a time → FrameQ: 2 means 2 cameras waiting
-    • Event sending is parallel → EventQ: 0 means no backlog
-
-PERFORMANCE BOTTLENECK
-From your logs:
-	Total FPS: 14.35 | FrameQ: 2
-Why 14 FPS total across 5 cameras?
-    • GPU processes 1 frame at ~70ms
-    • 5 cameras × 5 FPS target = 25 FPS needed
-    • GPU can only do ~14 FPS → cameras wait in queue
-Solution: Lower PROCESSING_FPS to 3 or use smaller model resolution (see line 878).
-
-SEQUENCE DIAGRAM
-CAMERA 1 ──┐
-CAMERA 2 ──┤
-CAMERA 3 ──┼──> FRAME_QUEUE ──> GPU Worker (1 thread) ──> Results back to cameras
-CAMERA 4 ──┤
-CAMERA 5 ──┘
-
-CAMERA 1/2/3/4/5 ──> EVENT_QUEUE ──> Sender Threads (3) ──> Backend API ──> Database
-Key Point: Cameras are parallel, but GPU is sequential (one frame at a time).
 ===================================================================================================
 STATUS VALUES & LOGIC
 1. IN_PROGRESS
@@ -908,3 +859,74 @@ FPS: 10–15
         └─────────────────────────────┘
 
 ===========================================================================================
+30/3/26 - Systemd Service ARCHITECTURE
+FINAL ARCHITECTURE (what we will build)
+systemd
+ ├── edge-precheck.service        (validates env + backend)
+ ├── edge-detector.service        (main pipeline)
+ ├── edge-watchdog.service        (GPU + health monitor)
+ ├── phase5.service               (aggregator + resolver loop)
+ └── nv-recovery.service          (GPU reset handler)
+=======================================================================================
+#31-3-26 
+
+Systemd Services - RUN EVERYTHING
+- first time setup (only once) :-
+
+    bash edge_precheck.sh
+sudo systemctl enable workforce-backend
+sudo systemctl enable workforce-edge
+sudo systemctl enable workforce-aggregator
+sudo systemctl enable workforce-phase5.timer
+sudo systemctl enable workforce-heartbeat
+sudo systemctl enable workforce-watchdog
+
+- Every time you want to RUN system :-
+
+    bash edge_precheck.sh
+sudo systemctl start workforce-backend
+sudo systemctl start workforce-edge
+sudo systemctl start workforce-aggregator
+sudo systemctl start workforce-phase5.timer
+sudo systemctl start workforce-heartbeat
+sudo systemctl start workforce-watchdog
+
+sudo systemctl restart workforce-backend
+sudo systemctl restart workforce-edge
+sudo systemctl restart workforce-aggregator
+sudo systemctl restart workforce-phase5.timer
+sudo systemctl restart workforce-heartbeat
+sudo systemctl restart workforce-watchdog
+
+- To stop the system -
+
+sudo systemctl stop workforce-backend
+sudo systemctl stop workforce-edge
+sudo systemctl stop workforce-aggregator
+sudo systemctl stop workforce-phase5.timer
+sudo systemctl stop workforce-heartbeat
+sudo systemctl stop workforce-watchdog
+
+
+===========================================================================================
+# FINAL SYSTEM :-
+EDGE (Jetson)
+ ├── edge_detector → events
+ ├── heartbeat_agent → device health
+ ├── watchdog → recovery
+
+BACKEND
+ ├── ingest API → store events
+ ├── aggregator → build instances
+ ├── phase5 → finalize + missed
+ ├── device monitor → offline detection
+ ===================================================================================
+ Run backend - 
+ (torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$ (this path)
+ uvicorn main:app --host 0.0.0.0 --port 8000
+ ==================================================================================================
+TRUNCATE activity_detection_event RESTART IDENTITY CASCADE;
+TRUNCATE activity_instance RESTART IDENTITY CASCADE;
+TRUNCATE edge_device_heartbeat RESTART IDENTITY CASCADE;
+===================================================================================================
+

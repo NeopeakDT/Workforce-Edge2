@@ -35,18 +35,43 @@ from common.time_utils import utc_now
 MAX_ACTIVITY_DURATION_SEC = 3 * 60 * 60  # 3 hours safety cap
 
 
+def ideal_window_utc_bounds(farm_tz, activity_date, ideal_start_time, ideal_end_time):
+    """
+    Build the strict ideal window for activity_date in farm local time, return UTC bounds.
+
+    Used by the resolver and aggregator so within_ideal_window matches:
+    ideal_start_utc <= actual_start_at <= ideal_end_utc
+    """
+    ideal_start_naive = datetime.combine(activity_date, ideal_start_time)
+    ideal_end_naive = datetime.combine(activity_date, ideal_end_time)
+
+    ideal_start_local = farm_tz.localize(ideal_start_naive)
+    ideal_end_local = farm_tz.localize(ideal_end_naive)
+
+    if ideal_end_local <= ideal_start_local:
+        ideal_end_local += timedelta(days=1)
+
+    ideal_start_utc = ideal_start_local.astimezone(timezone.utc)
+    ideal_end_utc = ideal_end_local.astimezone(timezone.utc)
+    return ideal_start_utc, ideal_end_utc
+
+
+def is_actual_start_within_ideal_window(actual_start_utc, ideal_start_utc, ideal_end_utc):
+    """Strict ideal window (no tolerance): inclusive on both ends, compared in UTC."""
+    actual_utc = actual_start_utc.astimezone(timezone.utc)
+    return ideal_start_utc <= actual_utc <= ideal_end_utc
+
+
 def resolve():
     now_utc = utc_now()
+    stable_end_cutoff_utc = now_utc - timedelta(seconds=30)
 
     with get_cursor() as cur:
         # --------------------------------------------------
         # Pick ended, unresolved AI instances
         # --------------------------------------------------
-        # 🔥 CRITICAL FIX: 
-        # 1. Removed "activity_schedule_id IS NULL" condition
-        #    (Aggregator now sets activity_schedule_id at instance creation)
-        # 2. Added reprocessing guard "started_offset_min IS NULL"
-        #    (Prevent recomputing already resolved instances)
+        # We resolve only "stable ended" rows to avoid finalizing too early
+        # while late FRAME/END events are still arriving.
         # --------------------------------------------------
         cur.execute(
             """
@@ -64,8 +89,11 @@ def resolve():
             WHERE ai.actual_end_at IS NOT NULL
               AND ai.status = 'IN_PROGRESS'
               AND ai.source = 'AI'
-              AND ai.started_offset_min IS NULL
-            """
+              AND ai.last_seen_at IS NOT NULL
+              AND ai.last_seen_at < %s
+              AND ai.updated_at < %s
+            """,
+            (stable_end_cutoff_utc, stable_end_cutoff_utc),
         )
 
         instances = cur.fetchall()
@@ -146,24 +174,16 @@ def resolve():
             s = schedule_row
 
             # ------- Compute offsets --------
-            # Build ideal window in FARM LOCAL TIME
-            ideal_start_naive = datetime.combine(
-                activity_date, s["ideal_start_time"]
+            ideal_start_utc, ideal_end_utc = ideal_window_utc_bounds(
+                farm_tz,
+                activity_date,
+                s["ideal_start_time"],
+                s["ideal_end_time"],
             )
-            ideal_end_naive = datetime.combine(
-                activity_date, s["ideal_end_time"]
+
+            within_ideal_window = is_actual_start_within_ideal_window(
+                actual_start_utc, ideal_start_utc, ideal_end_utc
             )
-
-            ideal_start_local = farm_tz.localize(ideal_start_naive)
-            ideal_end_local = farm_tz.localize(ideal_end_naive)
-
-            # Cross-midnight handling
-            if ideal_end_local <= ideal_start_local:
-                ideal_end_local += timedelta(days=1)
-
-            # Convert ideal window to UTC
-            ideal_start_utc = ideal_start_local.astimezone(timezone.utc)
-            ideal_end_utc = ideal_end_local.astimezone(timezone.utc)
 
             # Compute offsets in UTC (authoritative)
             started_offset = int(
@@ -192,6 +212,7 @@ def resolve():
                 SET started_offset_min = %s,
                     ended_offset_min = %s,
                     status = %s,
+                    within_ideal_window = %s,
                     updated_at = %s
                 WHERE id = %s
                 """,
@@ -199,6 +220,7 @@ def resolve():
                     started_offset,
                     ended_offset,
                     final_status,
+                    within_ideal_window,
                     now_utc,
                     ai["id"],
                 ),

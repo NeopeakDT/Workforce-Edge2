@@ -1,0 +1,69 @@
+# ------------------------------------------------------------------------------
+# Workforce Edge Detector Service (Jetson)
+#
+# Purpose:
+# Runs the edge AI pipeline (multi-camera detection + event sending) as a
+# background system service. Automatically restarts on crash and ensures
+# system is production-ready (no manual terminal needed).
+#
+# What it does:
+# - Runs jetson/edge_detector.py using virtual environment
+# - Performs precheck before start (backend, GPU, model)
+# - Auto-restarts on failure
+# - Logs output via journalctl
+#
+# How to use:
+# Start:    sudo systemctl start workforce-edge
+# Stop:     sudo systemctl stop workforce-edge
+# Restart:  sudo systemctl restart workforce-edge
+# Status:   sudo systemctl status workforce-edge
+# Logs:     journalctl -u workforce-edge -f
+#
+# Notes:
+# - For testing (video files): service will stop after video ends
+# - For production (RTSP): runs continuously
+# ----------------------------------------------------------------------------------------------------------
+[Unit]
+Description=Workforce Edge Detector (Jetson)
+After=network-online.target
+Wants=network-online.target
+
+# Prevent rapid crash loops
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Project root
+WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
+
+# Precheck (CRITICAL)
+ExecStartPre=/home/neopeak/edge_precheck.sh
+
+# Main process (NO activate)
+ExecStart=/home/neopeak/torch_env/bin/python jetson/edge_detector.py
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Kill all threads properly
+KillMode=control-group
+TimeoutStopSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Environment safety
+Environment=PYTHONUNBUFFERED=1
+
+# User
+User=neopeak
+
+# Resource limits (important for TensorRT stability)
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -3,17 +3,10 @@
 PHASE-5 ORCHESTRATOR (AUTHORITATIVE)
 
 Order (MANDATORY):
-1. STEP-4 — Aggregate & close instances
-2. STEP-5A — Resolve schedules & finalize status
-3. STEP-5B — Detect MISSED activities
+1. STEP-5A — Resolve schedules & finalize status
+2. STEP-5B — Detect MISSED activities
 ------------------------------------------------------------------------------------------------------------
 run_phase5.py
-    ↓
-STEP-4 activity_aggregator
-    - build instance
-    - merge
-    - close
-    - compute duration
     ↓
 STEP-5A activity_schedule_resolver
     - bind schedule
@@ -28,6 +21,7 @@ STEP-5B detect_missed_activities
 
 from pathlib import Path
 import sys
+import argparse
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
@@ -38,9 +32,10 @@ from aggregation.activity_schedule_resolver import resolve as step5a_resolver
 from aggregation.missed_activity_cron import detect_missed_activities
 
 
-def run():
-    print("[PHASE-5] STEP-4: aggregating activities…")
-    step4_aggregator(max_loops=1)
+def run(include_step4=False):
+    if include_step4:
+        print("[PHASE-5] STEP-4: aggregating activities…")
+        step4_aggregator(max_loops=1)
 
     print("[PHASE-5] STEP-5A: resolving schedules & status…")
     step5a_resolver()
@@ -49,5 +44,18 @@ def run():
     detect_missed_activities()
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run Phase-5 batch jobs (resolver + missed)."
+    )
+    parser.add_argument(
+        "--include-step4",
+        action="store_true",
+        help="Also run STEP-4 aggregator once before STEP-5.",
+    )
+    args = parser.parse_args()
+    run(include_step4=args.include_step4)
+
+
 if __name__ == "__main__":
-    run()
+    main()

@@ -27,8 +27,8 @@ from ultralytics import YOLO
 # ============================================================
 
 # Use RTSP stream or video file
-VIDEO_SOURCE = "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101"  # Live RTSP
-# VIDEO_SOURCE = "test_data/Full video (17-2-26)/GRP_1_Front_center_17-2-26.mp4"  # Or use file
+#VIDEO_SOURCE = "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101"  # Live RTSP
+VIDEO_SOURCE = "/home/neopeak/Desktop/projects/Rahuri farm videos/GRP_1_Front_center(5-10-25)/GRP_1_Front_center(5-10-25).mp4"  # Or use file
 MODEL_PATH = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/models/WF_V1.4.1_best.engine" # trained and exported with imgsz=512
 
 DEVICE = "cuda"  # Jetson
@@ -47,30 +47,51 @@ Your current video resolution is: 2560 × 1440
 
 But your ROI normalized values were calculated from: 1600 × 720.
 """
-FEEDING_ROI = None
+FEEDING_ROI = [
+    {
+        "x": 0.052,
+        "y": 0.314
+    },
+    {
+        "x": 0.122,
+        "y": 0.271
+    },
+    {
+        "x": 0.996,
+        "y": 0.974
+    },
+    {
+        "x": 0.2,
+        "y": 0.983
+    },
+    {
+        "x": 0.052,
+        "y": 0.314
+    }
+]
 
 SCRAPPING_ROI = [
-            {
-              "x": 0.619,
-              "y": 0.101
-            },
-            {
-              "x": 0.933,
-              "y": 0.224
-            },
-            {
-              "x": 0.831,
-              "y": 0.997
-            },
-            {
-              "x": 0.004,
-              "y": 0.981
-            },
-            {
-              "x": 0.611,
-              "y": 0.101
-            }
-          ]
+    {
+        "x": 0.145,
+        "y": 0.263
+    },
+    {
+        "x": 0.237,
+        "y": 0.215
+    },
+    {
+        "x": 0.998,
+        "y": 0.472
+    },
+    {
+        "x": 0.998,
+        "y": 0.904
+    },
+    {
+        "x": 0.145,
+        "y": 0.267
+    }
+]
 
 # Example:  
 # FEEDING_ROI = [
