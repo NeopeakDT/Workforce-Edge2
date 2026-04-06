@@ -12,7 +12,7 @@
 
 1. **Flash Jetson** - Install OS and base system
 2. **Install Python deps** - `pip install -r jetson_requirements.txt`
-3. **Export EDGE_API_BASE + EDGE_TOKEN** - Set environment variables
+3. **Export EDGE_API_BASE + EDGE_DEVICE_KEY + DEVICE_CODE** - Set environment variables
 4. **Run `edge_config_sync.py`** ← **REQUIRED**
 5. **Verify `local_cache.json`** - Ensure config was downloaded successfully
 6. **Enable systemd services** - Set up auto-start on boot
@@ -141,7 +141,7 @@ python3 /path/to/edge_detector.py
 3. **Authentication Error:**
    - ❌ Don't proceed without auth
    - ✅ Fail with 401/403 error
-   - ✅ Check EDGE_TOKEN is set
+   - ✅ Check EDGE_DEVICE_KEY is set
 
 ---
 
@@ -151,7 +151,7 @@ Before device is considered "ready":
 
 - [ ] `edge_config_sync.py` completed successfully
 - [ ] `local_cache.json` exists and is valid JSON
-- [ ] All required keys present: `farm_camera`, `camera_stream_config`, `device_model_assignment`, `ml_model_version`
+- [ ] All required keys present: `device_id`, `farm_id`, `farm_timezone`, `cameras`, `device_model_assignment`, `ml_model_version`
 - [ ] `edge_detector.py` can load config without errors
 - [ ] `edge_heartbeat_agent.py` is running
 - [ ] Device can communicate with backend API

@@ -15,7 +15,7 @@
       "nvr_rtsp_base": null,
       "nvr_channel": null,
       "resolution": "2560 x 1440",
-      "fps": 10,
+      "fps": 5,
       "roi_polygon": null,
       "motion_sensitivity": null,
       "activity_zones": {
@@ -85,7 +85,7 @@
       "nvr_rtsp_base": null,
       "nvr_channel": null,
       "resolution": "2560 x 1440",
-      "fps": 10,
+      "fps": 5,
       "roi_polygon": null,
       "motion_sensitivity": null,
       "activity_zones": {
@@ -159,7 +159,7 @@
       "nvr_rtsp_base": null,
       "nvr_channel": null,
       "resolution": "2560 x 1440",
-      "fps": 10,
+      "fps": 5,
       "roi_polygon": null,
       "motion_sensitivity": null,
       "activity_zones": {
@@ -229,7 +229,7 @@
       "nvr_rtsp_base": null,
       "nvr_channel": null,
       "resolution": "2560 x 1440",
-      "fps": 10,
+      "fps": 5,
       "roi_polygon": null,
       "motion_sensitivity": null,
       "activity_zones": {
@@ -295,7 +295,7 @@
       "nvr_rtsp_base": null,
       "nvr_channel": null,
       "resolution": "2560 x 1440",
-      "fps": 10,
+      "fps": 5,
       "roi_polygon": null,
       "motion_sensitivity": null,
       "activity_zones": {

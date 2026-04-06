@@ -2,12 +2,15 @@
   "device_id": "3259cd10-d54c-42e3-88d6-b85a05e262be",
   "farm_id": "07dbc890-2076-4018-b5fc-9f93cf2900e3",
   "farm_timezone": "Asia/Kolkata",
+  "activity_params": {
+    "SCRAPPING_MAX_DISTANCE_PX": 120
+  },
   "cameras": [
     {
       "camera_id": "c6ba130f-a0b4-4f74-96bd-6a4407e6c64a",
       "code": "H-GRP-2-Front-Right",
       "stream_type": "FILE",
-      "decode_mode": "GPU",
+      "decode_mode": "CPU",
       "rtsp_url": "rtsp://",
       "nvr_rtsp_base": null,
       "nvr_channel": null,
@@ -77,7 +80,7 @@
       "camera_id": "75bc9fb9-b3d9-4f3b-9091-11e6f18bc96e",
       "code": "H-GRP-1-Front-right",
       "stream_type": "FILE",
-      "decode_mode": "GPU",
+      "decode_mode": "CPU",
       "rtsp_url": "rtsp://",
       "nvr_rtsp_base": null,
       "nvr_channel": null,
@@ -148,7 +151,7 @@
       "video_file_path": "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/Full_video(17-2-26)/GRP_1_Front_Right_17-2-26.mp4"
     },
     {
-      "camera_id": "75bc9fb9-b3d9-4f3b-9091-11e6f18bc96e",
+      "camera_id": "f5e093ef-2730-46f7-824a-a1acff057462",
       "code": "H-GRP-1-Front-left",
       "stream_type": "FILE",
       "decode_mode": "CPU",
@@ -395,6 +398,7 @@
     }
   }
 }
+
 
 
 

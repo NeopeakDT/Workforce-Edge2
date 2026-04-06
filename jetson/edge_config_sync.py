@@ -34,22 +34,38 @@ def fatal(msg: str):
 # -------------------------------------------------
 # Resolve backend API base
 # -------------------------------------------------
+def normalize_api_base(api_base: str) -> str:
+    """
+    Normalize backend API base URL.
+
+    Accepts either:
+    - http://host:port
+    - http://host:port/api/v1
+
+    Returns canonical base without trailing '/api/v1' to avoid duplicated paths.
+    """
+    base = api_base.rstrip("/")
+    if base.endswith("/api/v1"):
+        base = base[:-7]
+    return base
+
+
 def get_api_base() -> str:
     api_base = os.getenv("BACKEND_API_URL")
 
     if api_base:
-        return api_base.rstrip("/")
+        return normalize_api_base(api_base)
 
     if BOOTSTRAP_CONFIG_PATH.exists():
         try:
             data = json.loads(BOOTSTRAP_CONFIG_PATH.read_text())
             if "backend_api_url" in data:
-                return data["backend_api_url"].rstrip("/")
+                return normalize_api_base(data["backend_api_url"])
         except Exception:
             fatal("Invalid bootstrap_config.json")
 
     if len(sys.argv) > 1:
-        return sys.argv[1].rstrip("/")
+        return normalize_api_base(sys.argv[1])
 
     fatal("BACKEND_API_URL not set")
 

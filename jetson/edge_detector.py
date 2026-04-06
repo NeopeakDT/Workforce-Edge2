@@ -817,20 +817,20 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                 ret, frame = False, None
 
         if not ret:
-            if is_live:
-                logger.warning("[CAMERA %s] Frame read failed, retrying...", camera_id)
-                time.sleep(1)
-                continue
-
             # FILE streams should stop cleanly at EOF (no reconnect loop)
             if not is_live:
                 logger.info("[CAMERA %s] End of file reached. Stopping FILE stream.", camera_id)
                 break
 
+            # LIVE streams: always attempt reconnect with bounded backoff.
             reconnect_attempt += 1
             backoff_delay = min(MAX_BACKOFF_SEC, 2 ** reconnect_attempt)
-
-            logger.warning("[CAMERA %s] Stream lost. Reconnect attempt #%d (waiting %ds)...", camera_id, reconnect_attempt, backoff_delay)
+            logger.warning(
+                "[CAMERA %s] Stream lost. Reconnect attempt #%d (waiting %ds)...",
+                camera_id,
+                reconnect_attempt,
+                backoff_delay,
+            )
             try:
                 time.sleep(backoff_delay)
                 stream.release()
