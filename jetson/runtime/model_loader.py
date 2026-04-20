@@ -102,7 +102,7 @@ class ModelRunner:
         # Prepare inference parameters based on model type
         inference_kwargs = {
             "imgsz": 512,  # Slightly larger for better accuracy, still Jetson-friendly
-            "conf": 0.25,  # Default confidence threshold
+            "conf": 0.65,  # Default confidence threshold
             "max_det": 100,  # Limit max detections per frame to stabilize latency
         }
 

@@ -3,6 +3,9 @@
 
 Database Connection
 Manages Supabase (Postgres) database connections and connection pooling.
+
+To test this file run python scripts/test_auth_jwt.py
+
 """
 # common/db.py
 

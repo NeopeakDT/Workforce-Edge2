@@ -42,6 +42,9 @@ from runtime.model_loader import ModelRunner
 from runtime.temporal_smoother import TemporalSmoother
 from runtime.video_stream import open_stream, _validate_gstreamer
 
+# GLOBAL RTSP START LOCK (prevents NVR overload)
+RTSP_START_LOCK = threading.Lock()
+
 # Thermal protection
 try:
     from jetson_telemetry import collect_telemetry
@@ -76,6 +79,9 @@ load_dotenv(DOTENV_PATH)
 FRAME_AGGREGATE_INTERVAL_SEC = 10  # seconds
 SCRAP_ACTIVE_BUFFER_SEC = float(os.getenv("SCRAP_ACTIVE_BUFFER_SEC", "10"))
 FEED_ACTIVE_BUFFER_SEC = float(os.getenv("FEED_ACTIVE_BUFFER_SEC", "15"))
+# For long tools, use the lower segment as proxy for the tool head.
+# 0.85 means "point at 85% bbox height from top" (near bottom tip).
+SCRAP_TOOL_HEAD_Y_RATIO = float(os.getenv("SCRAP_TOOL_HEAD_Y_RATIO", "0.7"))
 
 API_BASE = os.getenv("EDGE_API_BASE")
 DEVICE_KEY = os.getenv("EDGE_DEVICE_KEY")
@@ -134,7 +140,7 @@ log_listener.start()
 # ------------------------------------------------------------------
 # GPU Inference Pipeline (Queue-based, removes INFER_LOCK)
 # ------------------------------------------------------------------
-FRAME_QUEUE_MAXSIZE = int(os.getenv("EDGE_FRAME_QUEUE_MAXSIZE", "20"))
+FRAME_QUEUE_MAXSIZE = int(os.getenv("EDGE_FRAME_QUEUE_MAXSIZE", "10"))
 FRAME_QUEUE = Queue(maxsize=FRAME_QUEUE_MAXSIZE)
 INFERENCE_FRAME_SIZE = (640, 640)
 
@@ -654,26 +660,32 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     # --------------------------------------------------
     logger.info("[CAMERA INIT] Starting %s", camera_name)
     stream = None
-    for attempt in range(1, 6):
+    attempt = 0
+    while True:
+        attempt += 1
+        retry_delay = min(30, 2 ** attempt)
         try:
-            stream = open_stream(camera)
+            # Serialize RTSP negotiation to avoid NVR burst failures.
+            with RTSP_START_LOCK:
+                logger.info("[CAMERA %s] Acquired RTSP start lock", camera_name)
+                stream = open_stream(camera)
+                time.sleep(1.5)  # allow pipeline settle
             if stream and stream.cap and stream.cap.isOpened():
                 break
+            logger.warning(
+                "[CAMERA %s] Open stream attempt %d returned invalid handle; retrying...",
+                camera_name,
+                attempt,
+            )
         except Exception as e:
             logger.warning(
-                "[CAMERA %s] Open stream attempt %d/5 failed: %s",
+                "[CAMERA %s] Open stream attempt %d failed: %s",
                 camera_name,
                 attempt,
                 str(e)[:200],
             )
-
-        if attempt < 5:
-            time.sleep(2)
-
-    if not stream or not stream.cap or not stream.cap.isOpened():
-        logger.error("[CAMERA %s] FAILED after retries", camera_name)
-        # Raise so supervisor can restart this camera thread.
-        raise RuntimeError(f"[CAMERA {camera_name}] FAILED to open stream")
+        logger.info("[CAMERA %s] Retry open in %ds", camera_name, retry_delay)
+        time.sleep(retry_delay)
 
     # warmup decoder
     for _ in range(5):
@@ -683,16 +695,22 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     time.sleep(3)
 
     cap = stream.cap  # required for FPS / metadata only
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # FIX 4: Limit decode buffer for stability
+    # CAP_PROP_BUFFERSIZE is not supported on OpenCV-GStreamer for Jetson.
+    # Calling it can trigger "GStreamer: unhandled property" and stream churn.
+    try:
+        if cap.getBackendName() != "GStreamer":
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
     ret, frame = stream.read()
     if not ret:
         logger.error(f"[CAMERA {camera_name}] STREAM OPEN FAILED")
         stream.release()
-        return
+        raise RuntimeError(f"[CAMERA {camera_name}] Stream failed to open after handle creation")
 
     # Log video source information
-    stream_type = camera.get("stream_type", "AUTO").upper()
+    stream_type = (camera.get("stream_type") or "AUTO").upper()
     video_source = camera.get("video_file_path") or camera.get("rtsp_url") or "Unknown"
     logger.info("[CAMERA %s] started", camera_name)
     if logger.isEnabledFor(logging.DEBUG):
@@ -824,7 +842,7 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
 
             # LIVE streams: always attempt reconnect with bounded backoff.
             reconnect_attempt += 1
-            backoff_delay = min(MAX_BACKOFF_SEC, 2 ** reconnect_attempt)
+            backoff_delay = min(30, 2 ** reconnect_attempt)
             logger.warning(
                 "[CAMERA %s] Stream lost. Reconnect attempt #%d (waiting %ds)...",
                 camera_id,
@@ -833,8 +851,15 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             )
             try:
                 time.sleep(backoff_delay)
-                stream.release()
-                stream = open_stream(camera)
+                try:
+                    if stream:
+                        stream.release()
+                        time.sleep(2.0)  # allow NVDEC cleanup
+                except Exception:
+                    pass
+
+                with RTSP_START_LOCK:
+                    stream = open_stream(camera)
                 logger.info("[CAMERA %s] Stream reconnected successfully", camera_id)
                 reconnect_attempt = 0  # reset after success
                 continue
@@ -912,8 +937,13 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             done_event.set()
 
         if FRAME_QUEUE.full():
-            logger.debug("[CAMERA %s] GPU queue full — early drop before enqueue", camera_id)
-            continue
+            dropped = drop_oldest_frame_for_camera(camera_id)
+            if dropped:
+                logger.debug("[CAMERA %s] GPU queue full — dropped oldest frame for camera", camera_id)
+            else:
+                # No frame from this camera to evict; skip to avoid cross-camera starvation.
+                logger.debug("[CAMERA %s] GPU queue full — no evictable frame for camera", camera_id)
+                continue
 
         try:
             FRAME_QUEUE.put((camera_id, frame, set_detections), block=False)
@@ -923,7 +953,7 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             detections = []
         else:
             # Wait for inference result with proper blocking (no busy-wait)
-            if not done_event.wait(timeout=0.6):
+            if not done_event.wait(timeout=0.2):
                 now_ts = time.time()
                 if now_ts - last_timeout_log > 10:
                     logger.warning("[CAMERA %s] Inference timeout, skipping frame", camera_id)
@@ -1368,8 +1398,8 @@ def main():
         t.start()
         camera_threads.append(t)
 
-        # Prevent NVDEC allocation race when many streams start at once.
-        time.sleep(1.5)
+        # Prevent RTSP/NVDEC burst when many streams start at once.
+        time.sleep(2.0)
 
     for t in camera_threads:
         t.join()

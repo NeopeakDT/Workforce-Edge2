@@ -9,9 +9,13 @@ os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 # Hardware-aware decode control: limit concurrent GPU-decoded streams.
 # NOTE: This is process-wide for the Jetson edge_detector process.
-MAX_GPU_STREAMS = 1
+MAX_GPU_STREAMS = 3
 gpu_stream_count = 0
 gpu_stream_count_lock = threading.Lock()
+
+# Limit concurrent RTSP handshake/open attempts to avoid NVR burst overload.
+MAX_RTSP_CONNECTIONS = 5
+rtsp_semaphore = threading.Semaphore(MAX_RTSP_CONNECTIONS)
 
 class VideoStream:
 	def __init__(self, cap, on_release=None):
@@ -50,9 +54,9 @@ def build_pipeline(rtsp_url, codec):
 	
 	Key features:
 	- protocols=tcp: Prevents UDP packet drops on real deployments
-	- queue: Buffers between stages for stability
+	- non-zero latency + jitter buffer: Better tolerance to RTP jitter
+	- bounded leaky queue: Avoids backlog while staying realtime
 	- nvv4l2decoder: Hardware H.264/H.265 decode
-	- drop-on-latency=true: Drops old frames instead of queuing
 	- timeout=5000000: Prevents infinite hang on disconnect (5s timeout)
 	"""
 	if codec == "h264":
@@ -61,11 +65,11 @@ def build_pipeline(rtsp_url, codec):
 		depay = "rtph265depay ! h265parse"
 
 	return (
-		f"rtspsrc location={rtsp_url} latency=0 protocols=tcp "
-		"drop-on-latency=true timeout=5000000 ! "
-		"queue ! "
+		f"rtspsrc location={rtsp_url} latency=100 protocols=tcp timeout=5000000 ! "
+		"rtpjitterbuffer latency=100 drop-on-latency=false ! "
+		"queue max-size-buffers=4 leaky=downstream ! "
 		f"{depay} ! "
-		"nvv4l2decoder ! "
+		"nvv4l2decoder enable-max-performance=1 ! "
 		"nvvidconv ! video/x-raw,format=BGRx ! "
 		"videoconvert ! video/x-raw,format=BGR ! "
 		"appsink drop=true max-buffers=1 sync=false"
@@ -137,27 +141,24 @@ def open_rtsp_auto(rtsp_url):
 	Includes 500ms warm-up delay for camera initialization.
 	"""
 
-	# Try H.264 first, then fall back to H.265 if needed.
-	for codec in ("h264", "h265"):
+	# Use H.264 only for RTSP stability with this deployment.
+	for codec in ("h264",):
 		pipeline = build_pipeline(rtsp_url, codec)
 
 		# Retry loop to handle flaky RTSP connections / camera timeouts.
-		for attempt in range(3):
+		for attempt in range(2):
 			cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
-			# Best-effort guard against latency buildup on backends that honor this prop.
-			try:
-				if cap.getBackendName() == "GStreamer":
-					cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-			except Exception:
-				pass
+			# NOTE: Do not call CAP_PROP_BUFFERSIZE on GStreamer.
+			# On Jetson OpenCV-GStreamer this often logs "unhandled property"
+			# and can destabilize the pipeline.
 
 			if not cap.isOpened():
 				cap.release()
 				time.sleep(1)
 				continue
 
-			time.sleep(0.5)
+			time.sleep(1.5)
 
 			ret, _ = cap.read()
 			if ret:
@@ -182,7 +183,7 @@ def open_stream(camera_cfg):
 		If rtsp_url exists → use it directly
 		Else if nvr_channel exists → construct RTSP from base + channel
 	"""
-	stream_type = camera_cfg.get("stream_type", "AUTO").upper()
+	stream_type = (camera_cfg.get("stream_type") or "AUTO").upper()
 	rtsp_url = None
 	determined_stream_type = None
 
@@ -205,7 +206,9 @@ def open_stream(camera_cfg):
 		elif decode_mode == "CPU":
 			use_gpu = False
 		else:  # AUTO
-			use_gpu = False
+			if gpu_stream_count < MAX_GPU_STREAMS:
+				gpu_stream_count += 1
+				use_gpu = True
 
 	on_release = None
 	if use_gpu:
@@ -276,31 +279,33 @@ def open_stream(camera_cfg):
 				)
 
 			# Open RTSP stream based on the GPU decode decision above.
-			if use_gpu:
-				# GPU decode: use GStreamer + nvv4l2decoder
-				try:
-					cap = open_rtsp_auto(rtsp_url)
-					if decode_mode in ("GPU", "AUTO"):
-						print(f"[STREAM] Using GPU hardware decoder: {rtsp_url}")
-				except Exception as e:
-					# If GPU decode fails, fall back to CPU decode for correctness.
-					rollback_gpu_slot()
-					print(f"[STREAM] GPU decode failed ({decode_mode}) → CPU fallback (FFMPEG): {e}")
+			with rtsp_semaphore:
+				if use_gpu:
+					# GPU decode: use GStreamer + nvv4l2decoder
+					try:
+						cap = open_rtsp_auto(rtsp_url)
+						if decode_mode in ("GPU", "AUTO"):
+							print(f"[STREAM] Using GPU hardware decoder: {rtsp_url}")
+					except Exception as e:
+						# If GPU decode fails, fall back to CPU decode for correctness.
+						rollback_gpu_slot()
+						print(f"[STREAM] GPU decode failed ({decode_mode}) → CPU fallback (FFMPEG): {e}")
+						time.sleep(3)
+						cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+						# Reduce buffering (critical for live streams)
+						try:
+							cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+						except:
+							pass
+				else:
+					# CPU decode: FFMPEG via OpenCV
+					print(f"[STREAM] Using CPU decode (FFMPEG): {rtsp_url}")
 					cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
 					# Reduce buffering (critical for live streams)
 					try:
 						cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 					except:
 						pass
-			else:
-				# CPU decode: FFMPEG via OpenCV
-				print(f"[STREAM] Using CPU decode (FFMPEG): {rtsp_url}")
-				cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-				# Reduce buffering (critical for live streams)
-				try:
-					cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-				except:
-					pass
 
 		if not cap.isOpened():
 			raise RuntimeError(

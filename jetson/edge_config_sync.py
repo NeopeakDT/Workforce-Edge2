@@ -118,7 +118,7 @@ def main():
     # Per-camera validation
     # SMART FALLBACK: Camera must have EITHER rtsp_url OR (nvr_rtsp_base + nvr_channel)
     for cam in cfg["cameras"]:
-        st = cam.get("stream_type", "AUTO").upper()
+        st = (cam.get("stream_type") or "AUTO").upper()
         has_rtsp_url = bool(cam.get("rtsp_url"))
         has_nvr_config = bool(cam.get("nvr_rtsp_base") and cam.get("nvr_channel"))
 
@@ -137,7 +137,7 @@ def main():
                 fatal(f"NVR camera {cam['camera_id']} missing nvr_rtsp_base or nvr_channel")
 
         # AUTO or unspecified: Smart fallback
-        elif st in ["AUTO", "UNKNOWN", None]:
+        elif st in ["AUTO", "UNKNOWN"]:
             if not has_rtsp_url and not has_nvr_config:
                 fatal(
                     f"Camera {cam['camera_id']}: Must provide either "
@@ -158,7 +158,8 @@ def main():
     TEST_VIDEO_PATH = PROJECT_ROOT / "test_data" / "Full_scrapping_video_2.mp4"  # ← EDIT THIS
 
     for cam in cfg["cameras"]:
-        if cam["stream_type"] == "FILE":
+        cam_stream_type = (cam.get("stream_type") or "AUTO").upper()
+        if cam_stream_type == "FILE":
             cam["video_file_path"] = str(TEST_VIDEO_PATH)
 
     # -------------------------------------------------

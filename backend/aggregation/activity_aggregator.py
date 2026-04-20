@@ -53,7 +53,7 @@ from aggregation.activity_schedule_resolver import (
 MERGE_GAP_MINUTES = {
     1: 10,  # MILKING
     2: 10,  # FEEDING
-    3: 5,   # SCRAPPING
+    3: 10,  # SCRAPPING
 }
 
 

@@ -40,6 +40,19 @@ This script:
 ---------------------------------------------------------------------------------------
 📌 Script: roi_selector.py
 
+
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/502
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1902
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1802
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1302
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1702
+
+GRP2-TMR_WAY        → 502
+GRP2-FRONT_RIGHT    → 1902
+GRP1-FRONT_LEFT     → 1802   
+GRP1-FRONT_RIGHT    → 1302
+GRP1-FRONT_CENTER   → 1702
+
 """
 import cv2
 import json
@@ -51,14 +64,27 @@ from datetime import datetime
 # -------- CONFIG --------
 # SOURCE = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/rahuri_video-7.mp4"
 # SOURCE = "jetson/roi_selection/GRP-1-front-right-2.png"
-SOURCE = "rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/101"
-# OUTPUT_FILE where coordinates will be saved
-OUTPUT_FILE = "jetson/roi_selection/rtsp_roi_coordinates.txt"
+SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1702"
+# OUTPUT_FILE where coordinates will be saved (absolute, cwd-independent)
+OUTPUT_FILE = Path(__file__).resolve().parent / "rtsp_roi_coordinates.txt"
 # ------------------------
 
 points = []
 scale_factor = 1.0  # For downsampling large images
 polygon_closed = False
+
+def build_rtsp_pipeline(rtsp_url: str) -> str:
+    """
+    Jetson-safe RTSP pipeline for H.265 sources.
+    Uses GStreamer + nvv4l2decoder instead of OpenCV's default FFmpeg path.
+    """
+    return (
+        f"rtspsrc location={rtsp_url} latency=0 protocols=tcp ! "
+        "rtph265depay ! h265parse ! nvv4l2decoder ! "
+        "nvvidconv ! video/x-raw,format=BGRx ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true max-buffers=1 sync=false"
+    )
 
 def mouse_callback(event, x, y, flags, param):
     global points, scale_factor
@@ -83,9 +109,23 @@ def load_frame(source):
     else:
         # Try to load as video or RTSP stream
         print(f"[INFO] Attempting to load as video/RTSP: {source}")
-        cap = cv2.VideoCapture(source)
+        source_lower = source.lower()
+        is_rtsp = source_lower.startswith("rtsp://")
+
+        if is_rtsp:
+            pipeline = build_rtsp_pipeline(source)
+            print("[INFO] Using GStreamer RTSP pipeline (Jetson NVDEC)")
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        else:
+            cap = cv2.VideoCapture(source)
+
         if not cap.isOpened():
             raise Exception(f"Failed to open video/stream: {source}")
+
+        # Warmup to allow decoder/stream buffers to stabilize.
+        for _ in range(5):
+            cap.read()
+
         ret, frame = cap.read()
         cap.release()
         if not ret or frame is None:
@@ -205,6 +245,7 @@ if len(points) >= 3:
     }
 
     try:
+        OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(OUTPUT_FILE, "a") as f:
             f.write("\n" + "="*80 + "\n")
             f.write(f"Timestamp: {timestamp}\n")

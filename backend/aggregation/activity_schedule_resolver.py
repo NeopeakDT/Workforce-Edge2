@@ -32,7 +32,7 @@ from common.time_utils import utc_now
 # CONFIG
 # --------------------------------------------------
 
-MAX_ACTIVITY_DURATION_SEC = 3 * 60 * 60  # 3 hours safety cap
+MAX_ACTIVITY_DURATION_SEC = 90 * 60   # 1.5 hr for scrapping
 
 
 def ideal_window_utc_bounds(farm_tz, activity_date, ideal_start_time, ideal_end_time):
@@ -87,7 +87,14 @@ def resolve():
             FROM activity_instance ai
             JOIN farm f ON f.id = ai.farm_id
             WHERE ai.actual_end_at IS NOT NULL
-              AND ai.status = 'IN_PROGRESS'
+              AND (
+                    ai.status = 'IN_PROGRESS'
+                    OR (
+                        ai.status = 'LATE'
+                        AND ai.started_offset_min IS NULL
+                        AND ai.ended_offset_min IS NULL
+                    )
+                  )
               AND ai.source = 'AI'
               AND ai.last_seen_at IS NOT NULL
               AND ai.last_seen_at < %s

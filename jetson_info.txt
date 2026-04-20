@@ -65,9 +65,10 @@ export DEVICE_CODE=HARMONY_JETSON_TEST
 export EDGE_DEVICE_KEY=<YOUR_DEVICE_API_KEY>
 export BACKEND_API_URL=http://192.168.31.134:8000
 Eg-
-export DEVICE_CODE=HD_TEST_01
-export EDGE_DEVICE_KEY=25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab
-export BACKEND_API_URL=http://192.168.31.134:8000
+export DEVICE_CODE=JETSON_01
+export EDGE_DEVICE_KEY=5f6f0d651a42e343a5d253d89fc5ecdc547fb7e61bfe8a114671edadcfa9a00e
+export BACKEND_API_URL=http://192.168.31.143:8000
+
 to check it it is correct-
 echo $DEVICE_CODE
 echo $EDGE_DEVICE_KEY
@@ -76,39 +77,20 @@ echo $BACKEND_API_URL
 **Update the above in .env file
 
 ----------------------------------------------------------------------------------------------------------------------------
-19/1/2025- device_provisioning.py
+07/04/2025- device_provisioning.py
 
-neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ python backend/ops/device_provisioning.py --farm-id 07dbc890-2076-4018-b5fc-9f93cf2900e3 --device-name Harmony_dairy_01 --device-code HD_test_01
-** Below is the expected output(copy and save here)
+(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$ python ops/device_provisioning.py   --farm-id 608e7a58-d46e-4f6c-bd19-b8c2a8d59050   --device-name "Rahuri-Jetson-01"   --device-code "JETSON_01"
 ✅ Device provisioned successfully
-Device ID      : 3259cd10-d54c-42e3-88d6-b85a05e262be
-Device Name    : Harmony_dairy_01
-Device Code    : HD_TEST_01
-API Key (SAVE) : 25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab
+Device ID      : f0d5c399-6939-4b26-bf5a-fe24c2ed5738
+Device Name    : Rahuri-Jetson-01
+Device Code    : JETSON_01
+API Key (SAVE) : 5f6f0d651a42e343a5d253d89fc5ecdc547fb7e61bfe8a114671edadcfa9a00e
 
 ⚠️  WARNING: Save this API key now!
    It will NOT be shown again.
    Store it securely on the Jetson device.
-neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ 
+(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$ 
 
-#To insert data in activity_detection_event table .
-(torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection/backend$ curl -X POST http://192.168.31.134:8000/api/v1/ingest/event   -H "X-DEVICE-KEY: 25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab"   -H "Content-Type: application/json"   --data-binary "@event_ok.json"
-
-------------------------------------------------------------------------------------------------------
-17/2/2026
-python ops/device_provisioning.py \
-  --farm-id b38b09a7-adac-4f84-970e-6c21e80e54e7 \ --  NEOPEAK DAIRY
-  --device-name "NEOPEAK DAIRY 01" \
-  --device-code "NEOPEAK-D-01"
-✅ Device provisioned successfully
-Device ID      : 87b91fdc-256e-4002-943e-8c0281b4cf80
-Device Name    : NEOPEAK DAIRY 01
-Device Code    : NEOPEAK-D-01
-API Key (SAVE) : 247f01b3e80b3391657ac3ecc39a37399154ef270bdba4da8d5c49015179d186
-
-⚠️  WARNING: Save this API key now!
-   It will NOT be shown again.
-   Store it securely on the Jetson device.
 
 =====================================================================================================
 STEP 3.2 — Runtime Config Sync (IN SHORT) ( it stores data in local_cache.py)
@@ -575,8 +557,9 @@ If now > 02:15 PM AND no activity exists
 git archive --format=zip --output=project_code.zip HEAD
 
 ==================================================================================================
-5/3/2026 - gst-launch-1.0 rtspsrc location=rtsp://admin:ADMIN123@192.168.0.64:554/Streaming/Channels/102 latency=0 ! rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! autovideosink
-rtsp link - 
+7/4/2026 - RTSP Link - 
+gst-launch-1.0 rtspsrc location="rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/502" latency=0 ! \
+rtph265depay ! h265parse ! nvv4l2decoder ! nvvidconv ! nveglglessink  
 ==========================================================================================================
 
 (torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ python jetson/edge_detector.py
@@ -885,11 +868,12 @@ sudo systemctl enable workforce-watchdog
 
     bash edge_precheck.sh
 sudo systemctl start workforce-backend
-sudo systemctl start workforce-edge
 sudo systemctl start workforce-aggregator
 sudo systemctl start workforce-phase5.timer
+sudo systemctl start workforce-edge
 sudo systemctl start workforce-heartbeat
 sudo systemctl start workforce-watchdog
+
 
 sudo systemctl restart workforce-backend
 sudo systemctl restart workforce-edge
@@ -906,6 +890,9 @@ sudo systemctl stop workforce-aggregator
 sudo systemctl stop workforce-phase5.timer
 sudo systemctl stop workforce-heartbeat
 sudo systemctl stop workforce-watchdog
+
+- Verify
+sudo systemctl --no-pager --full status workforce-backend workforce-aggregator workforce-phase5.timer workforce-edge workforce-heartbeat workforce-watchdog
 
 
 ===========================================================================================
@@ -965,3 +952,24 @@ RTSP is supported in code, but current project state is not farm-live ready yet
     32. For new farm onboarding, mainly DB + env changes are needed; code changes are only needed to address the critical risks above.
 If you want, I can now make the exact code fixes for the 3 main blockers (service precheck path/startup flow, live reconnect bug, decode_mode/runtime-config improvement) so you can deploy with a safer build tomorrow.
 
+====================================================================================================
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/502
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1902
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1802
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1302
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1702
+
+GRP2-TMR_WAY        → 502
+GRP2-FRONT_RIGHT    → 1902
+GRP1-FRONT_LEFT     → 1802   
+GRP1-FRONT_RIGHT    → 1302
+GRP1-FRONT_CENTER   → 1702
+
+ffplay rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/502
+ffplay rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1902
+ffplay rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1802
+ffplay rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1302
+ffplay rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1702
+
+sudo systemctl restart workforce-edge workforce-watchdog
+journalctl -u workforce-edge -f
