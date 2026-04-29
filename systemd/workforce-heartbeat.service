@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# Workforce Edge Heartbeat Agent Service - Sends device health (CPU/GPU/etc) to backend every 120 sec
+# Workforce Edge Heartbeat Agent Service - Sends device health (CPU/GPU/etc) to backend every 300 sec
 #
 # Purpose:
 # Runs the device heartbeat agent as a background system service so the backend

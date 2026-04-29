@@ -10,7 +10,7 @@ Responsibilities:
 
 Rules:
 - Only instances with actual_end_at IS NOT NULL
-- Only instances with status = IN_PROGRESS
+- Includes ended rows waiting for schedule resolution
 - Uses FARM LOCAL TIMEZONE
 - Fully idempotent
 """
@@ -18,6 +18,7 @@ Rules:
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+import os
 import pytz
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +34,8 @@ from common.time_utils import utc_now
 # --------------------------------------------------
 
 MAX_ACTIVITY_DURATION_SEC = 90 * 60   # 1.5 hr for scrapping
+MIN_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MIN_ACTIVITY_DURATION_SEC", "300"))
+ON_TIME_BUFFER_MIN = int(os.getenv("AGG_ON_TIME_BUFFER_MIN", "10"))
 
 
 def ideal_window_utc_bounds(farm_tz, activity_date, ideal_start_time, ideal_end_time):
@@ -87,14 +90,8 @@ def resolve():
             FROM activity_instance ai
             JOIN farm f ON f.id = ai.farm_id
             WHERE ai.actual_end_at IS NOT NULL
-              AND (
-                    ai.status = 'IN_PROGRESS'
-                    OR (
-                        ai.status = 'LATE'
-                        AND ai.started_offset_min IS NULL
-                        AND ai.ended_offset_min IS NULL
-                    )
-                  )
+              AND ai.instance_type = 'SCHEDULED'
+              AND ai.status = 'ENDED'
               AND ai.source = 'AI'
               AND ai.last_seen_at IS NOT NULL
               AND ai.last_seen_at < %s
@@ -115,16 +112,7 @@ def resolve():
             )
 
             if duration_sec > MAX_ACTIVITY_DURATION_SEC:
-                # Mark as LATE without schedule binding (anomaly case)
-                cur.execute(
-                    """
-                    UPDATE activity_instance
-                    SET status = 'LATE',
-                        updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (now_utc, ai["id"]),
-                )
+                # Over-duration rows are treated as anomalies; do not resolve/finalize here.
                 continue
 
             farm_tz = pytz.timezone(ai["timezone"])
@@ -140,15 +128,21 @@ def resolve():
             actual_start_utc = ai["actual_start_at"].astimezone(timezone.utc)
             actual_end_utc = ai["actual_end_at"].astimezone(timezone.utc)
 
-            # Local reference only for picking correct activity_date
-            start_local = actual_start_utc.astimezone(farm_tz)
-            activity_date = start_local.date()
+            # Use persisted activity_date from STEP-4 to avoid cross-midnight drift.
+            activity_date = ai["activity_date"]
+            if activity_date is None:
+                # Safety fallback for legacy/bad rows.
+                start_local = actual_start_utc.astimezone(farm_tz)
+                activity_date = start_local.date()
 
             # --------------------------------------------------
             # CRITICAL: Use existing activity_schedule_id
             # (set by aggregator, not recomputed here)
             # --------------------------------------------------
             schedule_id = ai["activity_schedule_id"]
+            if schedule_id is None:
+                # UNSCHEDULED rows are intentionally excluded from schedule resolution.
+                continue
             
             cur.execute(
                 """
@@ -201,14 +195,25 @@ def resolve():
             )
 
             # --------------------------------------------------
-            # Final Status Resolution
+            # Final Status Resolution (schedule-tolerance model)
             # --------------------------------------------------
-            if started_offset < -s["tolerance_early_min"]:
+            early_tol_min = s["tolerance_early_min"] or 0
+            late_tol_min = s["tolerance_late_min"] or 0
+            early_limit = ideal_start_utc - timedelta(minutes=early_tol_min)
+            late_limit = ideal_start_utc + timedelta(minutes=late_tol_min)
+            buffer_start = ideal_start_utc - timedelta(minutes=ON_TIME_BUFFER_MIN)
+            buffer_end = ideal_start_utc + timedelta(minutes=ON_TIME_BUFFER_MIN)
+
+            if actual_start_utc < early_limit:
                 final_status = "EARLY"
-            elif started_offset > s["tolerance_late_min"]:
+            elif actual_start_utc < buffer_start:
+                final_status = "EARLY"
+            elif buffer_start <= actual_start_utc <= buffer_end:
+                final_status = "ON_TIME"
+            elif actual_start_utc <= late_limit:
                 final_status = "LATE"
             else:
-                final_status = "ON_TIME"
+                final_status = "LATE"
 
             # --------------------------------------------------
             # Persist resolution
@@ -232,6 +237,34 @@ def resolve():
                     ai["id"],
                 ),
             )
+
+        # --------------------------------------------------
+        # Finalize valid UNSCHEDULED rows
+        # --------------------------------------------------
+        # Rows shorter than MIN_ACTIVITY_DURATION_SEC are expected to be tagged as NOISE
+        # by STEP-4 and are intentionally excluded here.
+        cur.execute(
+            """
+            UPDATE activity_instance
+            SET status = 'UNSCHEDULE',
+                updated_at = %s
+            WHERE actual_end_at IS NOT NULL
+              AND instance_type = 'UNSCHEDULED'
+              AND status = 'IN_PROGRESS'
+              AND source = 'AI'
+              AND actual_duration_sec IS NOT NULL
+              AND actual_duration_sec >= %s
+              AND last_seen_at IS NOT NULL
+              AND last_seen_at < %s
+              AND updated_at < %s
+            """,
+            (
+                now_utc,
+                MIN_ACTIVITY_DURATION_SEC,
+                stable_end_cutoff_utc,
+                stable_end_cutoff_utc,
+            ),
+        )
 
         cur.connection.commit()
 

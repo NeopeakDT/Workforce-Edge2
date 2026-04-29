@@ -190,7 +190,8 @@ def open_stream(camera_cfg):
 	# --------------------------------------------------
 	# Decode selection with GPU stream limiting
 	# --------------------------------------------------
-	decode_mode = camera_cfg.get("decode_mode", "AUTO").upper()
+	# Default to CPU for stability when decode_mode is missing in synced config.
+	decode_mode = camera_cfg.get("decode_mode", "CPU").upper()
 
 	# Decide if this stream should use GPU decode.
 	# This caps the number of concurrent NVDEC/GStreamer GPU decodes.
@@ -217,6 +218,11 @@ def open_stream(camera_cfg):
 			with gpu_stream_count_lock:
 				gpu_stream_count = max(0, gpu_stream_count - 1)
 		on_release = _on_release
+
+	print(
+		f"[STREAM] camera={camera_cfg.get('code', camera_cfg.get('camera_id', 'UNKNOWN'))} "
+		f"decode_mode={decode_mode} resolved_decode={'GPU' if use_gpu else 'CPU'}"
+	)
 
 	def rollback_gpu_slot():
 		nonlocal on_release

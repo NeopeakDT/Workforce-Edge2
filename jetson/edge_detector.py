@@ -28,7 +28,7 @@ import numpy as np
 import logging
 from logging.handlers import QueueHandler, QueueListener
 import queue
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from queue import Queue
 from threading import Thread
@@ -381,21 +381,26 @@ def resend_failed_events():
 # ------------------------------------------------------------------
 # GPU Inference Worker — Dedicated Thread for TensorRT
 # ------------------------------------------------------------------
-def inference_worker(runner):
+def inference_worker(activity_runner, milking_runner):
     """
     Batched GPU worker for better utilization.
     Safe for Orin NX 8GB with batch=2 engine.
     """
-    BATCH_SIZE = 2  # Match your exported engine
+    BATCH_SIZE = 2  # Match exported engine batch
 
+    deferred_items = deque()
     while True:
         batch = []
         callbacks = []
-        queue_items_count = 0
+        model_type = None
+        processed_items_count = 0
         actual_batch = 0
 
         try:
-            item = FRAME_QUEUE.get(timeout=1.0)
+            if deferred_items:
+                item = deferred_items.popleft()
+            else:
+                item = FRAME_QUEUE.get(timeout=1.0)
         except queue.Empty:
             update_watchdog_heartbeat(
                 {
@@ -413,11 +418,11 @@ def inference_worker(runner):
             if item is None:
                 FRAME_QUEUE.task_done()
                 break
-            queue_items_count += 1
 
-            camera_id, frame, callback = item
+            camera_id, frame, model_type, callback = item
             batch.append(frame)
             callbacks.append(callback)
+            processed_items_count += 1
 
             # Allow micro-wait window to fill batch
             batch_deadline = time.time() + 0.003  # 3ms accumulation window
@@ -428,14 +433,22 @@ def inference_worker(runner):
                     if timeout <= 0:
                         break
 
-                    item = FRAME_QUEUE.get(timeout=timeout)
+                    next_item = FRAME_QUEUE.get(timeout=timeout)
                 except Exception:
                     break
 
-                cid, frm, cb = item
+                if next_item is None:
+                    deferred_items.append(next_item)
+                    break
+
+                cid, frm, next_model_type, cb = next_item
+                if next_model_type != model_type:
+                    deferred_items.append(next_item)
+                    break
+
                 batch.append(frm)
                 callbacks.append(cb)
-                queue_items_count += 1
+                processed_items_count += 1
 
         except Exception as e:
             logger.error("[GPU_WORKER] Batch build error: %s", str(e))
@@ -451,7 +464,12 @@ def inference_worker(runner):
                     batch.append(batch[-1])
                     callbacks.append(None)
 
-            results = runner.infer(batch)
+            if model_type == "MILKING":
+                if milking_runner is None:
+                    raise RuntimeError("MILKING inference requested but milking runner not loaded")
+                results = milking_runner.infer(batch)
+            else:
+                results = activity_runner.infer(batch)
 
             for dets, cb in zip(results[:actual_batch], callbacks[:actual_batch]):
                 if cb:
@@ -468,17 +486,26 @@ def inference_worker(runner):
                 {
                     "state": "running",
                     "batch_size": actual_batch,
+                    "model_type": model_type,
                     "frame_queue": FRAME_QUEUE.qsize(),
                 }
             )
-            for _ in range(queue_items_count):
+            for _ in range(processed_items_count):
                 FRAME_QUEUE.task_done()
 
 
 # ------------------------------------------------------------------
 # FIX 3: Thread Supervisor with Auto-Restart (Production Grade)
 # ------------------------------------------------------------------
-def camera_supervisor(camera, runner, person_classes, tool_classes, tmr_classes, tractor_classes, max_dist):
+def camera_supervisor(
+    camera,
+    person_classes,
+    tool_classes,
+    tmr_classes,
+    tractor_classes,
+    max_dist,
+    milking_model_enabled,
+):
     """Supervisor wrapper: restarts camera on crash (self-healing system)."""
     camera_code = camera.get("code", "UNKNOWN")
     restart_count = 0
@@ -488,12 +515,12 @@ def camera_supervisor(camera, runner, person_classes, tool_classes, tmr_classes,
             logger.info("[SUPERVISOR] Starting camera: %s", camera_code)
             process_camera(
                 camera,
-                runner,
                 person_classes,
                 tool_classes,
                 tmr_classes,
                 tractor_classes,
                 max_dist,
+                milking_model_enabled,
             )
             # If process_camera returns normally (EOF reached), exit supervisor
             logger.info("[SUPERVISOR] Camera %s finished normally", camera_code)
@@ -560,6 +587,14 @@ def euclidean(a, b):
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
+def bbox_intersects(boxA, boxB, pad=10):
+    xA = max(boxA[0], boxB[0] - pad)
+    yA = max(boxA[1], boxB[1] - pad)
+    xB = min(boxA[2], boxB[2] + pad)
+    yB = min(boxA[3], boxB[3] + pad)
+    return (xB > xA) and (yB > yA)
+
+
 def build_pixel_roi(normalized_roi, frame_w, frame_h):
     """
     Convert normalized ROI coordinates to pixel coordinates.
@@ -602,15 +637,51 @@ def detect_scrapping(detections, person_classes, tool_classes, max_dist):
     return False
 
 
+def detect_cluster_udder_intersection(detections):
+    clusters = [
+        d for d in detections
+        if d["class"].lower() == "cluster_attached"
+    ]
+    udders = [
+        d for d in detections
+        if d["class"].lower() == "cow_leg_udder"
+    ]
+
+    if not clusters or not udders:
+        return False
+
+    for cluster in clusters:
+        for udder in udders:
+            if bbox_intersects(cluster["bbox"], udder["bbox"], pad=10):
+                return True
+    return False
+
+
 
 
 # ------------------------------------------------------------------
 # Per-camera processing
 # ------------------------------------------------------------------
-def process_camera(camera, runner, person_classes, tool_classes, tmr_classes, tractor_classes, max_dist):
+def process_camera(
+    camera,
+    person_classes,
+    tool_classes,
+    tmr_classes,
+    tractor_classes,
+    max_dist,
+    milking_model_enabled,
+):
     # FIX 2: Wrap entire camera loop in crash guard (auto-restart safe)
     try:
-        _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_classes, tractor_classes, max_dist)
+        _process_camera_impl(
+            camera,
+            person_classes,
+            tool_classes,
+            tmr_classes,
+            tractor_classes,
+            max_dist,
+            milking_model_enabled,
+        )
     except Exception as e:
         logger.critical("[CAMERA %s] Critical error in camera thread: %s", camera['camera_id'], str(e)[:200])
         import traceback
@@ -619,7 +690,15 @@ def process_camera(camera, runner, person_classes, tool_classes, tmr_classes, tr
         raise
 
 
-def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_classes, tractor_classes, max_dist):
+def _process_camera_impl(
+    camera,
+    person_classes,
+    tool_classes,
+    tmr_classes,
+    tractor_classes,
+    max_dist,
+    milking_model_enabled,
+):
     camera_id = camera["camera_id"]
     camera_name = camera.get("code", camera_id)
     with STATS_LOCK:
@@ -632,10 +711,13 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
     }
     last_seen_scrap_ts = None
     last_seen_feed_ts = None
+    last_cluster_seen_ts = None
+    CLUSTER_MEMORY_SEC = 300
 
     smoothers = {
         "SCRAPPING": TemporalSmoother(),
         "FEEDING": TemporalSmoother(),
+        "MILKING": TemporalSmoother(start_sec=8, end_sec=20),
     }
 
     activity_state = {
@@ -649,11 +731,23 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             "session_id": None,
             "last_frame_emit": 0.0,
         },
+        "MILKING": {
+            "state": "INACTIVE",
+            "session_id": None,
+            "last_frame_emit": 0.0,
+        },
     }
 
     # Resolve zone IDs for activities (may be None)
     zone_scrapping = resolve_zone_id(camera, "SCRAPPING")
     zone_feeding = resolve_zone_id(camera, "FEEDING")
+    zone_milking = resolve_zone_id(camera, "MILKING")
+    use_milking_model = bool(zone_milking and milking_model_enabled)
+    if zone_milking and not milking_model_enabled:
+        logger.warning(
+            "[CAMERA %s] MILKING zone configured but milking model not loaded; MILKING detection disabled",
+            camera_id,
+        )
 
     # --------------------------------------------------
     # Open video stream (FILE / RTSP / NVR_CHANNEL)
@@ -791,11 +885,14 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
 
     scrap_roi_cfg = camera.get("activity_zones", {}).get("SCRAPPING", {}).get("roi")
     feed_roi_cfg = camera.get("activity_zones", {}).get("FEEDING", {}).get("roi")
+    milking_roi_cfg = camera.get("activity_zones", {}).get("MILKING", {}).get("roi")
     inference_w, inference_h = INFERENCE_FRAME_SIZE
     scrap_polygon = None
     feed_polygon = None
+    milking_polygon = None
     scrap_mask = None
     feed_mask = None
+    milking_mask = None
 
     if ROI_ENABLED and scrap_roi_cfg:
         scrap_polygon = build_pixel_roi(scrap_roi_cfg, inference_w, inference_h)
@@ -806,6 +903,15 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         feed_polygon = build_pixel_roi(feed_roi_cfg, inference_w, inference_h)
         feed_mask = np.zeros((inference_h, inference_w), dtype=np.uint8)
         cv2.fillPoly(feed_mask, [np.array(feed_polygon, dtype=np.int32)], 1)
+
+    if ROI_ENABLED and milking_roi_cfg:
+        milking_polygon = build_pixel_roi(milking_roi_cfg, inference_w, inference_h)
+        milking_mask = np.zeros((inference_h, inference_w), dtype=np.uint8)
+        cv2.fillPoly(milking_mask, [np.array(milking_polygon, dtype=np.int32)], 1)
+    else:
+        milking_polygon = None
+        milking_mask = None
+    milking_roi_missing_warned = False
 
     def video_timestamp(frame_idx):
         """Calculate actual video timestamp based on source frame index."""
@@ -929,38 +1035,71 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
         # Inference (Queue-based Pipeline)
         # -------------------------------
         # Non-blocking: push frame to GPU worker, continue processing
-        result = {}
-        done_event = threading.Event()
+        activity_result = {}
+        milking_result = {}
+        activity_done = threading.Event()
+        milking_done = threading.Event()
 
-        def set_detections(dets):
-            result["detections"] = dets
-            done_event.set()
+        def set_activity_detections(dets):
+            activity_result["detections"] = dets
+            activity_done.set()
 
-        if FRAME_QUEUE.full():
-            dropped = drop_oldest_frame_for_camera(camera_id)
-            if dropped:
-                logger.debug("[CAMERA %s] GPU queue full — dropped oldest frame for camera", camera_id)
-            else:
-                # No frame from this camera to evict; skip to avoid cross-camera starvation.
-                logger.debug("[CAMERA %s] GPU queue full — no evictable frame for camera", camera_id)
-                continue
+        def set_milking_detections(dets):
+            milking_result["detections"] = dets
+            milking_done.set()
 
-        try:
-            FRAME_QUEUE.put((camera_id, frame, set_detections), block=False)
-        except queue.Full:
-            # Drop frame if GPU overloaded (acceptable in real-time)
-            logger.debug("[CAMERA %s] GPU queue full — dropping frame", camera_id)
-            detections = []
-        else:
-            # Wait for inference result with proper blocking (no busy-wait)
-            if not done_event.wait(timeout=0.2):
+        def enqueue_inference(model_type, callback):
+            if FRAME_QUEUE.full():
+                dropped = drop_oldest_frame_for_camera(camera_id)
+                if dropped:
+                    logger.debug(
+                        "[CAMERA %s] GPU queue full — dropped oldest frame for camera",
+                        camera_id,
+                    )
+                else:
+                    logger.debug(
+                        "[CAMERA %s] GPU queue full — no evictable frame for camera",
+                        camera_id,
+                    )
+                    return False
+            try:
+                FRAME_QUEUE.put((camera_id, frame, model_type, callback), block=False)
+                return True
+            except queue.Full:
+                logger.debug("[CAMERA %s] GPU queue full — dropping frame", camera_id)
+                return False
+
+        activity_queued = enqueue_inference("ACTIVITY", set_activity_detections)
+        milking_queued = False
+        if use_milking_model:
+            milking_queued = enqueue_inference("MILKING", set_milking_detections)
+
+        if activity_queued:
+            if not activity_done.wait(timeout=0.4):
                 now_ts = time.time()
                 if now_ts - last_timeout_log > 10:
-                    logger.warning("[CAMERA %s] Inference timeout, skipping frame", camera_id)
+                    logger.warning("[CAMERA %s] Activity inference timeout, skipping frame", camera_id)
                     last_timeout_log = now_ts
-                detections = []
+                detections_activity = []
             else:
-                detections = result.get("detections", [])
+                detections_activity = activity_result.get("detections", [])
+        else:
+            detections_activity = []
+
+        if milking_queued:
+            if not milking_done.wait(timeout=0.4):
+                now_ts = time.time()
+                if now_ts - last_timeout_log > 10:
+                    logger.warning("[CAMERA %s] Milking inference timeout, skipping frame", camera_id)
+                    last_timeout_log = now_ts
+            else:
+                detections_milking_model = milking_result.get("detections", [])
+        else:
+            detections_milking_model = []
+
+        for det in detections_milking_model:
+            det["class"] = str(det.get("class", "")).lower()
+        detections = detections_activity + detections_milking_model
 
         # Apply ROI filtering if enabled and ROI polygons are configured
         frame_h, frame_w = frame.shape[:2]
@@ -976,6 +1115,24 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
             detections_feed = filter_by_roi(detections, feed_polygon, frame.shape, roi_mask=feed_mask)
         else:
             detections_feed = detections
+
+        if ROI_ENABLED and milking_polygon is not None:
+            detections_milking = filter_by_roi(
+                detections,
+                milking_polygon,
+                frame.shape,
+                roi_mask=milking_mask,
+            )
+        elif zone_milking and milking_polygon is None:
+            if not milking_roi_missing_warned:
+                logger.warning(
+                    "[CAMERA %s] MILKING zone exists but ROI missing — disabling milking",
+                    camera_id,
+                )
+                milking_roi_missing_warned = True
+            detections_milking = []
+        else:
+            detections_milking = detections
 
         frame_processing_time = time.time() - t0
         total_processing_time += frame_processing_time
@@ -1202,7 +1359,92 @@ def _process_camera_impl(camera, runner, person_classes, tool_classes, tmr_class
                         logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
                 state["last_frame_emit"] = now
 
-        # MILKING disabled - model doesn't support it yet
+        # ------------------------------------------------------------------
+        # MILKING - State Machine
+        # ------------------------------------------------------------------
+        has_cluster = any(
+            d["class"].lower() == "cluster_attached"
+            for d in detections_milking
+        )
+        has_udder = any(
+            d["class"].lower() == "cow_leg_udder"
+            for d in detections_milking
+        )
+        if has_cluster:
+            last_cluster_seen_ts = ts
+        cluster_recent = (
+            last_cluster_seen_ts is not None
+            and (ts - last_cluster_seen_ts) < CLUSTER_MEMORY_SEC
+        )
+        intersection_detected = detect_cluster_udder_intersection(detections_milking)
+        milking_detected = (
+            intersection_detected
+            or (has_udder and cluster_recent)
+        )
+        sig = smoothers["MILKING"].update(milking_detected, ts)
+        state = activity_state["MILKING"]
+
+        # START
+        if zone_milking and sig == "START" and state["state"] == "INACTIVE":
+            state["state"] = "ACTIVE"
+            state["session_id"] = str(uuid4())
+            state["last_frame_emit"] = 0.0
+            payload = build_event_payload(
+                "MILKING",
+                "START_CANDIDATE",
+                camera_id,
+                zone_milking,
+                detections_milking,
+                state["session_id"],
+            )
+            try:
+                if EVENT_QUEUE.full():
+                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                else:
+                    EVENT_QUEUE.put(payload, block=False)
+            except Exception as e:
+                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+
+        # END
+        elif zone_milking and sig == "END" and state["state"] == "ACTIVE":
+            payload = build_event_payload(
+                "MILKING",
+                "END_CANDIDATE",
+                camera_id,
+                zone_milking,
+                detections_milking,
+                state["session_id"],
+            )
+            try:
+                if EVENT_QUEUE.full():
+                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                else:
+                    EVENT_QUEUE.put(payload, block=False)
+            except Exception as e:
+                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+            state["state"] = "INACTIVE"
+            state["session_id"] = None
+            state["last_frame_emit"] = 0.0
+
+        # FRAME_AGGREGATE
+        elif state["state"] == "ACTIVE":
+            if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+                payload = build_event_payload(
+                    "MILKING",
+                    "FRAME_AGGREGATE",
+                    camera_id,
+                    zone_milking,
+                    detections_milking,
+                    state["session_id"],
+                )
+                try:
+                    if EVENT_QUEUE.full():
+                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                    else:
+                        EVENT_QUEUE.put(payload, block=False)
+                except Exception as e:
+                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+                state["last_frame_emit"] = now
 
     stream.release()
 
@@ -1326,22 +1568,51 @@ def main():
     model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
 
     # Create shared ModelRunner (once per device, NOT per camera)
-    shared_runner = ModelRunner(model_path, device=device)
-    logger.info("Model loaded once: %s", model_path)
+    activity_runner = ModelRunner(model_path, device=device)
+    logger.info("Activity model loaded: %s", model_path)
+
+    milking_model_relpath = os.getenv("MILKING_MODEL_PATH", "models/milking.engine")
+    milking_model_path = os.path.join(PROJECT_ROOT, milking_model_relpath)
+    milking_cameras = [
+        c for c in cfg.get("cameras", [])
+        if resolve_zone_id(c, "MILKING")
+    ]
+    milking_model_enabled = False
+    milking_runner = None
+    if milking_cameras:
+        if not os.path.exists(milking_model_path):
+            logger.warning(
+                "MILKING model not found at %s; MILKING inference disabled",
+                milking_model_path,
+            )
+        else:
+            milking_runner = ModelRunner(milking_model_path, device=device)
+            milking_model_enabled = True
+            logger.info("Milking model loaded: %s", milking_model_path)
 
     # Warmup TensorRT engine (avoids first-frame latency spike)
     logger.info("Warming up TensorRT engine...")
     dummy = np.zeros((512, 512, 3), dtype=np.uint8)
     for _ in range(5):
         try:
-            shared_runner.infer([dummy, dummy])
+            activity_runner.infer([dummy, dummy])
         except:
             pass
+    if milking_model_enabled and milking_runner is not None:
+        for _ in range(3):
+            try:
+                milking_runner.infer([dummy, dummy])
+            except:
+                pass
     logger.info("TensorRT engine warmed up")
 
-    # Start dedicated GPU inference worker (removes INFER_LOCK bottleneck)
-    Thread(target=inference_worker, args=(shared_runner,), daemon=True).start()
-    logger.info("Started GPU inference worker (queue-based pipeline)")
+    # Start dedicated single GPU inference worker with multi-model routing
+    Thread(
+        target=inference_worker,
+        args=(activity_runner, milking_runner),
+        daemon=True,
+    ).start()
+    logger.info("Started GPU inference worker (multi-model queue routing)")
     logger.info("Tip: For dairy cameras, consider imgsz=512 (30-40 percent faster than 640)")
     logger.info("To enable: edit backend/runtime/model_loader.py, change 'imgsz': 416 to 512")
 
@@ -1386,12 +1657,12 @@ def main():
             target=camera_supervisor,
             args=(
                 camera,
-                shared_runner,
                 person_classes,
                 tool_classes,
                 tmr_classes,
                 tractor_classes,
                 max_dist,
+                milking_model_enabled,
             ),
             daemon=False,
         )

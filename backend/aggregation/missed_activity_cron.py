@@ -31,6 +31,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from common.db import get_cursor
 from common.time_utils import utc_now
+from aggregation.activity_schedule_resolver import resolve as resolve_completed_activities
 
 
 # -------------------------------------------------
@@ -134,25 +135,66 @@ def detect_missed_activities():
             activity_date = local_now.date()
     
             # -------------------------------------------------
-            # Compute cutoff time (LOCAL → UTC)
+            # Compute late wait boundary from IDEAL START (LOCAL → UTC)
             # -------------------------------------------------
-            ideal_end_naive = datetime.combine(
+            ideal_start_naive = datetime.combine(
                 activity_date,
-                s["ideal_end_time"],
+                s["ideal_start_time"],
             )
-            ideal_end_local = farm_tz.localize(ideal_end_naive)
+            ideal_start_local = farm_tz.localize(ideal_start_naive)
             
             # Cross-midnight handling
             if s["ideal_end_time"] < s["ideal_start_time"]:
-                ideal_end_local += timedelta(days=1)
+                ideal_start_local -= timedelta(days=1)
             
-            late_cutoff_local = ideal_end_local + timedelta(
+            late_cutoff_local = ideal_start_local + timedelta(
                 minutes=s["tolerance_late_min"]
             )
             late_cutoff_utc = late_cutoff_local.astimezone(timezone.utc)
     
-            # If window still open → skip
+            # Wait until ideal_start + late_tolerance before marking MISSED.
             if now_utc <= late_cutoff_utc:
+                continue
+
+            # If raw detections exist for this local activity date, do not mark MISSED.
+            # This prevents false MISSED rows during temporary STEP-4 downtime/recovery.
+            cur.execute(
+                """
+                SELECT 1
+                FROM activity_detection_event e
+                WHERE e.farm_id = %s
+                  AND e.activity_type_id = %s
+                  AND e.zone_id IS NOT NULL
+                  AND (e.event_time AT TIME ZONE %s)::date = %s
+                LIMIT 1
+                """,
+                (
+                    farm_id,
+                    activity_type_id,
+                    s["timezone"],
+                    activity_date,
+                ),
+            )
+            if cur.fetchone():
+                continue
+
+            # If any instance already exists for this schedule/day, do not create MISSED.
+            cur.execute(
+                """
+                SELECT 1
+                FROM activity_instance ai
+                WHERE ai.farm_id = %s
+                  AND ai.activity_schedule_id = %s
+                  AND ai.activity_date = %s
+                LIMIT 1
+                """,
+                (
+                    farm_id,
+                    schedule_id,
+                    activity_date,
+                ),
+            )
+            if cur.fetchone():
                 continue
     
             # -------------------------------------------------
@@ -195,5 +237,6 @@ def detect_missed_activities():
 # RUNNER
 # -------------------------------------------------
 if __name__ == "__main__":
-    # finalize_completed_activities()
+    # If invoked directly, run STEP-5A before STEP-5B.
+    resolve_completed_activities()
     detect_missed_activities()

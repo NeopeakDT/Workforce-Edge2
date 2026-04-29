@@ -64,7 +64,7 @@ from datetime import datetime
 # -------- CONFIG --------
 # SOURCE = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/rahuri_video-7.mp4"
 # SOURCE = "jetson/roi_selection/GRP-1-front-right-2.png"
-SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1702"
+SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2002"
 # OUTPUT_FILE where coordinates will be saved (absolute, cwd-independent)
 OUTPUT_FILE = Path(__file__).resolve().parent / "rtsp_roi_coordinates.txt"
 # ------------------------

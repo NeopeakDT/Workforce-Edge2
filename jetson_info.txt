@@ -882,6 +882,13 @@ sudo systemctl restart workforce-phase5.timer
 sudo systemctl restart workforce-heartbeat
 sudo systemctl restart workforce-watchdog
 
+journalctl -u workforce-backend -f
+journalctl -u workforce-edge -f
+journalctl -u workforce-aggregator -f
+journalctl -u workforce-phase5.service -f
+journalctl -u workforce-heartbeat -f
+journalctl -u workforce-watchdog -f
+
 - To stop the system -
 
 sudo systemctl stop workforce-backend
