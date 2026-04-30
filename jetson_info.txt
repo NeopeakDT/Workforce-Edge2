@@ -879,6 +879,7 @@ sudo systemctl restart workforce-backend
 sudo systemctl restart workforce-edge
 sudo systemctl restart workforce-aggregator
 sudo systemctl restart workforce-phase5.timer
+sudo systemctl restart workforce-phase5.service
 sudo systemctl restart workforce-heartbeat
 sudo systemctl restart workforce-watchdog
 
@@ -895,6 +896,7 @@ sudo systemctl stop workforce-backend
 sudo systemctl stop workforce-edge
 sudo systemctl stop workforce-aggregator
 sudo systemctl stop workforce-phase5.timer
+sudo systemctl stop workforce-phase5.service
 sudo systemctl stop workforce-heartbeat
 sudo systemctl stop workforce-watchdog
 

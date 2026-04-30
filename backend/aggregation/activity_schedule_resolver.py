@@ -33,9 +33,12 @@ from common.time_utils import utc_now
 # CONFIG
 # --------------------------------------------------
 
-MAX_ACTIVITY_DURATION_SEC = 90 * 60   # 1.5 hr for scrapping
-MIN_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MIN_ACTIVITY_DURATION_SEC", "300"))
+MAX_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(90 * 60)))
+MIN_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MIN_ACTIVITY_DURATION_SEC", "60"))
 ON_TIME_BUFFER_MIN = int(os.getenv("AGG_ON_TIME_BUFFER_MIN", "10"))
+STABLE_END_DELAY_SEC = int(
+    os.getenv("AGG_STABLE_END_DELAY_SEC", os.getenv("AGG_CLOSE_DELAY_SEC", "60"))
+)
 
 
 def ideal_window_utc_bounds(farm_tz, activity_date, ideal_start_time, ideal_end_time):
@@ -67,7 +70,7 @@ def is_actual_start_within_ideal_window(actual_start_utc, ideal_start_utc, ideal
 
 def resolve():
     now_utc = utc_now()
-    stable_end_cutoff_utc = now_utc - timedelta(seconds=30)
+    stable_end_cutoff_utc = now_utc - timedelta(seconds=STABLE_END_DELAY_SEC)
 
     with get_cursor() as cur:
         # --------------------------------------------------
@@ -83,6 +86,7 @@ def resolve():
                 ai.farm_id,
                 ai.activity_type_id,
                 ai.activity_schedule_id,
+                ai.status,
                 ai.actual_start_at,
                 ai.actual_end_at,
                 ai.activity_date,
@@ -103,6 +107,9 @@ def resolve():
         instances = cur.fetchall()
 
         for ai in instances:
+            # Guard: NOISE rows must never be schedule-resolved.
+            if ai["status"] == "NOISE":
+                continue
 
             # --------------------------------------------------
             # Duration sanity check

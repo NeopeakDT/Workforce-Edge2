@@ -156,29 +156,7 @@ def detect_missed_activities():
             if now_utc <= late_cutoff_utc:
                 continue
 
-            # If raw detections exist for this local activity date, do not mark MISSED.
-            # This prevents false MISSED rows during temporary STEP-4 downtime/recovery.
-            cur.execute(
-                """
-                SELECT 1
-                FROM activity_detection_event e
-                WHERE e.farm_id = %s
-                  AND e.activity_type_id = %s
-                  AND e.zone_id IS NOT NULL
-                  AND (e.event_time AT TIME ZONE %s)::date = %s
-                LIMIT 1
-                """,
-                (
-                    farm_id,
-                    activity_type_id,
-                    s["timezone"],
-                    activity_date,
-                ),
-            )
-            if cur.fetchone():
-                continue
-
-            # If any instance already exists for this schedule/day, do not create MISSED.
+            # Create MISSED only when no AI-detected instance exists for this schedule/day.
             cur.execute(
                 """
                 SELECT 1
@@ -186,6 +164,7 @@ def detect_missed_activities():
                 WHERE ai.farm_id = %s
                   AND ai.activity_schedule_id = %s
                   AND ai.activity_date = %s
+                  AND ai.source = 'AI'
                 LIMIT 1
                 """,
                 (

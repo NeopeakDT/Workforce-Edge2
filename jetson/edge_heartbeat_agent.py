@@ -56,8 +56,8 @@ assert API_BASE.endswith("/api/v1"), (
 
 HEADERS = {"X-DEVICE-KEY": DEVICE_KEY}
 
-# Interval (seconds)
-INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "120"))
+# Interval (seconds) - default 5 minutes
+INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "300"))
 
 # ------------------------------------------------------------------
 # TELEMETRY COLLECTION

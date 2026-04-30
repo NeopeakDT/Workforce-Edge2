@@ -25,8 +25,9 @@ Critical rules:
 - `session_id` is used for correctness tracking (session -> instance mapping).
 - `schedule_id` is used for merge boundaries (same schedule window -> same instance).
 - `FRAME_AGGREGATE` and `END_CANDIDATE` normally attach to an existing instance.
-  If START is missing, a synthetic IN_PROGRESS instance is created.
-- END uses MAX logic: `actual_end_at = max(existing_end, event_time)`.
+  If START is missing, events are skipped (and optionally marked merge-processed).
+- END_CANDIDATE refreshes `last_seen_at` only; `cleanup_stale_instances` closes after `CLOSE_DELAY_SEC`
+  and then applies duration rules (including NOISE when finally shorter than `MIN_ACTIVITY_DURATION_SEC`).
 - START merge uses MIN logic: `actual_start_at = min(existing_start, event_time)`.
 """
 
@@ -57,13 +58,20 @@ MERGE_GAP_MINUTES = {
     3: 10,  # SCRAPPING
 }
 
-MAX_DURATION_SEC = 90 * 60
+MAX_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(90 * 60)))
 MIN_VALID_DURATION_SEC = int(os.getenv("AGG_MIN_VALID_DURATION_SEC", "60"))
-NOISE_DURATION_SEC = int(os.getenv("AGG_NOISE_DURATION_SEC", "300"))
-START_CONFIRMATION_WINDOW_SEC = int(os.getenv("AGG_START_CONFIRMATION_WINDOW_SEC", "10"))
-MIN_START_EVENTS = int(os.getenv("AGG_MIN_START_EVENTS", "15"))
-UNCLEAR_STALE_SEC = int(os.getenv("AGG_UNCLEAR_STALE_SEC", "600"))
+MIN_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MIN_ACTIVITY_DURATION_SEC", "60"))
+NOISE_DURATION_SEC = int(
+    os.getenv("AGG_NOISE_DURATION_SEC", str(MIN_ACTIVITY_DURATION_SEC))
+)
+START_CONFIRMATION_WINDOW_SEC = int(os.getenv("AGG_START_CONFIRMATION_WINDOW_SEC", "3"))
+MIN_START_EVENTS = int(os.getenv("AGG_MIN_START_EVENTS", "3"))
+UNCLEAR_STALE_SEC = int(os.getenv("AGG_UNCLEAR_STALE_SEC", "1800"))
 MAX_EVENT_DELAY_SEC = int(os.getenv("AGG_MAX_EVENT_DELAY_SEC", "300"))
+SCHEDULE_BIND_GRACE_SEC = int(os.getenv("AGG_SCHEDULE_BIND_GRACE_SEC", "40"))
+UNSCHEDULED_CREATE_DELAY_SEC = int(os.getenv("AGG_UNSCHEDULED_CREATE_DELAY_SEC", "60"))
+STALE_START_SESSION_EVENT_MIN = int(os.getenv("AGG_STALE_START_SESSION_EVENT_MIN", "3"))
+SOFT_DEDUPE_WINDOW_SEC = int(os.getenv("AGG_SOFT_DEDUPE_WINDOW_SEC", "30"))
 
 _NOISE_COLUMN_WARNED = False
 
@@ -229,15 +237,31 @@ def bulk_link_events(cur, event_links):
     )
 
 
+def mark_event_skipped(cur, event_row_id, event_columns):
+    if "merge_processed" not in event_columns:
+        return
+    cur.execute(
+        """
+        UPDATE activity_detection_event
+        SET merge_processed = TRUE
+        WHERE id = %s
+        """,
+        (event_row_id,),
+    )
+
+
 # Timeout-driven closure control. END_CANDIDATE does not close sessions immediately.
 # Sessions are closed only when inactivity exceeds CLOSE_DELAY_SEC.
+END_CONFIRMATION_WINDOW_SEC = int(
+    os.getenv("AGG_END_CONFIRMATION_WINDOW_SEC", "20")
+)
 CLOSE_DELAY_SEC = int(
     os.getenv(
         "AGG_CLOSE_DELAY_SEC",
-        os.getenv("AGG_END_GAP_SEC", "300"),
+        os.getenv("AGG_END_GAP_SEC", "60"),
     )
 )
-REOPEN_WINDOW_SEC = int(os.getenv("AGG_REOPEN_WINDOW_SEC", "300"))
+REOPEN_WINDOW_SEC = int(os.getenv("AGG_REOPEN_WINDOW_SEC", "180"))
 
 
 def load_activity_instance_columns(cur):
@@ -252,9 +276,21 @@ def load_activity_instance_columns(cur):
     return {row["column_name"] for row in cur.fetchall()}
 
 
+def load_event_columns(cur):
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'activity_detection_event'
+        """
+    )
+    return {row["column_name"] for row in cur.fetchall()}
+
+
 def mark_noise_if_short(cur, instance_id, duration_sec, ai_columns):
     global _NOISE_COLUMN_WARNED
-    if duration_sec >= NOISE_DURATION_SEC:
+    if duration_sec >= MIN_ACTIVITY_DURATION_SEC:
         return
 
     assignments = []
@@ -262,6 +298,9 @@ def mark_noise_if_short(cur, instance_id, duration_sec, ai_columns):
 
     if "instance_type" in ai_columns:
         assignments.append("instance_type = 'NOISE'")
+    if "activity_schedule_id" in ai_columns:
+        # Keep DB invariant: NOISE rows must not have schedule_id.
+        assignments.append("activity_schedule_id = NULL")
     if "status" in ai_columns:
         assignments.append("status = 'NOISE'")
     if "is_valid" in ai_columns:
@@ -391,12 +430,15 @@ def cleanup_stale_instances(cur, ai_columns):
             continue
 
         # Duration classification must run before lifecycle close status.
-        if duration < NOISE_DURATION_SEC:
+        if duration < MIN_ACTIVITY_DURATION_SEC:
             cur.execute(
                 """
                 UPDATE activity_instance
                 SET actual_end_at = %s,
                     actual_duration_sec = %s,
+                    status = 'NOISE',
+                    instance_type = 'NOISE',
+                    activity_schedule_id = NULL,
                     updated_at = %s
                 WHERE id = %s
                 """,
@@ -521,6 +563,7 @@ def run(max_loops=None):
     # This ensures END events attach to the correct instance
     session_map = {}
     ai_columns = None
+    event_columns = None
 
     while True:
         if max_loops and loops >= max_loops:
@@ -539,36 +582,69 @@ def run(max_loops=None):
         with get_cursor() as cur:
             if ai_columns is None:
                 ai_columns = load_activity_instance_columns(cur)
+            if event_columns is None:
+                event_columns = load_event_columns(cur)
 
             if loops % PENDING_LOG_EVERY_LOOPS == 0:
-                cur.execute(
-                    """
-                    SELECT count(*) AS pending
-                    FROM activity_detection_event
-                    WHERE activity_instance_id IS NULL
-                    """
-                )
+                if "merge_processed" in event_columns:
+                    cur.execute(
+                        """
+                        SELECT count(*) AS pending
+                        FROM activity_detection_event
+                        WHERE activity_instance_id IS NULL
+                          AND COALESCE(merge_processed, FALSE) = FALSE
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT count(*) AS pending
+                        FROM activity_detection_event
+                        WHERE activity_instance_id IS NULL
+                        """
+                    )
                 pending = cur.fetchone()["pending"]
                 print(f"[AGGREGATOR] Pending events: {pending}")
 
-            cur.execute(
-                """
-                SELECT
-                    e.id AS event_row_id,
-                    e.event_type,
-                    e.event_time,
-                    e.farm_id,
-                    e.camera_id,
-                    e.activity_type_id,
-                    e.session_id,
-                    e.zone_id
-                FROM activity_detection_event e
-                WHERE e.activity_instance_id IS NULL
-                ORDER BY event_time, e.id
-                LIMIT %s
-                """,
-                (BATCH_SIZE,),
-            )
+            if "merge_processed" in event_columns:
+                cur.execute(
+                    """
+                    SELECT
+                        e.id AS event_row_id,
+                        e.event_type,
+                        e.event_time,
+                        e.farm_id,
+                        e.camera_id,
+                        e.activity_type_id,
+                        e.session_id,
+                        e.zone_id
+                    FROM activity_detection_event e
+                    WHERE e.activity_instance_id IS NULL
+                      AND COALESCE(e.merge_processed, FALSE) = FALSE
+                    ORDER BY event_time, e.id
+                    LIMIT %s
+                    """,
+                    (BATCH_SIZE,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        e.id AS event_row_id,
+                        e.event_type,
+                        e.event_time,
+                        e.farm_id,
+                        e.camera_id,
+                        e.activity_type_id,
+                        e.session_id,
+                        e.zone_id
+                    FROM activity_detection_event e
+                    WHERE e.activity_instance_id IS NULL
+                    ORDER BY event_time, e.id
+                    LIMIT %s
+                    """,
+                    (BATCH_SIZE,),
+                )
 
             events = cur.fetchall()
 
@@ -616,7 +692,7 @@ def run(max_loops=None):
 
                     zone_id = e["zone_id"] or zone_cache[farm_id].get(zone_key[1:])
                     if not zone_id:
-                        print(f"[WARN] No zone mapping → retry later {e['event_row_id']}")
+                        print(f"[WARN] No zone mapping → skip event {e['event_row_id']}")
                         continue
 
                     # --------------------------------------------------
@@ -691,6 +767,10 @@ def run(max_loops=None):
                     if etype == "START_CANDIDATE":
                         instance_id = None
                         event_age_sec = (utc_now() - event_time).total_seconds()
+                        print(
+                            f"[START_DEBUG] session={session_id} "
+                            f"schedule={schedule_id} zone={zone_id} time={event_time}"
+                        )
 
                         # STEP 0: DUPLICATE PROTECTION
                         # If this session already started, skip duplicate START
@@ -701,64 +781,74 @@ def run(max_loops=None):
                             event_links.append((e["event_row_id"], existing_instance_id))
                             continue
 
-                        if not has_stable_start_signal(cur, session_id, event_time):
+                        stable_start = has_stable_start_signal(cur, session_id, event_time)
+                        if not stable_start:
                             print(
-                                f"[DEBUG] START deferred (unstable) session={session_id} "
+                                f"[WARN] Weak START → proceeding anyway session={session_id} "
                                 f"window={START_CONFIRMATION_WINDOW_SEC}s min_events={MIN_START_EVENTS}"
                             )
-                            # Keep event unlinked; it will be retried next loop.
-                            continue
-
-                        max_gap_sec = REOPEN_WINDOW_SEC
 
                         # STEP 1: Look for active instance in same bucket
                         active = None
                         cur.execute(
                             """
-                            SELECT id, last_seen_at
+                            SELECT id, last_seen_at, actual_start_at, instance_type
                             FROM activity_instance
                             WHERE farm_id = %s
-                              AND zone_id = %s
+                              AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
                               AND activity_type_id = %s
-                              AND (
-                                    activity_schedule_id = %s
-                                    OR (activity_schedule_id IS NULL AND %s IS NULL)
-                              )
                               AND status = 'IN_PROGRESS'
                               AND actual_end_at IS NULL
                             ORDER BY actual_start_at DESC
                             LIMIT 1
                             """,
-                            (farm_id, zone_id, activity_type_id, schedule_id, schedule_id),
+                            (farm_id, zone_id, zone_id, activity_type_id),
                         )
                         active = cur.fetchone()
 
                         if active:
                             last_seen_at = active["last_seen_at"]
-                            if last_seen_at is None:
+                            active_start_at = active["actual_start_at"]
+                            active_duration_sec = None
+                            if active_start_at is not None:
+                                active_duration_sec = int((event_time - active_start_at).total_seconds())
+                            if active_duration_sec is not None and active_duration_sec > MAX_DURATION_SEC:
+                                close_at = last_seen_at or event_time
+                                status_on_close = (
+                                    "ENDED"
+                                    if (active.get("instance_type") == "SCHEDULED")
+                                    else "UNSCHEDULED"
+                                )
+                                cur.execute(
+                                    """
+                                    UPDATE activity_instance
+                                    SET actual_end_at = %s,
+                                        actual_duration_sec = %s,
+                                        status = %s,
+                                        updated_at = %s
+                                    WHERE id = %s
+                                    """,
+                                    (
+                                        close_at,
+                                        max(0, int((close_at - active_start_at).total_seconds())),
+                                        status_on_close,
+                                        utc_now(),
+                                        active["id"],
+                                    ),
+                                )
+                                print(
+                                    f"[DEBUG] Force-closed runaway active instance {active['id']} "
+                                    f"duration={active_duration_sec}s cap={MAX_DURATION_SEC}s"
+                                )
+                                active = None
+                            elif last_seen_at is None:
                                 print("[DEBUG] GAP BREAK → active instance has no last_seen_at")
                                 active = None
                             else:
                                 gap_sec = (event_time - last_seen_at).total_seconds()
-                                if gap_sec <= max_gap_sec:
+                                if gap_sec <= REOPEN_WINDOW_SEC:
                                     instance_id = active["id"]
                                     print(f"[DEBUG] Found active instance → instance_id={instance_id}")
-                                elif gap_sec <= REOPEN_WINDOW_SEC:
-                                    # Reopen same active session for short pauses/flicker gaps.
-                                    instance_id = active["id"]
-                                    cur.execute(
-                                        """
-                                        UPDATE activity_instance
-                                        SET last_seen_at = %s,
-                                            updated_at = %s
-                                        WHERE id = %s
-                                        """,
-                                        (event_time, utc_now(), instance_id),
-                                    )
-                                    print(
-                                        f"[DEBUG] REOPENED active session → instance_id={instance_id} "
-                                        f"(gap_sec={gap_sec:.1f}, reopen_limit={REOPEN_WINDOW_SEC})"
-                                    )
                                 else:
                                     print(
                                         f"[DEBUG] HARD GAP BREAK → new instance "
@@ -767,58 +857,81 @@ def run(max_loops=None):
                                     active = None
 
                         if not active:
-                            # STEP 2: Check for merge window (recent ended in same bucket)
-                            gap = timedelta(seconds=REOPEN_WINDOW_SEC)
-
-                            if schedule_id is None:
-                                cur.execute(
-                                    """
-                                    SELECT id, actual_end_at, actual_start_at
-                                    FROM activity_instance
-                                    WHERE farm_id = %s
-                                      AND zone_id = %s
-                                      AND activity_type_id = %s
-                                      AND activity_schedule_id IS NULL
-                                      AND actual_end_at IS NOT NULL
-                                      AND status = 'IN_PROGRESS'
-                                    ORDER BY actual_end_at DESC
-                                    LIMIT 1
-                                    """,
-                                    (farm_id, zone_id, activity_type_id),
-                                )
-                            else:
-                                cur.execute(
-                                    """
-                                    SELECT id, actual_end_at, actual_start_at
-                                    FROM activity_instance
-                                    WHERE farm_id = %s
-                                      AND zone_id = %s
-                                      AND activity_type_id = %s
-                                      AND activity_schedule_id = %s
-                                      AND actual_end_at IS NOT NULL
-                                      AND status = 'IN_PROGRESS'
-                                    ORDER BY actual_end_at DESC
-                                    LIMIT 1
-                                    """,
-                                    (farm_id, zone_id, activity_type_id, schedule_id),
-                                )
+                            # STEP 2: Re-open a recently closed row in the same bucket so fragmented
+                            # sessions (new session_id / premature END) stitch into one instance.
+                            # Previous bug: queried status = IN_PROGRESS AND actual_end_at IS NOT NULL,
+                            # which violates lifecycle constraints and matched zero rows.
+                            cur.execute(
+                                """
+                                SELECT id, actual_end_at, actual_start_at,
+                                       activity_schedule_id, status
+                                FROM activity_instance
+                                WHERE farm_id = %s
+                                  AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
+                                  AND activity_type_id = %s
+                                  AND activity_date = %s
+                                  AND actual_end_at IS NOT NULL
+                                  AND status <> 'MISSED'
+                                  AND status <> 'IN_PROGRESS'
+                                ORDER BY actual_end_at DESC
+                                LIMIT 1
+                                """,
+                                (
+                                    farm_id,
+                                    zone_id,
+                                    zone_id,
+                                    activity_type_id,
+                                    activity_date,
+                                ),
+                            )
                             prev = cur.fetchone()
 
-                            if prev and event_time - prev["actual_end_at"] <= gap:
-                                # MERGE without reopening.
-                                instance_id = prev["id"]
+                            if prev:
+                                gap_sec = (event_time - prev["actual_end_at"]).total_seconds()
+                                if gap_sec <= REOPEN_WINDOW_SEC:
+                                    instance_id = prev["id"]
+                                else:
+                                    prev = None
+                            if prev:
+                                merged_schedule_id = prev["activity_schedule_id"] or schedule_id
+                                merged_type = (
+                                    "SCHEDULED"
+                                    if merged_schedule_id is not None
+                                    else "UNSCHEDULED"
+                                )
 
                                 cur.execute(
                                     """
                                     UPDATE activity_instance
                                     SET actual_start_at = LEAST(actual_start_at, %s),
                                         last_seen_at = %s,
+                                        actual_end_at = NULL,
+                                        actual_duration_sec = NULL,
+                                        started_offset_min = NULL,
+                                        ended_offset_min = NULL,
+                                        status = 'IN_PROGRESS',
+                                        activity_schedule_id = %s,
+                                        instance_type = %s,
+                                        session_id = %s,
+                                        zone_id = COALESCE(zone_id, %s),
                                         updated_at = %s
                                     WHERE id = %s
                                     """,
-                                    (event_time, event_time, utc_now(), instance_id),
+                                    (
+                                        event_time,
+                                        event_time,
+                                        merged_schedule_id,
+                                        merged_type,
+                                        session_id,
+                                        zone_id,
+                                        utc_now(),
+                                        instance_id,
+                                    ),
                                 )
-                                print(f"[DEBUG] MERGED-ON-START → instance_id={instance_id} (no reopen)")
+                                print(
+                                    f"[DEBUG] MERGED-ON-START (reopened) → instance_id={instance_id} "
+                                    f"prev_status={prev['status']}"
+                                )
                             else:
                                 # STEP 3: CREATE new instance
                                 if event_age_sec > MAX_EVENT_DELAY_SEC:
@@ -827,36 +940,52 @@ def run(max_loops=None):
                                         f"(age_sec={int(event_age_sec)}): {event_time}"
                                     )
 
+                                # Do not blindly reuse latest row here.
+                                # Reuse is only allowed via active attach, gap-based merge,
+                                # or soft dedupe guard below.
+
+                                # Soft dedupe across session_id churn/restarts.
                                 cur.execute(
                                     """
-                                    SELECT id, status, actual_end_at
+                                    SELECT id
                                     FROM activity_instance
                                     WHERE farm_id = %s
-                                      AND zone_id = %s
+                                      AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
                                       AND activity_type_id = %s
                                       AND activity_date = %s
-                                      AND (
-                                            activity_schedule_id = %s
-                                            OR (activity_schedule_id IS NULL AND %s IS NULL)
-                                      )
+                                      AND status = 'IN_PROGRESS'
+                                      AND actual_end_at IS NULL
+                                      AND actual_start_at IS NOT NULL
+                                      AND ABS(EXTRACT(EPOCH FROM (actual_start_at - %s))) <= %s
                                     ORDER BY updated_at DESC
                                     LIMIT 1
                                     """,
                                     (
                                         farm_id,
                                         zone_id,
+                                        zone_id,
                                         activity_type_id,
                                         activity_date,
-                                        schedule_id,
-                                        schedule_id,
+                                        event_time,
+                                        SOFT_DEDUPE_WINDOW_SEC,
                                     ),
                                 )
-                                existing = cur.fetchone()
-                                if existing:
-                                    instance_id = existing["id"]
+                                soft_dupe = cur.fetchone()
+                                if soft_dupe:
+                                    instance_id = soft_dupe["id"]
+                                    cur.execute(
+                                        """
+                                        UPDATE activity_instance
+                                        SET last_seen_at = %s,
+                                            session_id = %s,
+                                            updated_at = %s
+                                        WHERE id = %s
+                                        """,
+                                        (event_time, session_id, utc_now(), instance_id),
+                                    )
                                     session_map[session_id] = (instance_id, time.time())
                                     print(
-                                        f"[DEBUG] Duplicate guard reused existing instance "
+                                        f"[DEBUG] Soft-dedupe reused active instance "
                                         f"→ instance_id={instance_id}"
                                     )
                                     event_links.append((e["event_row_id"], instance_id))
@@ -1005,105 +1134,66 @@ def run(max_loops=None):
                                     existing_status = existing["status"]
 
                                     if existing_status != "IN_PROGRESS":
-                                        if existing_status == "MISSED":
-                                            # Reuse MISSED row in-place; never delete during aggregation.
-                                            print("[DEBUG] Reusing MISSED row as active AI instance")
+                                        # Finalized rows (including MISSED) are terminal.
+                                        # Never reopen in-place; create a fresh AI row.
+                                        cur.execute("SAVEPOINT ai_fresh_insert_sp")
+                                        try:
                                             cur.execute(
                                                 """
-                                                UPDATE activity_instance
-                                                SET zone_id = %s,
-                                                    session_id = COALESCE(session_id, %s),
-                                                    instance_type = %s,
-                                                    status = 'IN_PROGRESS',
-                                                    source = 'AI',
-                                                    actual_start_at = LEAST(COALESCE(actual_start_at, %s), %s),
-                                                    actual_end_at = NULL,
-                                                    actual_duration_sec = NULL,
-                                                    last_seen_at = GREATEST(COALESCE(last_seen_at, %s), %s),
-                                                    within_ideal_window = %s,
-                                                    started_offset_min = NULL,
-                                                    ended_offset_min = NULL,
-                                                    updated_at = %s
-                                                WHERE id = %s
+                                                INSERT INTO activity_instance (
+                                                    farm_id,
+                                                    zone_id,
+                                                    activity_type_id,
+                                                    activity_schedule_id,
+                                                    activity_date,
+                                                    session_id,
+                                                    instance_type,
+                                                    status,
+                                                    actual_start_at,
+                                                    last_seen_at,
+                                                    source,
+                                                    within_ideal_window,
+                                                    created_at,
+                                                    updated_at
+                                                )
+                                                VALUES (%s,%s,%s,%s,%s,
+                                                        %s,%s,
+                                                        'IN_PROGRESS',
+                                                        %s,%s,
+                                                        'AI',
+                                                        %s,
+                                                        %s,%s)
+                                                RETURNING id
                                                 """,
                                                 (
+                                                    farm_id,
                                                     zone_id,
+                                                    activity_type_id,
+                                                    schedule_id,
+                                                    activity_date,
                                                     session_id,
                                                     instance_type,
                                                     event_time,
                                                     event_time,
-                                                    event_time,
-                                                    event_time,
                                                     within_ideal_window,
                                                     utc_now(),
-                                                    instance_id,
+                                                    utc_now(),
                                                 ),
                                             )
+                                            instance_id = cur.fetchone()["id"]
+                                            cur.execute("RELEASE SAVEPOINT ai_fresh_insert_sp")
                                             print(
-                                                f"[DEBUG] REUSED-MISSED as IN_PROGRESS "
+                                                f"[DEBUG] CREATED-NEW after finalized-row conflict "
                                                 f"→ instance_id={instance_id}"
                                             )
-                                        else:
-                                            # COMPLETED (and other finalized) rows are terminal.
-                                            # Never reopen; attempt a fresh insert instead.
-                                            cur.execute("SAVEPOINT ai_fresh_insert_sp")
-                                            try:
-                                                cur.execute(
-                                                    """
-                                                    INSERT INTO activity_instance (
-                                                        farm_id,
-                                                        zone_id,
-                                                        activity_type_id,
-                                                        activity_schedule_id,
-                                                        activity_date,
-                                                        session_id,
-                                                        instance_type,
-                                                        status,
-                                                        actual_start_at,
-                                                        last_seen_at,
-                                                        source,
-                                                        within_ideal_window,
-                                                        created_at,
-                                                        updated_at
-                                                    )
-                                                    VALUES (%s,%s,%s,%s,%s,
-                                                            %s,%s,
-                                                            'IN_PROGRESS',
-                                                            %s,%s,
-                                                            'AI',
-                                                            %s,
-                                                            %s,%s)
-                                                    RETURNING id
-                                                    """,
-                                                    (
-                                                        farm_id,
-                                                        zone_id,
-                                                        activity_type_id,
-                                                        schedule_id,
-                                                        activity_date,
-                                                        session_id,
-                                                        instance_type,
-                                                        event_time,
-                                                        event_time,
-                                                        within_ideal_window,
-                                                        utc_now(),
-                                                        utc_now(),
-                                                    ),
-                                                )
-                                                instance_id = cur.fetchone()["id"]
-                                                cur.execute("RELEASE SAVEPOINT ai_fresh_insert_sp")
-                                                print(
-                                                    f"[DEBUG] CREATED-NEW after finalized-row conflict "
-                                                    f"→ instance_id={instance_id}"
-                                                )
-                                            except pg_errors.UniqueViolation:
-                                                cur.execute("ROLLBACK TO SAVEPOINT ai_fresh_insert_sp")
-                                                cur.execute("RELEASE SAVEPOINT ai_fresh_insert_sp")
-                                                print(
-                                                    f"[WARN] Finalized row conflict prevented fresh insert "
-                                                    f"→ retry later {e['event_row_id']}"
-                                                )
-                                                continue
+                                        except pg_errors.UniqueViolation:
+                                            cur.execute("ROLLBACK TO SAVEPOINT ai_fresh_insert_sp")
+                                            cur.execute("RELEASE SAVEPOINT ai_fresh_insert_sp")
+                                            print(
+                                                f"[WARN] Finalized row conflict prevented fresh insert "
+                                                f"→ retry later {e['event_row_id']}"
+                                            )
+                                            continue
                                     else:
                                         cur.execute(
                                             """
@@ -1141,9 +1231,40 @@ def run(max_loops=None):
                     # FRAME / END
                     # -------------------------------------------------
                     else:
-                        # For FRAME/END, look up instance via session_map (correctness layer)
+                        # Session-first attach for FRAME/END to prevent retry loops.
                         cache_row = session_map.get(session_id)
-                        instance_id = cache_row[0] if cache_row else None
+                        if cache_row:
+                            instance_id = cache_row[0]
+                            session_map[session_id] = (instance_id, time.time())
+                            if schedule_id is not None:
+                                cur.execute(
+                                    """
+                                    UPDATE activity_instance
+                                    SET last_seen_at = %s,
+                                        updated_at = %s,
+                                        activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                        instance_type = CASE
+                                            WHEN activity_schedule_id IS NULL THEN 'SCHEDULED'
+                                            ELSE instance_type
+                                        END
+                                    WHERE id = %s
+                                    """,
+                                    (event_time, utc_now(), schedule_id, instance_id),
+                                )
+                            else:
+                                cur.execute(
+                                    """
+                                    UPDATE activity_instance
+                                    SET last_seen_at = %s,
+                                        updated_at = %s
+                                    WHERE id = %s
+                                    """,
+                                    (event_time, utc_now(), instance_id),
+                                )
+                            event_links.append((e["event_row_id"], instance_id))
+                            continue
+
+                        instance_id = None
 
                         if instance_id is None:
                             # 🔥 CRITICAL FIX (ISSUE 3): DB Fallback for Restart Safety
@@ -1167,77 +1288,14 @@ def run(max_loops=None):
                                 session_map[session_id] = (instance_id, time.time())
                                 print(f"[DEBUG] Restored session map from DB: {session_id} → {instance_id}")
                             else:
-                                # START can be dropped under load/restarts; synthesize session start.
-                                event_age_sec = (utc_now() - event_time).total_seconds()
-                                if event_age_sec > MAX_EVENT_DELAY_SEC:
-                                    print(
-                                        f"[REPLAY] Processing delayed event "
-                                        f"(age_sec={int(event_age_sec)}): {event_time}"
-                                    )
-
-                                synthetic_schedule_id = schedule_id
-                                if synthetic_schedule_id is None:
-                                    s_key = (farm_id, activity_type_id)
-                                    schedules = schedule_cache.get(s_key)
-                                    if schedules is None:
-                                        cur.execute(
-                                            """
-                                            SELECT
-                                                id, ideal_start_time, ideal_end_time,
-                                                tolerance_early_min, tolerance_late_min
-                                            FROM activity_schedule
-                                            WHERE farm_id = %s
-                                              AND activity_type_id = %s
-                                              AND is_active = true
-                                            ORDER BY ideal_start_time
-                                            """,
-                                            (farm_id, activity_type_id),
-                                        )
-                                        schedules = cur.fetchall()
-                                        schedule_cache[s_key] = schedules
-                                    synthetic_schedule_id = resolve_schedule_from_rows(
-                                        schedules, event_time, farm_tz
-                                    )
-
-                                synthetic_activity_date = compute_activity_date(cur, farm_id, event_time)
-                                synthetic_within_ideal_window = False
-                                if synthetic_schedule_id is not None:
-                                    cur.execute(
-                                        """
-                                        SELECT
-                                            ideal_start_time,
-                                            ideal_end_time,
-                                            tolerance_early_min,
-                                            tolerance_late_min
-                                        FROM activity_schedule
-                                        WHERE id = %s
-                                        """,
-                                        (synthetic_schedule_id,),
-                                    )
-                                    srow = cur.fetchone()
-                                    if srow:
-                                        ideal_start_utc, ideal_end_utc = ideal_window_utc_bounds(
-                                            farm_tz,
-                                            synthetic_activity_date,
-                                            srow["ideal_start_time"],
-                                            srow["ideal_end_time"],
-                                        )
-                                        early_tol = srow["tolerance_early_min"] or 0
-                                        late_tol = srow["tolerance_late_min"] or 0
-                                        synthetic_within_ideal_window = (
-                                            ideal_start_utc - timedelta(minutes=early_tol)
-                                            <= event_time
-                                            <= ideal_end_utc + timedelta(minutes=late_tol)
-                                        )
-                                # Enforce one-active-instance-per-key rule before any synthetic insert.
-                                # NOTE: intentionally do not filter by schedule_id here, because
-                                # uniq_active_instance enforces uniqueness on the business key only.
+                                # Do not create synthetic instances from FRAME/END without a strong START.
+                                # Try business-key recovery first (handles session_id churn), otherwise skip.
                                 cur.execute(
                                     """
                                     SELECT id
                                     FROM activity_instance
                                     WHERE farm_id = %s
-                                      AND zone_id = %s
+                                      AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
                                       AND activity_type_id = %s
                                       AND activity_date = %s
                                       AND status = 'IN_PROGRESS'
@@ -1248,131 +1306,50 @@ def run(max_loops=None):
                                     (
                                         farm_id,
                                         zone_id,
+                                        zone_id,
                                         activity_type_id,
-                                        synthetic_activity_date,
+                                        activity_date,
                                     ),
                                 )
-                                existing_active = cur.fetchone()
-
-                                if existing_active:
-                                    instance_id = existing_active["id"]
-                                    cur.execute(
-                                        """
-                                        UPDATE activity_instance
-                                        SET last_seen_at = %s,
-                                            updated_at = %s
-                                        WHERE id = %s
-                                        """,
-                                        (event_time, utc_now(), instance_id),
-                                    )
+                                by_key = cur.fetchone()
+                                if by_key:
+                                    instance_id = by_key["id"]
+                                    if schedule_id is not None:
+                                        cur.execute(
+                                            """
+                                            UPDATE activity_instance
+                                            SET last_seen_at = %s,
+                                                updated_at = %s,
+                                                activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                                instance_type = CASE
+                                                    WHEN activity_schedule_id IS NULL THEN 'SCHEDULED'
+                                                    ELSE instance_type
+                                                END
+                                            WHERE id = %s
+                                            """,
+                                            (event_time, utc_now(), schedule_id, instance_id),
+                                        )
+                                    else:
+                                        cur.execute(
+                                            """
+                                            UPDATE activity_instance
+                                            SET last_seen_at = %s,
+                                                updated_at = %s
+                                            WHERE id = %s
+                                            """,
+                                            (event_time, utc_now(), instance_id),
+                                        )
                                     session_map[session_id] = (instance_id, time.time())
                                     print(
-                                        f"[DEBUG] Reused existing active instance instead of synthetic insert "
-                                        f"→ instance_id={instance_id}"
+                                        f"[DEBUG] Recovered active instance by business key "
+                                        f"→ session={session_id} instance_id={instance_id}"
                                     )
                                 else:
-                                    synthetic_instance_type = (
-                                        "SCHEDULED" if synthetic_schedule_id is not None else "UNSCHEDULED"
+                                    print(
+                                        f"[WARN] TEMP SKIP (will retry) {etype} "
+                                        f"→ event_id={e['event_row_id']} session={session_id}"
                                     )
-                                    cur.execute("SAVEPOINT ai_synth_insert_sp")
-                                    try:
-                                        cur.execute(
-                                            """
-                                            INSERT INTO activity_instance (
-                                                farm_id,
-                                                zone_id,
-                                                activity_type_id,
-                                                activity_schedule_id,
-                                                activity_date,
-                                                session_id,
-                                                instance_type,
-                                                status,
-                                                actual_start_at,
-                                                last_seen_at,
-                                                source,
-                                                within_ideal_window,
-                                                created_at,
-                                                updated_at
-                                            )
-                                            VALUES (%s,%s,%s,%s,%s,
-                                                    %s,%s,
-                                                    'IN_PROGRESS',
-                                                    %s,%s,
-                                                    'AI',
-                                                    %s,
-                                                    %s,%s)
-                                            RETURNING id
-                                            """,
-                                            (
-                                                farm_id,
-                                                zone_id,
-                                                activity_type_id,
-                                                synthetic_schedule_id,
-                                                synthetic_activity_date,
-                                                session_id,
-                                                synthetic_instance_type,
-                                                event_time,
-                                                event_time,
-                                                synthetic_within_ideal_window,
-                                                utc_now(),
-                                                utc_now(),
-                                            ),
-                                        )
-                                        instance_id = cur.fetchone()["id"]
-                                        cur.execute("RELEASE SAVEPOINT ai_synth_insert_sp")
-                                        session_map[session_id] = (instance_id, time.time())
-                                        print(
-                                            f"[WARN] No START for session {session_id} "
-                                            f"→ created synthetic instance {instance_id}"
-                                        )
-                                    except pg_errors.UniqueViolation:
-                                        # Race-safe fallback: another worker/path created the active row.
-                                        cur.execute("ROLLBACK TO SAVEPOINT ai_synth_insert_sp")
-                                        cur.execute("RELEASE SAVEPOINT ai_synth_insert_sp")
-                                        cur.execute(
-                                            """
-                                            SELECT id
-                                            FROM activity_instance
-                                            WHERE farm_id = %s
-                                              AND zone_id = %s
-                                              AND activity_type_id = %s
-                                              AND activity_date = %s
-                                              AND status = 'IN_PROGRESS'
-                                              AND actual_end_at IS NULL
-                                            ORDER BY updated_at DESC
-                                            LIMIT 1
-                                            FOR UPDATE
-                                            """,
-                                            (
-                                                farm_id,
-                                                zone_id,
-                                                activity_type_id,
-                                                synthetic_activity_date,
-                                            ),
-                                        )
-                                        race_row = cur.fetchone()
-                                        if race_row:
-                                            instance_id = race_row["id"]
-                                            cur.execute(
-                                                """
-                                                UPDATE activity_instance
-                                                SET last_seen_at = %s,
-                                                    updated_at = %s
-                                                WHERE id = %s
-                                                """,
-                                                (event_time, utc_now(), instance_id),
-                                            )
-                                            session_map[session_id] = (instance_id, time.time())
-                                            print(
-                                                f"[DEBUG] Recovered from synthetic insert race "
-                                                f"→ instance_id={instance_id}"
-                                            )
-                                        else:
-                                            print(
-                                                f"[WARN] Synthetic insert raced but no active row found "
-                                                f"→ retry later {e['event_row_id']}"
-                                            )
-                                            continue
+                                    continue
                         else:
                             # Refresh last-touch timestamp for long sessions.
                             session_map[session_id] = (instance_id, time.time())
@@ -1406,21 +1383,39 @@ def run(max_loops=None):
                             )
 
                         elif etype == "END_CANDIDATE":
-                            # END is advisory; do not close immediately.
-                            # Keep session open so short pauses can stitch into one session.
-                            cur.execute(
-                                """
-                                UPDATE activity_instance
-                                SET last_seen_at = %s,
-                                    updated_at = %s
-                                WHERE id = %s
-                                """,
-                                (event_time, utc_now(), instance_id),
-                            )
-                            print(
-                                f"[DEBUG] END_CANDIDATE observed; deferred close by timeout "
-                                f"(instance_id={instance_id})"
-                            )
+                            # Always defer real closure to cleanup_stale_instances after
+                            # CLOSE_DELAY_SEC of inactivity. Classifying NOISE from the *first*
+                            # END_CANDIDATE while duration < NOISE_DURATION_SEC falsely splits real
+                            # sessions (edge often emits END during brief detection gaps).
+                            if actual_start_at is None:
+                                cur.execute(
+                                    """
+                                    UPDATE activity_instance
+                                    SET last_seen_at = %s,
+                                        updated_at = %s
+                                    WHERE id = %s
+                                    """,
+                                    (event_time, utc_now(), instance_id),
+                                )
+                                print(
+                                    "[WARN] END_CANDIDATE but no start -> fallback update "
+                                    f"instance_id={instance_id}"
+                                )
+                            else:
+                                duration_sec = int((event_time - actual_start_at).total_seconds())
+                                cur.execute(
+                                    """
+                                    UPDATE activity_instance
+                                    SET last_seen_at = %s,
+                                        updated_at = %s
+                                    WHERE id = %s
+                                    """,
+                                    (event_time, utc_now(), instance_id),
+                                )
+                                print(
+                                    "[DEBUG] END_CANDIDATE -> deferred close (stitch mode) "
+                                    f"instance_id={instance_id} duration={duration_sec}s"
+                                )
 
                         event_links.append((e["event_row_id"], instance_id))
 

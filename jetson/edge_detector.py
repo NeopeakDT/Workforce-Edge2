@@ -77,8 +77,8 @@ load_dotenv(DOTENV_PATH)
 # Edge-side constants (standalone, no backend dependency)
 # ------------------------------------------------------------------
 FRAME_AGGREGATE_INTERVAL_SEC = 10  # seconds
-SCRAP_ACTIVE_BUFFER_SEC = float(os.getenv("SCRAP_ACTIVE_BUFFER_SEC", "10"))
-FEED_ACTIVE_BUFFER_SEC = float(os.getenv("FEED_ACTIVE_BUFFER_SEC", "15"))
+SCRAP_ACTIVE_BUFFER_SEC = float(os.getenv("SCRAP_ACTIVE_BUFFER_SEC", "20"))
+FEED_ACTIVE_BUFFER_SEC = float(os.getenv("FEED_ACTIVE_BUFFER_SEC", "25"))
 # For long tools, use the lower segment as proxy for the tool head.
 # 0.85 means "point at 85% bbox height from top" (near bottom tip).
 SCRAP_TOOL_HEAD_Y_RATIO = float(os.getenv("SCRAP_TOOL_HEAD_Y_RATIO", "0.7"))
