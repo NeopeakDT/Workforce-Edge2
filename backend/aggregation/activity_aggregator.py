@@ -25,7 +25,7 @@ Critical rules:
 - `session_id` is used for correctness tracking (session -> instance mapping).
 - `schedule_id` is used for merge boundaries (same schedule window -> same instance).
 - `FRAME_AGGREGATE` and `END_CANDIDATE` normally attach to an existing instance.
-  If START is missing, events are skipped (and optionally marked merge-processed).
+  If START is missing, a new instance is created as a fallback when no active row matches.
 - END_CANDIDATE refreshes `last_seen_at` only; `cleanup_stale_instances` closes after `CLOSE_DELAY_SEC`
   and then applies duration rules (including NOISE when finally shorter than `MIN_ACTIVITY_DURATION_SEC`).
 - START merge uses MIN logic: `actual_start_at = min(existing_start, event_time)`.
@@ -64,8 +64,6 @@ MIN_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MIN_ACTIVITY_DURATION_SEC", "60")
 NOISE_DURATION_SEC = int(
     os.getenv("AGG_NOISE_DURATION_SEC", str(MIN_ACTIVITY_DURATION_SEC))
 )
-START_CONFIRMATION_WINDOW_SEC = int(os.getenv("AGG_START_CONFIRMATION_WINDOW_SEC", "3"))
-MIN_START_EVENTS = int(os.getenv("AGG_MIN_START_EVENTS", "3"))
 UNCLEAR_STALE_SEC = int(os.getenv("AGG_UNCLEAR_STALE_SEC", "1800"))
 MAX_EVENT_DELAY_SEC = int(os.getenv("AGG_MAX_EVENT_DELAY_SEC", "300"))
 SCHEDULE_BIND_GRACE_SEC = int(os.getenv("AGG_SCHEDULE_BIND_GRACE_SEC", "40"))
@@ -343,38 +341,121 @@ def mark_noise_if_short(cur, instance_id, duration_sec, ai_columns):
     )
 
 
-def has_stable_start_signal(cur, session_id, event_time):
+def create_fallback_activity_instance(
+    cur,
+    farm_id,
+    zone_id,
+    activity_type_id,
+    schedule_id,
+    activity_date,
+    session_id,
+    event_time,
+    farm_tz,
+    matched_schedule,
+    event_row_id,
+):
     """
-    Require temporal persistence before converting START_CANDIDATE into an instance.
-    This avoids one-frame false starts polluting activity_instance.
+    Create IN_PROGRESS activity_instance when FRAME/END arrive with no mapping.
+    Matches START-path insert semantics (schedule ideal window, instance_type).
     """
-    window_start = event_time - timedelta(seconds=START_CONFIRMATION_WINDOW_SEC)
-    cur.execute(
-        """
-        SELECT
-            count(*) AS evt_count,
-            min(event_time) AS first_seen,
-            max(event_time) AS last_seen
-        FROM activity_detection_event
-        WHERE session_id = %s
-          AND activity_instance_id IS NULL
-          AND event_type IN ('START_CANDIDATE', 'FRAME_AGGREGATE')
-          AND event_time BETWEEN %s AND %s
-        """,
-        (session_id, window_start, event_time),
-    )
-    row = cur.fetchone()
-    evt_count = row["evt_count"] or 0
-    if evt_count < MIN_START_EVENTS:
-        return False
+    resolved_schedule_id = schedule_id
+    if schedule_id is not None and not matched_schedule:
+        print(
+            f"[WARN] activity_schedule {schedule_id} missing in cache "
+            f"→ create as UNSCHEDULED for event {event_row_id}"
+        )
+        resolved_schedule_id = None
 
-    first_seen = row["first_seen"]
-    last_seen = row["last_seen"]
-    if not first_seen or not last_seen:
-        return False
+    within_ideal_window = False
+    if resolved_schedule_id is not None and matched_schedule:
+        ideal_start_utc, ideal_end_utc = ideal_window_utc_bounds(
+            farm_tz,
+            activity_date,
+            matched_schedule["ideal_start_time"],
+            matched_schedule["ideal_end_time"],
+        )
+        within_ideal_window = is_actual_start_within_ideal_window(
+            event_time, ideal_start_utc, ideal_end_utc
+        )
 
-    span_sec = (last_seen - first_seen).total_seconds()
-    return span_sec >= START_CONFIRMATION_WINDOW_SEC
+    instance_type = "SCHEDULED" if resolved_schedule_id is not None else "UNSCHEDULED"
+    cur.execute("SAVEPOINT ai_fb_insert_sp")
+    try:
+        cur.execute(
+            """
+            INSERT INTO activity_instance (
+                farm_id,
+                zone_id,
+                activity_type_id,
+                activity_schedule_id,
+                activity_date,
+                session_id,
+                instance_type,
+                status,
+                actual_start_at,
+                last_seen_at,
+                source,
+                within_ideal_window,
+                created_at,
+                updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,
+                    %s,%s,
+                    'IN_PROGRESS',
+                    %s,%s,
+                    'AI',
+                    %s,
+                    %s,%s)
+            RETURNING id
+            """,
+            (
+                farm_id,
+                zone_id,
+                activity_type_id,
+                resolved_schedule_id,
+                activity_date,
+                session_id,
+                instance_type,
+                event_time,
+                event_time,
+                within_ideal_window,
+                utc_now(),
+                utc_now(),
+            ),
+        )
+        instance_id = cur.fetchone()["id"]
+        cur.execute("RELEASE SAVEPOINT ai_fb_insert_sp")
+        print(
+            f"[DEBUG] FRAME/END fallback CREATED-NEW → instance_id={instance_id} "
+            f"type={instance_type} event_row_id={event_row_id}"
+        )
+        return instance_id
+    except pg_errors.UniqueViolation:
+        cur.execute("ROLLBACK TO SAVEPOINT ai_fb_insert_sp")
+        cur.execute("RELEASE SAVEPOINT ai_fb_insert_sp")
+        cur.execute(
+            """
+            SELECT id
+            FROM activity_instance
+            WHERE farm_id = %s
+              AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
+              AND activity_type_id = %s
+              AND activity_date = %s
+              AND status = 'IN_PROGRESS'
+              AND actual_end_at IS NULL
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (farm_id, zone_id, zone_id, activity_type_id, activity_date),
+        )
+        row = cur.fetchone()
+        if row:
+            print(
+                f"[DEBUG] FRAME/END fallback recovered concurrent row "
+                f"→ instance_id={row['id']} event_row_id={event_row_id}"
+            )
+            return row["id"]
+        return None
 
 
 def cleanup_stale_instances(cur, ai_columns):
@@ -780,13 +861,6 @@ def run(max_loops=None):
                             print(f"[DEBUG] START already processed for session {session_id} → skip duplicate")
                             event_links.append((e["event_row_id"], existing_instance_id))
                             continue
-
-                        stable_start = has_stable_start_signal(cur, session_id, event_time)
-                        if not stable_start:
-                            print(
-                                f"[WARN] Weak START → proceeding anyway session={session_id} "
-                                f"window={START_CONFIRMATION_WINDOW_SEC}s min_events={MIN_START_EVENTS}"
-                            )
 
                         # STEP 1: Look for active instance in same bucket
                         active = None
@@ -1288,8 +1362,7 @@ def run(max_loops=None):
                                 session_map[session_id] = (instance_id, time.time())
                                 print(f"[DEBUG] Restored session map from DB: {session_id} → {instance_id}")
                             else:
-                                # Do not create synthetic instances from FRAME/END without a strong START.
-                                # Try business-key recovery first (handles session_id churn), otherwise skip.
+                                # Try business-key recovery (session_id churn), then fallback create.
                                 cur.execute(
                                     """
                                     SELECT id
@@ -1345,11 +1418,30 @@ def run(max_loops=None):
                                         f"→ session={session_id} instance_id={instance_id}"
                                     )
                                 else:
-                                    print(
-                                        f"[WARN] TEMP SKIP (will retry) {etype} "
-                                        f"→ event_id={e['event_row_id']} session={session_id}"
+                                    instance_id = create_fallback_activity_instance(
+                                        cur,
+                                        farm_id,
+                                        zone_id,
+                                        activity_type_id,
+                                        schedule_id,
+                                        activity_date,
+                                        session_id,
+                                        event_time,
+                                        farm_tz,
+                                        matched_schedule,
+                                        e["event_row_id"],
                                     )
-                                    continue
+                                    if instance_id is None:
+                                        print(
+                                            f"[WARN] TEMP SKIP (will retry) {etype} "
+                                            f"→ event_id={e['event_row_id']} session={session_id}"
+                                        )
+                                        continue
+                                    session_map[session_id] = (instance_id, time.time())
+                                    print(
+                                        f"[DEBUG] FRAME/END fallback mapped session "
+                                        f"{session_id} → instance_id={instance_id}"
+                                    )
                         else:
                             # Refresh last-touch timestamp for long sessions.
                             session_map[session_id] = (instance_id, time.time())
