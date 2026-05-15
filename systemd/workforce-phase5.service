@@ -23,7 +23,8 @@ After=network.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
-ExecStart=/home/neopeak/torch_env/bin/python /home/neopeak/Desktop/WF-project/WF/Workforce-Detection/backend/run_phase5.py
+# Use backend/ as cwd so python-dotenv loads the same .env as workforce-backend (DATABASE_URL, etc.).
+WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/backend
+ExecStart=/home/neopeak/torch_env/bin/python run_phase5.py
 Environment=PYTHONUNBUFFERED=1
 User=neopeak

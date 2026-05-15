@@ -296,6 +296,17 @@ def build_event_payload(activity, event_type, camera_id, zone_id, detections, se
         confidences.append(conf)
         objects_dict.setdefault(cls, []).append({"id": f"{cls}_{idx}"})
 
+    # SCRAPPING sessions often have empty ROI-filtered detections while still ACTIVE; avoid
+    # all-empty `objects` on FRAME ticks so ingest/analytics keep continuity with the session.
+    metadata = None
+    if (
+        activity == "SCRAPPING"
+        and event_type == "FRAME_AGGREGATE"
+        and not objects_dict
+    ):
+        metadata = {"scrapping_sparse_frame": True}
+        objects_dict["edge_continuity_tick"] = [{"id": "scrapping_active_sparse"}]
+
     if event_type == "FRAME_AGGREGATE":
         confidence = sum(confidences) / len(confidences) if confidences else 0.5
     elif event_type == "END_CANDIDATE":
@@ -311,7 +322,7 @@ def build_event_payload(activity, event_type, camera_id, zone_id, detections, se
     # Generate unique event_id and use it as idempotency_key
     event_id = str(uuid4())
 
-    return {
+    out = {
         "event_id": event_id,
         "session_id": session_id,
         "camera_id": str(camera_id),
@@ -325,6 +336,9 @@ def build_event_payload(activity, event_type, camera_id, zone_id, detections, se
         } if zone_id else None,
         "idempotency_key": event_id,
     }
+    if metadata is not None:
+        out["metadata"] = metadata
+    return out
 
 
 # ------------------------------------------------------------------
@@ -1222,9 +1236,11 @@ def _process_camera_impl(
                             logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
                         else:
                             EVENT_QUEUE.put(payload, block=False)
+                            state["last_frame_emit"] = now
                     except Exception as e:
                         logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-                state["last_frame_emit"] = now
+                else:
+                    state["last_frame_emit"] = now
 
         # ------------------------------------------------------------------
         # FEEDING - State Machine (using ROI-filtered detections)

@@ -69,7 +69,6 @@ BEGIN
           'ON_TIME',
           'LATE',
           'MISSED',
-          'UNSCHEDULE',
           'UNSCHEDULED',
           'UNCLEAR',
           'NOISE'

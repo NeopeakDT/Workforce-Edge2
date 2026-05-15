@@ -109,7 +109,15 @@ def ingest_event(
     validate_utc(payload.event_time)
     activity_type_id = resolve_activity_type_id(payload.activity_type)
     
-    print(f"[INGEST] {payload.event_type} | {payload.camera_id} | {payload.event_time}")
+    # Normalize lifecycle so aggregation always begins from START_CANDIDATE.
+    incoming_event_type = (payload.event_type or "").strip().upper()
+    event_type_for_insert = (
+        "START_CANDIDATE" if incoming_event_type == "START" else incoming_event_type
+    )
+    print(
+        f"[INGEST] in={incoming_event_type} stored={event_type_for_insert} | "
+        f"{payload.camera_id} | {payload.event_time}"
+    )
 
     exceeded, retry_after = rate_exceeded(str(payload.camera_id))
     if exceeded:
@@ -155,7 +163,7 @@ def ingest_event(
                     device_ctx["device_id"],
                     str(payload.camera_id),
                     activity_type_id,
-                    payload.event_type,
+                    event_type_for_insert,
                     payload.event_time,
                     payload.confidence,
                     zone_id,

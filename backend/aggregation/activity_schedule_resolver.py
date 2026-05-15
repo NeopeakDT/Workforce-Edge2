@@ -6,7 +6,15 @@ STEP-5A — ACTIVITY SCHEDULE RESOLVER (AUTHORITATIVE)
 Responsibilities:
 - Bind activity_instance → activity_schedule
 - Compute timing offsets
-- Finalize status: EARLY / ON_TIME / LATE
+- Finalize session_classification: EARLY / ON_TIME / LATE (overlap of actual interval vs ideal window)
+
+Selection:
+- Primary: stable ENDED AI rows (last_seen / updated_at before stable cutoff) with min duration.
+- Repair: any AI row with schedule + ended interval + min duration where session_classification or
+  offset columns are still NULL (historical replay / partial writes), without requiring the stable
+  cutoff on those rows.
+- Refresh: rows touched within `AGG_PHASE5_CLASSIFICATION_REFRESH_DAYS` (default 2) so replay-extended
+  intervals are reclassified even when offsets were previously populated.
 
 Rules:
 - Only instances with actual_end_at IS NOT NULL
@@ -34,11 +42,15 @@ from common.time_utils import utc_now
 # --------------------------------------------------
 
 MAX_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(90 * 60)))
-MIN_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MIN_ACTIVITY_DURATION_SEC", "60"))
-ON_TIME_BUFFER_MIN = int(os.getenv("AGG_ON_TIME_BUFFER_MIN", "10"))
+MIN_ON_TIME_OVERLAP_SEC = int(os.getenv("AGG_MIN_ON_TIME_OVERLAP_SEC", "60"))
 STABLE_END_DELAY_SEC = int(
-    os.getenv("AGG_STABLE_END_DELAY_SEC", os.getenv("AGG_CLOSE_DELAY_SEC", "60"))
+    os.getenv(
+        "AGG_STABLE_END_DELAY_SEC",
+        os.getenv("AGG_CLOSE_DELAY_SEC", os.getenv("AGG_END_GAP_SEC", "900")),
+    )
 )
+# Re-resolve session_classification when row was touched recently (replay extends finalized rows).
+CLASSIFICATION_REFRESH_DAYS = int(os.getenv("AGG_PHASE5_CLASSIFICATION_REFRESH_DAYS", "2"))
 
 
 def ideal_window_utc_bounds(farm_tz, activity_date, ideal_start_time, ideal_end_time):
@@ -71,6 +83,7 @@ def is_actual_start_within_ideal_window(actual_start_utc, ideal_start_utc, ideal
 def resolve():
     now_utc = utc_now()
     stable_end_cutoff_utc = now_utc - timedelta(seconds=STABLE_END_DELAY_SEC)
+    classification_refresh_cutoff_utc = now_utc - timedelta(days=CLASSIFICATION_REFRESH_DAYS)
 
     with get_cursor() as cur:
         # --------------------------------------------------
@@ -94,31 +107,66 @@ def resolve():
             FROM activity_instance ai
             JOIN farm f ON f.id = ai.farm_id
             WHERE ai.actual_end_at IS NOT NULL
-              AND ai.instance_type = 'SCHEDULED'
-              AND ai.status = 'ENDED'
+              AND ai.activity_schedule_id IS NOT NULL
+              AND (
+                    (ai.activity_type_id = 1 AND ai.actual_duration_sec >= 300)
+                 OR (ai.activity_type_id = 2 AND ai.actual_duration_sec >= 60)
+                 OR (ai.activity_type_id = 3 AND ai.actual_duration_sec >= 30)
+              )
               AND ai.source = 'AI'
-              AND ai.last_seen_at IS NOT NULL
-              AND ai.last_seen_at < %s
-              AND ai.updated_at < %s
+              AND (
+                    (
+                      ai.status = 'ENDED'
+                      AND ai.last_seen_at IS NOT NULL
+                      AND ai.last_seen_at < %s
+                      AND ai.updated_at < %s
+                    )
+                    OR
+                    (
+                      (
+                        ai.session_classification IS NULL
+                        OR ai.started_offset_min IS NULL
+                        OR ai.ended_offset_min IS NULL
+                      )
+                      AND ai.status IN (
+                        'ENDED',
+                        'ON_TIME',
+                        'LATE',
+                        'EARLY',
+                        'UNSCHEDULED'
+                      )
+                    )
+                    OR
+                    (
+                      ai.updated_at >= %s
+                      AND ai.status IN (
+                        'ENDED',
+                        'ON_TIME',
+                        'LATE',
+                        'EARLY',
+                        'UNSCHEDULED'
+                      )
+                    )
+                  )
             """,
-            (stable_end_cutoff_utc, stable_end_cutoff_utc),
+            (
+                stable_end_cutoff_utc,
+                stable_end_cutoff_utc,
+                classification_refresh_cutoff_utc,
+            ),
         )
 
         instances = cur.fetchall()
 
         for ai in instances:
-            # Guard: NOISE rows must never be schedule-resolved.
-            if ai["status"] == "NOISE":
-                continue
-
-            # --------------------------------------------------
-            # Duration sanity check
-            # --------------------------------------------------
-            duration_sec = int(
+            span_sec = int(
                 (ai["actual_end_at"] - ai["actual_start_at"]).total_seconds()
             )
 
-            if duration_sec > MAX_ACTIVITY_DURATION_SEC:
+            if span_sec <= 0:
+                continue
+
+            if span_sec > MAX_ACTIVITY_DURATION_SEC:
                 # Over-duration rows are treated as anomalies; do not resolve/finalize here.
                 continue
 
@@ -148,7 +196,6 @@ def resolve():
             # --------------------------------------------------
             schedule_id = ai["activity_schedule_id"]
             if schedule_id is None:
-                # UNSCHEDULED rows are intentionally excluded from schedule resolution.
                 continue
             
             cur.execute(
@@ -156,9 +203,7 @@ def resolve():
                 SELECT
                     s.id,
                     s.ideal_start_time,
-                    s.ideal_end_time,
-                    s.tolerance_early_min,
-                    s.tolerance_late_min
+                    s.ideal_end_time
                 FROM activity_schedule s
                 WHERE s.id = %s
                 """,
@@ -167,11 +212,11 @@ def resolve():
             
             schedule_row = cur.fetchone()
             if not schedule_row:
-                # Schedule deleted? Mark as LATE and skip
+                # Schedule deleted? Preserve as unscheduled classification.
                 cur.execute(
                     """
                     UPDATE activity_instance
-                    SET status = 'LATE',
+                    SET session_classification = 'UNSCHEDULED',
                         updated_at = %s
                     WHERE id = %s
                     """,
@@ -202,25 +247,36 @@ def resolve():
             )
 
             # --------------------------------------------------
-            # Final Status Resolution (schedule-tolerance model)
+            # OVERLAP-BASED STATUS
             # --------------------------------------------------
-            early_tol_min = s["tolerance_early_min"] or 0
-            late_tol_min = s["tolerance_late_min"] or 0
-            early_limit = ideal_start_utc - timedelta(minutes=early_tol_min)
-            late_limit = ideal_start_utc + timedelta(minutes=late_tol_min)
-            buffer_start = ideal_start_utc - timedelta(minutes=ON_TIME_BUFFER_MIN)
-            buffer_end = ideal_start_utc + timedelta(minutes=ON_TIME_BUFFER_MIN)
+            duration_sec = max(
+                1,
+                int((actual_end_utc - actual_start_utc).total_seconds()),
+            )
 
-            if actual_start_utc < early_limit:
-                final_status = "EARLY"
-            elif actual_start_utc < buffer_start:
-                final_status = "EARLY"
-            elif buffer_start <= actual_start_utc <= buffer_end:
+            overlap_start = max(actual_start_utc, ideal_start_utc)
+            overlap_end = min(actual_end_utc, ideal_end_utc)
+
+            overlap_sec = max(
+                0,
+                int((overlap_end - overlap_start).total_seconds()),
+            )
+
+            overlap_ratio = overlap_sec / duration_sec
+
+            print(
+                f"[OVERLAP_DEBUG] instance={ai['id']} "
+                f"duration={duration_sec}s overlap={overlap_sec}s ratio={overlap_ratio:.2f}"
+            )
+
+            if overlap_sec >= MIN_ON_TIME_OVERLAP_SEC:
                 final_status = "ON_TIME"
-            elif actual_start_utc <= late_limit:
+            elif actual_end_utc <= ideal_start_utc:
+                final_status = "EARLY"
+            elif actual_start_utc >= ideal_end_utc:
                 final_status = "LATE"
             else:
-                final_status = "LATE"
+                final_status = "ON_TIME"
 
             # --------------------------------------------------
             # Persist resolution
@@ -230,7 +286,7 @@ def resolve():
                 UPDATE activity_instance
                 SET started_offset_min = %s,
                     ended_offset_min = %s,
-                    status = %s,
+                    session_classification = %s,
                     within_ideal_window = %s,
                     updated_at = %s
                 WHERE id = %s
@@ -246,28 +302,23 @@ def resolve():
             )
 
         # --------------------------------------------------
-        # Finalize valid UNSCHEDULED rows
+        # Finalize ended rows with no schedule binding → UNSCHEDULED classification
         # --------------------------------------------------
-        # Rows shorter than MIN_ACTIVITY_DURATION_SEC are expected to be tagged as NOISE
-        # by STEP-4 and are intentionally excluded here.
         cur.execute(
             """
             UPDATE activity_instance
-            SET status = 'UNSCHEDULE',
+            SET session_classification = 'UNSCHEDULED',
                 updated_at = %s
             WHERE actual_end_at IS NOT NULL
-              AND instance_type = 'UNSCHEDULED'
-              AND status = 'IN_PROGRESS'
+              AND activity_schedule_id IS NULL
+              AND status = 'ENDED'
               AND source = 'AI'
-              AND actual_duration_sec IS NOT NULL
-              AND actual_duration_sec >= %s
               AND last_seen_at IS NOT NULL
               AND last_seen_at < %s
               AND updated_at < %s
             """,
             (
                 now_utc,
-                MIN_ACTIVITY_DURATION_SEC,
                 stable_end_cutoff_utc,
                 stable_end_cutoff_utc,
             ),

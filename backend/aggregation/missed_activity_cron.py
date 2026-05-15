@@ -97,7 +97,7 @@ from aggregation.activity_schedule_resolver import resolve as resolve_completed_
 def detect_missed_activities():
     """
     Create MISSED activity_instance rows when:
-    - Schedule window + late tolerance has passed
+    - Ideal end + late tolerance has passed (full window plus grace elapsed)
     - No activity_instance exists for that (farm, schedule, activity_date)
     """
     # MISSED creation is enabled.
@@ -135,28 +135,36 @@ def detect_missed_activities():
             activity_date = local_now.date()
     
             # -------------------------------------------------
-            # Compute late wait boundary from IDEAL START (LOCAL → UTC)
+            # Compute late cutoff from IDEAL END (LOCAL → UTC)
             # -------------------------------------------------
             ideal_start_naive = datetime.combine(
                 activity_date,
                 s["ideal_start_time"],
             )
+            ideal_end_naive = datetime.combine(
+                activity_date,
+                s["ideal_end_time"],
+            )
+
             ideal_start_local = farm_tz.localize(ideal_start_naive)
-            
+            ideal_end_local = farm_tz.localize(ideal_end_naive)
+
             # Cross-midnight handling
-            if s["ideal_end_time"] < s["ideal_start_time"]:
-                ideal_start_local -= timedelta(days=1)
-            
-            late_cutoff_local = ideal_start_local + timedelta(
+            if ideal_end_local <= ideal_start_local:
+                ideal_end_local += timedelta(days=1)
+
+            # MISSED cutoff = ideal_end + late tolerance
+            late_cutoff_local = ideal_end_local + timedelta(
                 minutes=s["tolerance_late_min"]
             )
+
             late_cutoff_utc = late_cutoff_local.astimezone(timezone.utc)
-    
-            # Wait until ideal_start + late_tolerance before marking MISSED.
+
+            # Wait until ideal_end + late_tolerance before marking MISSED.
             if now_utc <= late_cutoff_utc:
                 continue
 
-            # Create MISSED only when no AI-detected instance exists for this schedule/day.
+            # Create pending-missed signal only when no AI instance exists for this schedule/day.
             cur.execute(
                 """
                 SELECT 1
@@ -165,6 +173,18 @@ def detect_missed_activities():
                   AND ai.activity_schedule_id = %s
                   AND ai.activity_date = %s
                   AND ai.source = 'AI'
+                  AND (
+                        (ai.activity_type_id = 1 AND ai.actual_duration_sec >= 300)
+                     OR (ai.activity_type_id = 2 AND ai.actual_duration_sec >= 60)
+                     OR (ai.activity_type_id = 3 AND ai.actual_duration_sec >= 30)
+                  )
+                  AND (
+                        ai.status = 'IN_PROGRESS'
+                        OR (
+                            ai.status = 'ENDED'
+                            AND ai.session_classification IS NOT NULL
+                        )
+                      )
                 LIMIT 1
                 """,
                 (
@@ -175,40 +195,11 @@ def detect_missed_activities():
             )
             if cur.fetchone():
                 continue
-    
-            # -------------------------------------------------
-            # Insert MISSED (fully idempotent with UPSERT)
-            # 🔥 CRITICAL FIX (FIX 4):
-            # Using UPSERT ON CONFLICT DO NOTHING ensures:
-            # ✔ No duplicates even under race conditions
-            # ✔ Parallel runs safe
-            # ✔ Retries safe
-            # ✔ Cron overlaps handled
-            # -------------------------------------------------
-            cur.execute(
-                """
-                INSERT INTO activity_instance (
-                    farm_id,
-                    activity_type_id,
-                    activity_schedule_id,
-                    activity_date,
-                    status,
-                    source,
-                    created_at,
-                    updated_at
-                )
-                VALUES (%s, %s, %s, %s, 'MISSED', 'SYSTEM', %s, %s)
-                ON CONFLICT (farm_id, activity_schedule_id, activity_date)
-                DO NOTHING
-                """,
-                (
-                    farm_id,
-                    activity_type_id,
-                    schedule_id,
-                    activity_date,
-                    now_utc,
-                    now_utc,
-                ),
+
+            print(
+                "[MISSED_PENDING] "
+                f"farm={farm_id} schedule={schedule_id} activity_type={activity_type_id} "
+                f"activity_date={activity_date} cutoff_utc={late_cutoff_utc.isoformat()}"
             )
 
 

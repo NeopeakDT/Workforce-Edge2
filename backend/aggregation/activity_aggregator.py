@@ -5,7 +5,7 @@ STEP-4 - Activity Aggregator (schedule-aware)
 What this does:
 - Consumes unlinked rows from `activity_detection_event` where `activity_instance_id` is NULL.
 - Creates/updates `activity_instance` records for real-world activity sessions.
-- Groups events by `(farm, zone, activity_type, schedule_id)` to avoid cross-schedule merges.
+- Uses optional schedule binding per event (tolerance) without merging across inactive gaps.
 - Attaches `FRAME_AGGREGATE` and `END_CANDIDATE` to the correct instance using `session_id`.
 - Auto-closes stale in-progress instances using `last_seen_at`.
 
@@ -18,17 +18,34 @@ How to use:
 Operational notes:
 - This file is STEP-4 only. STEP-5A and STEP-5B are run by `run_phase5.py`.
 - Designed to run as a long-lived systemd service.
-- Idempotent behavior is achieved by linking each processed event to an instance.
+- Every event link runs `backfill_instance_schedule_date` + `normalize_instance_status_for_row`;
+  each loop calls `normalize_null_instance_statuses` before commit (repairs historical NULL `status`).
+- Env `AGG_MAX_EVENT_AGE_SEC` (>0): skip stale events with `merge_processed` set so they are not retried forever.
+- Env `AGG_DISABLE_FALLBACK_INSTANCE_CREATE`: when truthy, skip synthetic INSERT in `resolve_fallback_instance_or_skip`.
+- Env `AGG_ENDED_RECOVERY_WINDOW_SEC`: optional override for late FRAME/END stitch into `ENDED` rows
+  (see `ended_recovery_window_sec` for activity-type defaults; separate from live attach guard).
+- Default `AGG_CLOSE_DELAY_SEC` / `AGG_END_GAP_SEC` is 900s unless overridden (use 1800+ for heavy replay).
+- Live attach uses `live_attach_guard_sec` for open rows and `ended_recovery_window_sec` for recent finalized rows.
+- Periodic reconciliation: `AGG_RECONCILE_EVERY_LOOPS` (default 5) pulls NULL-linked events via
+  `retry_unlinked_events`; lookback `AGG_RECONCILE_LOOKBACK_DAYS` (default 7); batch `AGG_RECONCILE_BATCH_SIZE`.
+  Orphans stay retriable (`merge_processed` unchanged).
+- A MISSED row at `(farm_id, activity_schedule_id, activity_date)` blocks INSERT via unique index;
+  START converts that row back to `IN_PROGRESS` instead of inserting another row.
 
 Critical rules:
-- One active instance per `(farm, zone, activity_type, schedule_id)`.
-- `session_id` is used for correctness tracking (session -> instance mapping).
-- `schedule_id` is used for merge boundaries (same schedule window -> same instance).
-- `FRAME_AGGREGATE` and `END_CANDIDATE` normally attach to an existing instance.
-  If START is missing, a new instance is created as a fallback when no active row matches.
-- END_CANDIDATE refreshes `last_seen_at` only; `cleanup_stale_instances` closes after `CLOSE_DELAY_SEC`
-  and then applies duration rules (including NOISE when finally shorter than `MIN_ACTIVITY_DURATION_SEC`).
-- START merge uses MIN logic: `actual_start_at = min(existing_start, event_time)`.
+- Attach logic is centralized in `resolve_attachable_instance` / `find_in_progress_bucket_attach`:
+  same farm / type / day / zone-soft; **open** rows attach by `last_seen_at` within `live_attach_guard_sec`;
+  **finalized** rows (`ENDED` / timed classifications) attach by proximity to `actual_end_at` within
+  `ended_recovery_window_sec`. Schedule is ranking only (soft NULL match).
+- `recover_ended_instance_for_late_frame_end` extends **ENDED** rows in-place (`actual_end_at` / duration /
+  `last_seen_at`) without setting `status = 'IN_PROGRESS'`, preserving `check_valid_lifecycle`.
+- `session_id` is a hint for ordering/cache; bucket keys are farm / zone-soft / activity_type / day.
+- `FRAME_AGGREGATE` / `END_CANDIDATE` / `START_CANDIDATE` bucket paths share the resolver rules above.
+- `cleanup_stale_instances` selects `IN_PROGRESS` rows stale by `last_seen_at` or runaway span (including
+  rows with provisional non-null `actual_end_at`).
+- END_CANDIDATE logging uses deferred close; cleanup assigns final `ENDED` after `CLOSE_DELAY_SEC`.
+- Session open is optimistic on first `START_CANDIDATE` (no pre-frame count gate); short sessions
+  are filtered at cleanup via `MIN_VALID_DURATION_SEC`. Merge uses MIN logic on `actual_start_at`.
 """
 
 from pathlib import Path
@@ -54,24 +71,88 @@ from aggregation.activity_schedule_resolver import (
 
 MERGE_GAP_MINUTES = {
     1: 10,  # MILKING
-    2: 10,  # FEEDING
-    3: 10,  # SCRAPPING
+    2: 5,  # FEEDING
+    3: 30,  # SCRAPPING — align reopen/merge-on-start with long sparse-session recovery (see ended_recovery_window_sec)
 }
 
-MAX_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(90 * 60)))
-MIN_VALID_DURATION_SEC = int(os.getenv("AGG_MIN_VALID_DURATION_SEC", "60"))
-MIN_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MIN_ACTIVITY_DURATION_SEC", "60"))
-NOISE_DURATION_SEC = int(
-    os.getenv("AGG_NOISE_DURATION_SEC", str(MIN_ACTIVITY_DURATION_SEC))
+MIN_VALID_DURATION_SEC = {
+    1: 300,  # MILKING
+    2: 60,  # FEEDING
+    3: 30,  # SCRAPPING
+}
+
+# Lifecycle: finalized rows retain `actual_end_at`; FRAME/END may extend in attach paths.
+FINALIZED_LIFECYCLE_STATUSES = (
+    "ENDED",
+    "ON_TIME",
+    "LATE",
+    "EARLY",
+    "UNSCHEDULED",
 )
-UNCLEAR_STALE_SEC = int(os.getenv("AGG_UNCLEAR_STALE_SEC", "1800"))
+FINALIZED_ATTACH_STATUSES = frozenset(FINALIZED_LIFECYCLE_STATUSES)
+
+
+def reopen_window_sec(activity_type_id: int) -> int:
+    """Seconds allowed between last activity and a new attach/reopen; keyed by activity_type_id."""
+    minutes = MERGE_GAP_MINUTES.get(activity_type_id, 10)
+    return minutes * 60
+
+
+def reopen_missed_activity_instance(
+    cur,
+    instance_id,
+    zone_id,
+    session_id,
+    event_time,
+    within_ideal_window,
+):
+    """
+    Convert a placeholder MISSED row into a live AI session. Avoids INSERT collisions with
+    uq_missed_schedule_per_day (farm_id, activity_schedule_id, activity_date).
+    session_id is set here because MISSED placeholders typically had none.
+    """
+    cur.execute(
+        """
+        UPDATE activity_instance
+        SET status = 'IN_PROGRESS',
+            zone_id = COALESCE(zone_id, %s),
+            actual_start_at = %s,
+            actual_end_at = NULL,
+            actual_duration_sec = NULL,
+            last_seen_at = %s,
+            source = 'AI',
+            session_id = %s,
+            within_ideal_window = %s,
+            started_offset_min = NULL,
+            ended_offset_min = NULL,
+            session_classification = NULL,
+            updated_at = %s
+        WHERE id = %s
+          AND status = 'MISSED'
+        RETURNING id
+        """,
+        (
+            zone_id,
+            event_time,
+            event_time,
+            session_id,
+            within_ideal_window,
+            utc_now(),
+            instance_id,
+        ),
+    )
+    row = cur.fetchone()
+    return row["id"] if row else None
+
+
+MAX_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(90 * 60)))
 MAX_EVENT_DELAY_SEC = int(os.getenv("AGG_MAX_EVENT_DELAY_SEC", "300"))
 SCHEDULE_BIND_GRACE_SEC = int(os.getenv("AGG_SCHEDULE_BIND_GRACE_SEC", "40"))
 UNSCHEDULED_CREATE_DELAY_SEC = int(os.getenv("AGG_UNSCHEDULED_CREATE_DELAY_SEC", "60"))
 STALE_START_SESSION_EVENT_MIN = int(os.getenv("AGG_STALE_START_SESSION_EVENT_MIN", "3"))
 SOFT_DEDUPE_WINDOW_SEC = int(os.getenv("AGG_SOFT_DEDUPE_WINDOW_SEC", "30"))
-
-_NOISE_COLUMN_WARNED = False
+# When > 0, skip processing events older than this many seconds (debug / backlog isolation).
+MAX_EVENT_AGE_SEC = int(os.getenv("AGG_MAX_EVENT_AGE_SEC", "0"))
 
 
 def compute_activity_date(cur, farm_id, event_time_utc):
@@ -214,9 +295,93 @@ def resolve_schedule_from_rows(schedules, event_time_utc, farm_tz):
     return best_schedule
 
 
+def attach_event_to_instance(cur, event_row_id, instance_id):
+    """Persist detection-event → instance link immediately (crash-safe before batch flush)."""
+    cur.execute(
+        """
+        UPDATE activity_detection_event
+        SET activity_instance_id = %s
+        WHERE id = %s
+          AND activity_instance_id IS NULL
+        """,
+        (instance_id, event_row_id),
+    )
+
+
+def queue_event_link(
+    cur,
+    event_row_id,
+    instance_id,
+    event_links,
+    *,
+    schedule_id=None,
+    activity_date=None,
+):
+    """Link event to instance; backfill NULL schedule/date on the instance from this event's resolution."""
+    attach_event_to_instance(cur, event_row_id, instance_id)
+    event_links.append((event_row_id, instance_id))
+    backfill_instance_schedule_date(cur, instance_id, schedule_id, activity_date)
+    normalize_instance_status_for_row(cur, instance_id)
+
+
+def backfill_instance_schedule_date(cur, instance_id, schedule_id, activity_date):
+    """COALESCE-fill `activity_schedule_id` / `activity_date` after attach (replay / recovery safe)."""
+    if not instance_id:
+        return
+    if schedule_id is None and activity_date is None:
+        return
+    cur.execute(
+        """
+        UPDATE activity_instance
+        SET activity_schedule_id = COALESCE(activity_schedule_id, %s),
+            activity_date = COALESCE(activity_date, %s)
+        WHERE id = %s
+        """,
+        (schedule_id, activity_date, instance_id),
+    )
+
+
+def normalize_instance_status_for_row(cur, instance_id):
+    """If this instance still has NULL `status`, derive from `actual_end_at` (single-row repair)."""
+    if not instance_id:
+        return
+    cur.execute(
+        """
+        UPDATE activity_instance
+        SET status = CASE
+            WHEN actual_end_at IS NULL THEN 'IN_PROGRESS'
+            ELSE 'ENDED'
+        END,
+            updated_at = %s
+        WHERE id = %s
+          AND status IS NULL
+        """,
+        (utc_now(), instance_id),
+    )
+
+
+def normalize_null_instance_statuses(cur):
+    """
+    Repair rows where lifecycle writers left `status` NULL (historical + edge paths).
+    Derives status only from `actual_end_at` (aligns with check_valid_lifecycle).
+    """
+    cur.execute(
+        """
+        UPDATE activity_instance
+        SET status = CASE
+            WHEN actual_end_at IS NULL THEN 'IN_PROGRESS'
+            ELSE 'ENDED'
+        END,
+            updated_at = %s
+        WHERE status IS NULL
+        """,
+        (utc_now(),),
+    )
+
+
 def bulk_link_events(cur, event_links):
     """
-    Bulk update activity_detection_event.activity_instance_id.
+    Optional bulk replay for rows still NULL (e.g. race); queue_event_link already attached most.
     event_links: list[(event_row_id, instance_id)]
     """
     if not event_links:
@@ -229,6 +394,7 @@ def bulk_link_events(cur, event_links):
         SET activity_instance_id = v.activity_instance_id
         FROM (VALUES %s) AS v(id, activity_instance_id)
         WHERE e.id = v.id
+          AND e.activity_instance_id IS NULL
         """,
         event_links,
         template="(%s::bigint, %s::uuid)",
@@ -248,6 +414,127 @@ def mark_event_skipped(cur, event_row_id, event_columns):
     )
 
 
+def resolve_fallback_instance_or_skip(
+    cur,
+    farm_id,
+    zone_id,
+    activity_type_id,
+    schedule_id,
+    activity_date,
+    session_id,
+    event_time,
+    farm_tz,
+    matched_schedule,
+    event_row_id,
+    event_columns,
+    fatal_label,
+):
+    """
+    Last-resort INSERT when session restore, bucket attach, and ENDED extension all miss (backlog /
+    fragmentation). Retry via `merge_processed=FALSE` semantics on failure paths.
+    Disabled when `AGG_DISABLE_FALLBACK_INSTANCE_CREATE` is truthy.
+    """
+    if os.getenv("AGG_DISABLE_FALLBACK_INSTANCE_CREATE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        print(
+            f"[ORPHAN_EVENT] skipped (fallback disabled) "
+            f"event_row_id={event_row_id} type={fatal_label}"
+        )
+        return None
+
+    within_ideal_window = False
+    if schedule_id is not None and matched_schedule:
+        ideal_start_utc, ideal_end_utc = ideal_window_utc_bounds(
+            farm_tz,
+            activity_date,
+            matched_schedule["ideal_start_time"],
+            matched_schedule["ideal_end_time"],
+        )
+        within_ideal_window = is_actual_start_within_ideal_window(
+            event_time,
+            ideal_start_utc,
+            ideal_end_utc,
+        )
+
+    cur.execute("SAVEPOINT fallback_instance_sp")
+    try:
+        cur.execute(
+            """
+            INSERT INTO activity_instance (
+                farm_id,
+                zone_id,
+                activity_type_id,
+                activity_schedule_id,
+                activity_date,
+                session_id,
+                status,
+                actual_start_at,
+                last_seen_at,
+                source,
+                within_ideal_window,
+                created_at,
+                updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,
+                    %s,
+                    'IN_PROGRESS',
+                    %s,%s,
+                    'AI',
+                    %s,
+                    %s,%s)
+            RETURNING id
+            """,
+            (
+                farm_id,
+                zone_id,
+                activity_type_id,
+                schedule_id,
+                activity_date,
+                session_id,
+                event_time,
+                event_time,
+                within_ideal_window,
+                utc_now(),
+                utc_now(),
+            ),
+        )
+        row = cur.fetchone()
+        cur.execute("RELEASE SAVEPOINT fallback_instance_sp")
+        iid = row["id"]
+        print(
+            f"[FALLBACK_INSTANCE] created instance_id={iid} event_row_id={event_row_id} "
+            f"reason={fatal_label}"
+        )
+        return iid
+    except pg_errors.UniqueViolation:
+        cur.execute("ROLLBACK TO SAVEPOINT fallback_instance_sp")
+        cur.execute("RELEASE SAVEPOINT fallback_instance_sp")
+        alt = find_in_progress_bucket_attach(
+            cur,
+            farm_id,
+            zone_id,
+            activity_type_id,
+            activity_date,
+            schedule_id,
+            event_time,
+            event_row_id=event_row_id,
+        )
+        if alt:
+            print(
+                f"[FALLBACK_INSTANCE] uniq race → reuse instance_id={alt} "
+                f"event_row_id={event_row_id}"
+            )
+            return alt
+        print(
+            f"[ORPHAN_EVENT] event_row_id={event_row_id} type={fatal_label} "
+            "(UniqueViolation; no attach row)"
+        )
+        return None
+
+
 # Timeout-driven closure control. END_CANDIDATE does not close sessions immediately.
 # Sessions are closed only when inactivity exceeds CLOSE_DELAY_SEC.
 END_CONFIRMATION_WINDOW_SEC = int(
@@ -256,22 +543,608 @@ END_CONFIRMATION_WINDOW_SEC = int(
 CLOSE_DELAY_SEC = int(
     os.getenv(
         "AGG_CLOSE_DELAY_SEC",
-        os.getenv("AGG_END_GAP_SEC", "60"),
+        os.getenv("AGG_END_GAP_SEC", "900"),
     )
 )
-REOPEN_WINDOW_SEC = int(os.getenv("AGG_REOPEN_WINDOW_SEC", "180"))
 
 
-def load_activity_instance_columns(cur):
+def ended_recovery_window_sec(activity_type_id: int):
+    """
+    Max allowed delay for stitching late FRAME/END events
+    into an already ENDED instance.
+    """
+
+    env_override = os.getenv("AGG_ENDED_RECOVERY_WINDOW_SEC")
+    if env_override:
+        return int(env_override)
+
+    # activity-specific defaults
+    defaults = {
+        1: 1800,  # milking 30 min
+        2: 900,  # feeding 15 min
+        3: 1800,  # scrapping 30 min — late FRAME/END after sparse visibility / cleanup delay
+    }
+
+    return defaults.get(activity_type_id, 900)
+
+
+def attach_guard_window_sec(activity_type_id: int) -> int:
+    """Legacy: max(reopen gap, close delay). Prefer `live_attach_guard_sec` for IN_PROGRESS attach."""
+    return max(reopen_window_sec(activity_type_id), CLOSE_DELAY_SEC)
+
+
+def live_attach_guard_sec(activity_type_id: int) -> int:
+    """
+    Live IN_PROGRESS attach window (seconds), time-first vs schedule.
+    Separate from `ended_recovery_window_sec` (ENDED / replay stitch).
+    Override: AGG_LIVE_ATTACH_GUARD_SEC or AGG_LIVE_ATTACH_GUARD_SEC_<type_id>.
+    """
+    env = os.getenv("AGG_LIVE_ATTACH_GUARD_SEC")
+    if env:
+        return int(env)
+    per = os.getenv(f"AGG_LIVE_ATTACH_GUARD_SEC_{activity_type_id}")
+    if per:
+        return int(per)
+    defaults = {
+        1: 300,  # milking
+        2: 300,  # feeding
+        3: 600,  # scrapping — sparse motion / ROI gaps; IN_PROGRESS attach vs last_seen_at
+    }
+    return int(defaults.get(activity_type_id, 180))
+
+
+def log_attach_reject(reason: str, **fields):
+    """Structured attach failure log (grep-friendly)."""
+    parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    print(f"[ATTACH_REJECT] reason={reason} {parts}".rstrip())
+
+
+def find_in_progress_bucket_attach(
+    cur,
+    farm_id,
+    zone_id,
+    activity_type_id,
+    activity_date,
+    schedule_id,
+    event_time,
+    *,
+    event_row_id=None,
+):
+    """
+    Bucket attach: open `IN_PROGRESS` rows by `live_attach_guard_sec` vs `last_seen_at`, or recent
+    finalized rows by `ended_recovery_window_sec` vs `actual_end_at`. Schedule is ranking only.
+    """
+    guard_sec = live_attach_guard_sec(activity_type_id)
+    ended_sec = ended_recovery_window_sec(activity_type_id)
+
+    cur.execute(
+        f"""
+        SELECT id, activity_schedule_id, status
+        FROM activity_instance
+        WHERE farm_id = %s
+          AND activity_type_id = %s
+          AND activity_date = %s
+          AND (
+                zone_id = %s
+                OR zone_id IS NULL
+              )
+          AND (
+                (
+                  status = 'IN_PROGRESS'
+                  AND last_seen_at IS NOT NULL
+                  AND ABS(
+                        EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at))
+                      ) <= %s
+                )
+                OR (
+                  status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+                  AND actual_end_at IS NOT NULL
+                  AND ABS(
+                        EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at))
+                      ) <= %s
+                )
+              )
+          AND (
+                (
+                  %s IS NOT NULL
+                  AND (
+                        activity_schedule_id = %s
+                        OR activity_schedule_id IS NULL
+                      )
+                )
+                OR (
+                  %s IS NULL
+                  AND (
+                        activity_schedule_id IS NOT NULL
+                        OR activity_schedule_id IS NULL
+                      )
+                )
+              )
+        ORDER BY
+          CASE WHEN status = 'IN_PROGRESS' THEN 0 ELSE 1 END,
+          CASE
+            WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
+            WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
+            WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
+            WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
+            ELSE 2
+          END,
+          CASE
+            WHEN status = 'IN_PROGRESS' THEN
+              ABS(EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at)))
+            ELSE
+              ABS(EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)))
+          END
+        LIMIT 1
+        """,
+        (
+            farm_id,
+            activity_type_id,
+            activity_date,
+            zone_id,
+            event_time,
+            guard_sec,
+            *FINALIZED_LIFECYCLE_STATUSES,
+            event_time,
+            ended_sec,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            event_time,
+            event_time,
+        ),
+    )
+    row = cur.fetchone()
+    if row:
+        inst_sched = row["activity_schedule_id"]
+        if (
+            schedule_id is not None
+            and inst_sched is not None
+            and inst_sched != schedule_id
+        ):
+            print(
+                f"[ATTACH_SOFT] schedule_soft_match_used "
+                f"event_row_id={event_row_id} event_schedule={schedule_id} "
+                f"instance_schedule={inst_sched}"
+            )
+        if row["status"] != "IN_PROGRESS":
+            print(
+                f"[ATTACH_FINALIZED] attaching to status={row['status']} instance_id={row['id']} "
+                f"event_row_id={event_row_id}"
+            )
+        return row["id"]
+
     cur.execute(
         """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'activity_instance'
-        """
+        SELECT COUNT(*) AS c
+        FROM activity_instance
+        WHERE farm_id = %s
+          AND activity_type_id = %s
+          AND activity_date = %s
+          AND (zone_id = %s OR zone_id IS NULL)
+          AND status = 'IN_PROGRESS'
+        """,
+        (farm_id, activity_type_id, activity_date, zone_id),
     )
-    return {row["column_name"] for row in cur.fetchall()}
+    any_open = int(cur.fetchone()["c"] or 0)
+
+    cur.execute(
+        f"""
+        SELECT COUNT(*) AS c
+        FROM activity_instance
+        WHERE farm_id = %s
+          AND activity_type_id = %s
+          AND activity_date = %s
+          AND (zone_id = %s OR zone_id IS NULL)
+          AND (
+                (
+                  status = 'IN_PROGRESS'
+                  AND last_seen_at IS NOT NULL
+                  AND ABS(
+                        EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at))
+                      ) <= %s
+                )
+                OR (
+                  status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+                  AND actual_end_at IS NOT NULL
+                  AND ABS(
+                        EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at))
+                      ) <= %s
+                )
+              )
+        """,
+        (
+            farm_id,
+            activity_type_id,
+            activity_date,
+            zone_id,
+            event_time,
+            guard_sec,
+            *FINALIZED_LIFECYCLE_STATUSES,
+            event_time,
+            ended_sec,
+        ),
+    )
+    in_window = int(cur.fetchone()["c"] or 0)
+
+    if any_open <= 0 and in_window <= 0:
+        log_attach_reject(
+            "no_attach_bucket",
+            event_row_id=event_row_id,
+            farm_id=farm_id,
+            activity_type_id=activity_type_id,
+            activity_date=activity_date,
+            zone_id=zone_id,
+            event_schedule=schedule_id,
+            guard_sec=guard_sec,
+            ended_sec=ended_sec,
+        )
+    elif in_window <= 0:
+        log_attach_reject(
+            "outside_attach_guard",
+            event_row_id=event_row_id,
+            farm_id=farm_id,
+            activity_type_id=activity_type_id,
+            activity_date=activity_date,
+            zone_id=zone_id,
+            event_schedule=schedule_id,
+            guard_sec=guard_sec,
+            ended_sec=ended_sec,
+            open_rows=any_open,
+        )
+    else:
+        log_attach_reject(
+            "schedule_mismatch_in_window",
+            event_row_id=event_row_id,
+            farm_id=farm_id,
+            activity_type_id=activity_type_id,
+            activity_date=activity_date,
+            zone_id=zone_id,
+            event_schedule=schedule_id,
+            guard_sec=guard_sec,
+            ended_sec=ended_sec,
+            in_window_rows=in_window,
+        )
+    return None
+
+
+def recover_ended_instance_for_late_frame_end(
+    cur,
+    session_id,
+    farm_id,
+    activity_date,
+    zone_id,
+    activity_type_id,
+    schedule_id,
+    event_time,
+    recovery_sec,
+):
+    """
+    Extend finalized instances in-place (`actual_end_at` / duration / `last_seen_at`) for late FRAME/END
+    replays — never sets `status = 'IN_PROGRESS'` while `actual_end_at` remains set (lifecycle-safe).
+    """
+
+    def _extend_ended_row(evt, now_ts, sid, zid, sched_id, row_id):
+        cur.execute(
+            f"""
+            UPDATE activity_instance
+            SET
+                status = COALESCE(status, 'ENDED'),
+                actual_end_at = GREATEST(actual_end_at, %s::timestamptz),
+                last_seen_at = GREATEST(
+                    COALESCE(last_seen_at, %s::timestamptz),
+                    %s::timestamptz
+                ),
+                actual_duration_sec = CASE
+                    WHEN actual_start_at IS NOT NULL THEN
+                        CAST(
+                            EXTRACT(
+                                EPOCH FROM (
+                                    GREATEST(actual_end_at, %s::timestamptz) - actual_start_at
+                                )
+                            ) AS INTEGER
+                        )
+                    ELSE actual_duration_sec
+                END,
+                updated_at = %s::timestamptz,
+                session_id = COALESCE(session_id, %s),
+                zone_id = COALESCE(zone_id, %s),
+                activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                activity_date = COALESCE(activity_date, %s::date),
+                session_classification = NULL,
+                started_offset_min = NULL,
+                ended_offset_min = NULL
+            WHERE id = %s
+              AND status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+              AND actual_end_at IS NOT NULL
+            RETURNING id
+            """,
+            (
+                evt,
+                evt,
+                evt,
+                evt,
+                now_ts,
+                sid,
+                zid,
+                sched_id,
+                activity_date,
+                row_id,
+                *FINALIZED_LIFECYCLE_STATUSES,
+            ),
+        )
+        row = cur.fetchone()
+        return row["id"] if row else None
+
+    cur.execute(
+        f"""
+        SELECT
+            id,
+            actual_start_at,
+            actual_end_at,
+            zone_id,
+            activity_schedule_id
+        FROM activity_instance
+        WHERE farm_id = %s
+          AND activity_type_id = %s
+          AND status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+          AND actual_end_at IS NOT NULL
+          AND (
+                zone_id = %s
+                OR zone_id IS NULL
+              )
+          AND activity_date = %s
+          AND ABS(
+                EXTRACT(
+                    EPOCH FROM (%s::timestamptz - actual_end_at)
+                )
+              ) <= %s
+        ORDER BY
+          CASE
+            WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
+            WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
+            WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
+            WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
+            ELSE 2
+          END,
+          ABS(EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)))
+        LIMIT 1
+        """,
+        (
+            farm_id,
+            activity_type_id,
+            *FINALIZED_LIFECYCLE_STATUSES,
+            zone_id,
+            activity_date,
+            event_time,
+            recovery_sec,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            schedule_id,
+            event_time,
+        ),
+    )
+    hit = cur.fetchone()
+
+    if hit:
+        if (
+            hit["actual_start_at"] is not None
+            and event_time < hit["actual_start_at"] - timedelta(minutes=30)
+        ):
+            hit = None
+
+    if not hit:
+        return None
+
+    now = utc_now()
+    rid = _extend_ended_row(
+        event_time,
+        now,
+        session_id,
+        zone_id,
+        schedule_id,
+        hit["id"],
+    )
+    if rid:
+        print(
+            f"[ENDED_RECOVERY] extended finalized instance_id={rid} "
+            f"farm={farm_id} type={activity_type_id} session_hint={session_id} "
+            f"(window={recovery_sec}s)"
+        )
+    return rid
+
+
+def resolve_attachable_instance(
+    cur,
+    farm_id,
+    zone_id,
+    activity_type_id,
+    activity_date,
+    schedule_id,
+    event_time,
+    session_id,
+    *,
+    try_session_restore=True,
+    try_ended_recovery_sec=None,
+    event_row_id=None,
+):
+    """
+    Resolver for FRAME / END / session hint: bounded session restore (open + recent finalized rows),
+    then bucket attach (`find_in_progress_bucket_attach`), then optional ENDED-only extension pass.
+    """
+    guard_sec = live_attach_guard_sec(activity_type_id)
+    ended_sec = ended_recovery_window_sec(activity_type_id)
+
+    if try_session_restore and session_id:
+        cur.execute(
+            f"""
+            SELECT id, activity_schedule_id, status
+            FROM activity_instance
+            WHERE session_id = %s
+              AND farm_id = %s
+              AND activity_date = %s
+              AND activity_type_id = %s
+              AND (
+                    (
+                      status = 'IN_PROGRESS'
+                      AND last_seen_at IS NOT NULL
+                      AND ABS(
+                            EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at))
+                          ) <= %s
+                    )
+                    OR (
+                      status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+                      AND actual_end_at IS NOT NULL
+                      AND ABS(
+                            EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at))
+                          ) <= %s
+                    )
+                  )
+              AND (
+                    zone_id = %s
+                    OR zone_id IS NULL
+                  )
+            ORDER BY
+              CASE WHEN status = 'IN_PROGRESS' THEN 0 ELSE 1 END,
+              CASE
+                WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
+                WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
+                WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
+                WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
+                ELSE 2
+              END,
+              CASE
+                WHEN status = 'IN_PROGRESS' THEN
+                  ABS(EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at)))
+                ELSE
+                  ABS(EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)))
+              END,
+              created_at DESC
+            LIMIT 1
+            """,
+            (
+                session_id,
+                farm_id,
+                activity_date,
+                activity_type_id,
+                event_time,
+                guard_sec,
+                *FINALIZED_LIFECYCLE_STATUSES,
+                event_time,
+                ended_sec,
+                zone_id,
+                schedule_id,
+                schedule_id,
+                schedule_id,
+                schedule_id,
+                schedule_id,
+                event_time,
+                event_time,
+            ),
+        )
+        row = cur.fetchone()
+        if row:
+            inst_sched = row["activity_schedule_id"]
+            if (
+                schedule_id is not None
+                and inst_sched is not None
+                and inst_sched != schedule_id
+            ):
+                print(
+                    f"[ATTACH_SOFT] session_restore_schedule_soft_match "
+                    f"event_row_id={event_row_id} event_schedule={schedule_id} "
+                    f"instance_schedule={inst_sched}"
+                )
+            if row.get("status") and row["status"] != "IN_PROGRESS":
+                print(
+                    f"[SESSION_RESTORE_FINALIZED] instance_id={row['id']} "
+                    f"status={row['status']} event_row_id={event_row_id}"
+                )
+            return row["id"]
+        log_attach_reject(
+            "session_restore_miss",
+            event_row_id=event_row_id,
+            session_id=session_id,
+            farm_id=farm_id,
+            activity_type_id=activity_type_id,
+            activity_date=activity_date,
+            guard_sec=guard_sec,
+            ended_sec=ended_sec,
+            event_schedule=schedule_id,
+        )
+
+    bid = find_in_progress_bucket_attach(
+        cur,
+        farm_id,
+        zone_id,
+        activity_type_id,
+        activity_date,
+        schedule_id,
+        event_time,
+        event_row_id=event_row_id,
+    )
+    if bid:
+        return bid
+
+    if try_ended_recovery_sec is not None and try_ended_recovery_sec > 0:
+        return recover_ended_instance_for_late_frame_end(
+            cur,
+            session_id,
+            farm_id,
+            activity_date,
+            zone_id,
+            activity_type_id,
+            schedule_id,
+            event_time,
+            try_ended_recovery_sec,
+        )
+    return None
+
+
+def retry_unlinked_events(cur, event_columns, limit=500, lookback_days=None):
+    """
+    Periodic reconciliation: NULL-linked events in lookback window get another attempt.
+    Does not set merge_processed on failure so retries remain possible.
+    """
+    merge_clause = ""
+    if "merge_processed" in event_columns:
+        merge_clause = " AND COALESCE(e.merge_processed, FALSE) = FALSE"
+
+    if lookback_days is None:
+        lookback_days = int(os.getenv("AGG_RECONCILE_LOOKBACK_DAYS", "7"))
+
+    cur.execute(
+        f"""
+        SELECT
+            e.event_id,
+            e.id AS event_row_id,
+            e.event_type,
+            e.event_time,
+            e.farm_id,
+            e.device_id,
+            e.camera_id,
+            e.activity_type_id,
+            e.session_id,
+            e.zone_id,
+            e.ai_confidence,
+            e.payload
+        FROM activity_detection_event e
+        WHERE e.activity_instance_id IS NULL
+          AND e.event_time >= NOW() - (%s * INTERVAL '1 day')
+          {merge_clause}
+        ORDER BY e.event_time
+        LIMIT %s
+        """,
+        (lookback_days, limit),
+    )
+    return cur.fetchall()
 
 
 def load_event_columns(cur):
@@ -286,188 +1159,30 @@ def load_event_columns(cur):
     return {row["column_name"] for row in cur.fetchall()}
 
 
-def mark_noise_if_short(cur, instance_id, duration_sec, ai_columns):
-    global _NOISE_COLUMN_WARNED
-    if duration_sec >= MIN_ACTIVITY_DURATION_SEC:
+def _cleanup_pop_session_map(cur, instance_id, session_map):
+    """Drop stale session→instance cache entries after closing an instance."""
+    if not session_map:
         return
-
-    assignments = []
-    params = []
-
-    if "instance_type" in ai_columns:
-        assignments.append("instance_type = 'NOISE'")
-    if "activity_schedule_id" in ai_columns:
-        # Keep DB invariant: NOISE rows must not have schedule_id.
-        assignments.append("activity_schedule_id = NULL")
-    if "status" in ai_columns:
-        assignments.append("status = 'NOISE'")
-    if "is_valid" in ai_columns:
-        assignments.append("is_valid = FALSE")
-    if "anomaly_reason" in ai_columns:
-        if duration_sec < MIN_VALID_DURATION_SEC:
-            assignments.append("anomaly_reason = 'TOO_SHORT'")
-        else:
-            assignments.append("anomaly_reason = 'SHORT_DURATION'")
-    if "within_ideal_window" in ai_columns:
-        assignments.append("within_ideal_window = FALSE")
-    if "started_offset_min" in ai_columns:
-        assignments.append("started_offset_min = NULL")
-    if "ended_offset_min" in ai_columns:
-        assignments.append("ended_offset_min = NULL")
-    if "updated_at" in ai_columns:
-        assignments.append("updated_at = %s")
-        params.append(utc_now())
-
-    if not assignments:
-        if not _NOISE_COLUMN_WARNED:
-            print(
-                "[WARN] SHORT_DURATION noise columns missing on activity_instance; "
-                "skipping NOISE tagging."
-            )
-            _NOISE_COLUMN_WARNED = True
-        return
-
     cur.execute(
-        f"""
-        UPDATE activity_instance
-        SET {", ".join(assignments)}
+        """
+        SELECT session_id
+        FROM activity_instance
         WHERE id = %s
         """,
-        (*params, instance_id),
+        (instance_id,),
     )
-    print(
-        f"[DEBUG] Marked instance as NOISE "
-        f"instance_id={instance_id} duration_sec={duration_sec}"
-    )
+    sess = cur.fetchone()
+    if sess and sess.get("session_id"):
+        session_map.pop(sess["session_id"], None)
 
 
-def create_fallback_activity_instance(
-    cur,
-    farm_id,
-    zone_id,
-    activity_type_id,
-    schedule_id,
-    activity_date,
-    session_id,
-    event_time,
-    farm_tz,
-    matched_schedule,
-    event_row_id,
-):
+def cleanup_stale_instances(cur, session_map=None):
     """
-    Create IN_PROGRESS activity_instance when FRAME/END arrive with no mapping.
-    Matches START-path insert semantics (schedule ideal window, instance_type).
-    """
-    resolved_schedule_id = schedule_id
-    if schedule_id is not None and not matched_schedule:
-        print(
-            f"[WARN] activity_schedule {schedule_id} missing in cache "
-            f"→ create as UNSCHEDULED for event {event_row_id}"
-        )
-        resolved_schedule_id = None
+    Auto-close zombie IN_PROGRESS instances (single pass).
 
-    within_ideal_window = False
-    if resolved_schedule_id is not None and matched_schedule:
-        ideal_start_utc, ideal_end_utc = ideal_window_utc_bounds(
-            farm_tz,
-            activity_date,
-            matched_schedule["ideal_start_time"],
-            matched_schedule["ideal_end_time"],
-        )
-        within_ideal_window = is_actual_start_within_ideal_window(
-            event_time, ideal_start_utc, ideal_end_utc
-        )
-
-    instance_type = "SCHEDULED" if resolved_schedule_id is not None else "UNSCHEDULED"
-    cur.execute("SAVEPOINT ai_fb_insert_sp")
-    try:
-        cur.execute(
-            """
-            INSERT INTO activity_instance (
-                farm_id,
-                zone_id,
-                activity_type_id,
-                activity_schedule_id,
-                activity_date,
-                session_id,
-                instance_type,
-                status,
-                actual_start_at,
-                last_seen_at,
-                source,
-                within_ideal_window,
-                created_at,
-                updated_at
-            )
-            VALUES (%s,%s,%s,%s,%s,
-                    %s,%s,
-                    'IN_PROGRESS',
-                    %s,%s,
-                    'AI',
-                    %s,
-                    %s,%s)
-            RETURNING id
-            """,
-            (
-                farm_id,
-                zone_id,
-                activity_type_id,
-                resolved_schedule_id,
-                activity_date,
-                session_id,
-                instance_type,
-                event_time,
-                event_time,
-                within_ideal_window,
-                utc_now(),
-                utc_now(),
-            ),
-        )
-        instance_id = cur.fetchone()["id"]
-        cur.execute("RELEASE SAVEPOINT ai_fb_insert_sp")
-        print(
-            f"[DEBUG] FRAME/END fallback CREATED-NEW → instance_id={instance_id} "
-            f"type={instance_type} event_row_id={event_row_id}"
-        )
-        return instance_id
-    except pg_errors.UniqueViolation:
-        cur.execute("ROLLBACK TO SAVEPOINT ai_fb_insert_sp")
-        cur.execute("RELEASE SAVEPOINT ai_fb_insert_sp")
-        cur.execute(
-            """
-            SELECT id
-            FROM activity_instance
-            WHERE farm_id = %s
-              AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
-              AND activity_type_id = %s
-              AND activity_date = %s
-              AND status = 'IN_PROGRESS'
-              AND actual_end_at IS NULL
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (farm_id, zone_id, zone_id, activity_type_id, activity_date),
-        )
-        row = cur.fetchone()
-        if row:
-            print(
-                f"[DEBUG] FRAME/END fallback recovered concurrent row "
-                f"→ instance_id={row['id']} event_row_id={event_row_id}"
-            )
-            return row["id"]
-        return None
-
-
-def cleanup_stale_instances(cur, ai_columns):
-    """
-    Auto-close zombie IN_PROGRESS instances.
-
-    Rules:
-    - status = IN_PROGRESS
-    - actual_end_at IS NULL
-    - last_seen_at older than close delay
-    - Close using last_seen_at (NOT now)
-    - Never keep IN_PROGRESS after close
+    Rows selected when either:
+    - last_seen older than CLOSE_DELAY (inactive), or
+    - span since actual_start exceeds MAX_DURATION_SEC (runaway), without a second scan pass.
     """
 
     now = utc_now()
@@ -475,151 +1190,148 @@ def cleanup_stale_instances(cur, ai_columns):
 
     cur.execute(
         """
-        SELECT id, actual_start_at, last_seen_at, activity_schedule_id, instance_type
+        SELECT
+            id,
+            activity_type_id,
+            actual_start_at,
+            last_seen_at,
+            activity_schedule_id,
+            (
+                last_seen_at IS NOT NULL
+                AND last_seen_at < %(cutoff)s
+            ) AS inactive_stale
         FROM activity_instance
         WHERE status = 'IN_PROGRESS'
-          AND actual_end_at IS NULL
-          AND last_seen_at IS NOT NULL
-          AND last_seen_at < %s
+          AND (
+                (
+                    last_seen_at IS NOT NULL
+                    AND last_seen_at < %(cutoff)s
+                )
+                OR (
+                    actual_start_at IS NOT NULL
+                    AND EXTRACT(
+                        EPOCH FROM (
+                            COALESCE(last_seen_at, %(now)s) - actual_start_at
+                        )
+                    ) > %(max_dur)s
+                )
+              )
         """,
-        (cutoff,),
+        {"cutoff": cutoff, "now": now, "max_dur": MAX_DURATION_SEC},
     )
 
     stale = cur.fetchall()
 
     if stale:
         print(
-            f"[CLEANUP] Closing {len(stale)} inactive instances "
-            f"(CLOSE_DELAY_SEC={CLOSE_DELAY_SEC})"
+            f"[CLEANUP] Processing {len(stale)} close candidates "
+            f"(CLOSE_DELAY_SEC={CLOSE_DELAY_SEC}, MAX_DURATION_SEC={MAX_DURATION_SEC})"
         )
+
+    forced_closed = 0
 
     for row in stale:
-        instance_type = row["instance_type"] or "UNSCHEDULED"
-        duration = max(
-            0,
-            int(
-                (row["last_seen_at"] - row["actual_start_at"]).total_seconds()
-            ),
-        )
+        inactive_stale = bool(row["inactive_stale"])
 
-        if duration <= 0:
-            cur.execute(
-                "DELETE FROM activity_instance WHERE id = %s",
-                (row["id"],),
+        if (
+            row["last_seen_at"] is not None
+            and row["actual_start_at"] is not None
+            and row["last_seen_at"] < row["actual_start_at"]
+        ):
+            print(
+                f"[ERROR] Invalid timeline last_seen_at < actual_start_at "
+                f"→ skip finalize id={row['id']}"
             )
-            print(f"[CLEANUP] Deleted zero-duration instance {row['id']}")
             continue
 
-        # Duration classification must run before lifecycle close status.
-        if duration < MIN_ACTIVITY_DURATION_SEC:
+        close_at = row["last_seen_at"] or now
+
+        if row["actual_start_at"] is None:
+            duration = 0
+        else:
+            duration = max(
+                0,
+                int((close_at - row["actual_start_at"]).total_seconds()),
+            )
+
+        if duration <= 0:
+            print(
+                f"[CLEANUP] skip_finalize duration<=0 instance_id={row['id']} "
+                f"activity_type={row['activity_type_id']}"
+            )
+            continue
+
+        print(
+            f"[SESSION_FINALIZED] "
+            f"instance_id={row['id']} "
+            f"activity_type={row['activity_type_id']} "
+            f"duration={duration}"
+        )
+
+        min_required = MIN_VALID_DURATION_SEC.get(row["activity_type_id"], 10)
+        if duration < min_required:
+            end_anchor = row["last_seen_at"] or row["actual_start_at"] or now
+            cur.execute(
+                """
+                UPDATE activity_instance
+                SET status = 'ENDED',
+                    actual_end_at = %s,
+                    actual_duration_sec = %s,
+                    updated_at = %s
+                WHERE id = %s
+                """,
+                (end_anchor, duration, now, row["id"]),
+            )
+            print(
+                f"[CLEANUP] Closed short-duration instance as ENDED "
+                f"id={row['id']} duration={duration}s min_required={min_required}s"
+            )
+            _cleanup_pop_session_map(cur, row["id"], session_map)
+            continue
+
+        closed_status = "ENDED"
+
+        if inactive_stale:
             cur.execute(
                 """
                 UPDATE activity_instance
                 SET actual_end_at = %s,
                     actual_duration_sec = %s,
-                    status = 'NOISE',
-                    instance_type = 'NOISE',
-                    activity_schedule_id = NULL,
+                    status = %s,
                     updated_at = %s
                 WHERE id = %s
                 """,
                 (
                     row["last_seen_at"],
                     duration,
+                    closed_status,
                     now,
                     row["id"],
                 ),
             )
-            mark_noise_if_short(
-                cur,
-                row["id"],
-                duration,
-                ai_columns,
+            _cleanup_pop_session_map(cur, row["id"], session_map)
+        elif duration > MAX_DURATION_SEC:
+            cur.execute(
+                """
+                UPDATE activity_instance
+                SET actual_end_at = %s,
+                    actual_duration_sec = %s,
+                    status = %s,
+                    last_seen_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                """,
+                (
+                    close_at,
+                    duration,
+                    closed_status,
+                    close_at,
+                    now,
+                    row["id"],
+                ),
             )
-            continue
-
-        stale_age_sec = (now - row["last_seen_at"]).total_seconds()
-        if instance_type == "SCHEDULED":
-            closed_status = "ENDED"
-        elif instance_type == "NOISE":
-            closed_status = "NOISE"
-        elif stale_age_sec > UNCLEAR_STALE_SEC:
-            closed_status = "UNCLEAR"
-        else:
-            closed_status = "UNSCHEDULED"
-
-        cur.execute(
-            """
-            UPDATE activity_instance
-            SET actual_end_at = %s,
-                actual_duration_sec = %s,
-                status = %s,
-                updated_at = %s
-            WHERE id = %s
-            """,
-            (
-                row["last_seen_at"],
-                duration,
-                closed_status,
-                now,
-                row["id"],
-            ),
-        )
-
-    # Hard close runaway sessions even if events keep trickling in.
-    cur.execute(
-        """
-        SELECT id, actual_start_at, last_seen_at, activity_schedule_id, instance_type
-        FROM activity_instance
-        WHERE status = 'IN_PROGRESS'
-          AND actual_end_at IS NULL
-          AND actual_start_at IS NOT NULL
-        """
-    )
-    open_rows = cur.fetchall()
-    forced_closed = 0
-
-    for row in open_rows:
-        instance_type = row["instance_type"] or "UNSCHEDULED"
-        close_at = row["last_seen_at"] or now
-        duration = max(
-            0,
-            int((close_at - row["actual_start_at"]).total_seconds()),
-        )
-        if duration <= 0:
-            cur.execute("DELETE FROM activity_instance WHERE id = %s", (row["id"],))
-            print(f"[CLEANUP] Deleted zero-duration runaway instance {row['id']}")
-            continue
-        if duration <= MAX_DURATION_SEC:
-            continue
-
-        if instance_type == "SCHEDULED":
-            closed_status = "ENDED"
-        elif instance_type == "NOISE":
-            closed_status = "NOISE"
-        else:
-            closed_status = "UNSCHEDULED"
-
-        cur.execute(
-            """
-            UPDATE activity_instance
-            SET actual_end_at = %s,
-                actual_duration_sec = %s,
-                status = %s,
-                last_seen_at = %s,
-                updated_at = %s
-            WHERE id = %s
-            """,
-            (
-                close_at,
-                duration,
-                closed_status,
-                close_at,
-                now,
-                row["id"],
-            ),
-        )
-        forced_closed += 1
+            forced_closed += 1
+            _cleanup_pop_session_map(cur, row["id"], session_map)
 
     if forced_closed:
         print(f"[CLEANUP] Force-closed {forced_closed} over-duration instances")
@@ -629,6 +1341,9 @@ def run(max_loops=None):
     print("[AGGREGATOR] Starting continuous worker (SCHEDULE-AWARE)")
 
     BATCH_SIZE = int(os.getenv("AGG_BATCH_SIZE", "500"))
+    RECONCILE_EVERY_LOOPS = int(os.getenv("AGG_RECONCILE_EVERY_LOOPS", "5"))
+    RECONCILE_BATCH_SIZE = int(os.getenv("AGG_RECONCILE_BATCH_SIZE", "500"))
+    RECONCILE_LOOKBACK_DAYS = int(os.getenv("AGG_RECONCILE_LOOKBACK_DAYS", "7"))
     MAX_SESSION_AGE_SEC = int(os.getenv("AGG_MAX_SESSION_AGE_SEC", "3600"))
     PENDING_LOG_EVERY_LOOPS = int(os.getenv("AGG_PENDING_LOG_EVERY_LOOPS", "10"))
     loops = 0
@@ -643,7 +1358,6 @@ def run(max_loops=None):
     # CRITICAL: Maps session_id → (instance_id, last_touch_unix_sec)
     # This ensures END events attach to the correct instance
     session_map = {}
-    ai_columns = None
     event_columns = None
 
     while True:
@@ -661,8 +1375,6 @@ def run(max_loops=None):
                 session_map.pop(sid, None)
 
         with get_cursor() as cur:
-            if ai_columns is None:
-                ai_columns = load_activity_instance_columns(cur)
             if event_columns is None:
                 event_columns = load_event_columns(cur)
 
@@ -691,18 +1403,29 @@ def run(max_loops=None):
                 cur.execute(
                     """
                     SELECT
+                        e.event_id,
                         e.id AS event_row_id,
                         e.event_type,
                         e.event_time,
                         e.farm_id,
+                        e.device_id,
                         e.camera_id,
                         e.activity_type_id,
                         e.session_id,
-                        e.zone_id
+                        e.zone_id,
+                        e.ai_confidence,
+                        e.payload
                     FROM activity_detection_event e
                     WHERE e.activity_instance_id IS NULL
                       AND COALESCE(e.merge_processed, FALSE) = FALSE
-                    ORDER BY event_time, e.id
+                    ORDER BY e.event_time,
+                             CASE e.event_type::text
+                               WHEN 'START_CANDIDATE' THEN 0
+                               WHEN 'FRAME_AGGREGATE' THEN 1
+                               WHEN 'END_CANDIDATE' THEN 2
+                               ELSE 3
+                             END,
+                             e.id
                     LIMIT %s
                     """,
                     (BATCH_SIZE,),
@@ -711,23 +1434,51 @@ def run(max_loops=None):
                 cur.execute(
                     """
                     SELECT
+                        e.event_id,
                         e.id AS event_row_id,
                         e.event_type,
                         e.event_time,
                         e.farm_id,
+                        e.device_id,
                         e.camera_id,
                         e.activity_type_id,
                         e.session_id,
-                        e.zone_id
+                        e.zone_id,
+                        e.ai_confidence,
+                        e.payload
                     FROM activity_detection_event e
                     WHERE e.activity_instance_id IS NULL
-                    ORDER BY event_time, e.id
+                    ORDER BY e.event_time,
+                             CASE e.event_type::text
+                               WHEN 'START_CANDIDATE' THEN 0
+                               WHEN 'FRAME_AGGREGATE' THEN 1
+                               WHEN 'END_CANDIDATE' THEN 2
+                               ELSE 3
+                             END,
+                             e.id
                     LIMIT %s
                     """,
                     (BATCH_SIZE,),
                 )
 
             events = cur.fetchall()
+
+            if (
+                RECONCILE_EVERY_LOOPS > 0
+                and loops % RECONCILE_EVERY_LOOPS == 0
+            ):
+                retry_batch = retry_unlinked_events(
+                    cur,
+                    event_columns,
+                    limit=RECONCILE_BATCH_SIZE,
+                    lookback_days=RECONCILE_LOOKBACK_DAYS,
+                )
+                if retry_batch:
+                    print(
+                        f"[RECONCILE] prepended {len(retry_batch)} unlinked events "
+                        f"(lookback_days={RECONCILE_LOOKBACK_DAYS}, limit={RECONCILE_BATCH_SIZE})"
+                    )
+                    events = list(retry_batch) + list(events)
 
             if events:
                 processed = True
@@ -774,7 +1525,18 @@ def run(max_loops=None):
                     zone_id = e["zone_id"] or zone_cache[farm_id].get(zone_key[1:])
                     if not zone_id:
                         print(f"[WARN] No zone mapping → skip event {e['event_row_id']}")
+                        mark_event_skipped(cur, e["event_row_id"], event_columns)
                         continue
+
+                    if MAX_EVENT_AGE_SEC > 0:
+                        ev_age = (utc_now() - event_time).total_seconds()
+                        if ev_age > MAX_EVENT_AGE_SEC:
+                            print(
+                                f"[SKIP_STALE_EVENT] event_row_id={e['event_row_id']} "
+                                f"age_sec={int(ev_age)} max={MAX_EVENT_AGE_SEC}"
+                            )
+                            mark_event_skipped(cur, e["event_row_id"], event_columns)
+                            continue
 
                     # --------------------------------------------------
                     # CRITICAL: Resolve schedule for THIS event
@@ -807,7 +1569,7 @@ def run(max_loops=None):
                         print(f"[SCHEDULE_MISS] event={event_time} farm={farm_id}")
 
                     # Strict schedule binding: if event is outside tolerance window,
-                    # force UNSCHEDULED so we never merge across schedule windows.
+                    # force no schedule binding so we never merge across schedule windows.
                     matched_schedule = None
                     within_window = False
                     if schedule_id is not None:
@@ -843,9 +1605,33 @@ def run(max_loops=None):
                     )
 
                     # -------------------------------------------------
-                    # START_CANDIDATE
+                    # START_CANDIDATE: open session immediately (optimistic); FRAME/END attach
+                    # afterward. No synthetic START row (enum: START_CANDIDATE / FRAME / END only).
                     # -------------------------------------------------
                     if etype == "START_CANDIDATE":
+                        cur.execute(
+                            """
+                            SELECT 1
+                            FROM activity_detection_event
+                            WHERE session_id = %s
+                              AND event_type IN (
+                                    'START_CANDIDATE',
+                                    'FRAME_AGGREGATE'
+                              )
+                              AND activity_instance_id IS NOT NULL
+                            LIMIT 1
+                            """,
+                            (session_id,),
+                        )
+                        if cur.fetchone():
+                            mark_event_skipped(cur, e["event_row_id"], event_columns)
+                            print(
+                                f"[SKIP_START_CANDIDATE] session already has linked evidence "
+                                f"session={session_id} event_id={e['event_row_id']}"
+                            )
+                            continue
+
+                        reopen_sec = reopen_window_sec(activity_type_id)
                         instance_id = None
                         event_age_sec = (utc_now() - event_time).total_seconds()
                         print(
@@ -854,85 +1640,198 @@ def run(max_loops=None):
                         )
 
                         # STEP 0: DUPLICATE PROTECTION
-                        # If this session already started, skip duplicate START
+                        # If this session already mapped, skip duplicate open (only if row still open).
                         if session_id in session_map:
                             existing_instance_id, _ = session_map[session_id]
-                            session_map[session_id] = (existing_instance_id, time.time())
-                            print(f"[DEBUG] START already processed for session {session_id} → skip duplicate")
-                            event_links.append((e["event_row_id"], existing_instance_id))
-                            continue
+                            cur.execute(
+                                """
+                                SELECT activity_date, status
+                                FROM activity_instance
+                                WHERE id = %s
+                                """,
+                                (existing_instance_id,),
+                            )
+                            row = cur.fetchone()
+                            if (
+                                row
+                                and row["activity_date"] == activity_date
+                                and row["status"] == "IN_PROGRESS"
+                            ):
+                                session_map[session_id] = (existing_instance_id, time.time())
+                                print(
+                                    f"[DEBUG] START_CANDIDATE already mapped for session {session_id} "
+                                    "→ skip duplicate"
+                                )
+                                queue_event_link(cur, e["event_row_id"], existing_instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
+                                continue
+                            session_map.pop(session_id, None)
 
-                        # STEP 1: Look for active instance in same bucket
-                        active = None
                         cur.execute(
                             """
-                            SELECT id, last_seen_at, actual_start_at, instance_type
+                            SELECT id
                             FROM activity_instance
-                            WHERE farm_id = %s
-                              AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
-                              AND activity_type_id = %s
-                              AND status = 'IN_PROGRESS'
-                              AND actual_end_at IS NULL
-                            ORDER BY actual_start_at DESC
+                            WHERE session_id = %s
+                              AND activity_date = %s
+                            ORDER BY created_at DESC
                             LIMIT 1
                             """,
-                            (farm_id, zone_id, zone_id, activity_type_id),
+                            (session_id, activity_date),
                         )
-                        active = cur.fetchone()
+                        existing_session_instance = cur.fetchone()
+                        if existing_session_instance:
+                            cur.execute(
+                                """
+                                SELECT status, actual_end_at
+                                FROM activity_instance
+                                WHERE id = %s
+                                """,
+                                (existing_session_instance["id"],),
+                            )
+                            row_sess = cur.fetchone()
+                            if row_sess and row_sess["status"] == "IN_PROGRESS":
+                                instance_id = existing_session_instance["id"]
+                                session_map[session_id] = (instance_id, time.time())
+                                print(
+                                    f"[DEBUG] Existing session instance reused "
+                                    f"→ instance_id={instance_id}"
+                                )
+                                queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
+                                continue
+
+                        # Bucket IN_PROGRESS attach (time-first + schedule rank via
+                        # `find_in_progress_bucket_attach`). Includes runaway close before attach.
+                        bucket_attach_id = find_in_progress_bucket_attach(
+                            cur,
+                            farm_id,
+                            zone_id,
+                            activity_type_id,
+                            activity_date,
+                            schedule_id,
+                            event_time,
+                            event_row_id=e["event_row_id"],
+                        )
+                        active = None
+                        if bucket_attach_id:
+                            cur.execute(
+                                """
+                                SELECT id, last_seen_at, actual_start_at, activity_schedule_id
+                                FROM activity_instance
+                                WHERE id = %s
+                                """,
+                                (bucket_attach_id,),
+                            )
+                            active = cur.fetchone()
 
                         if active:
-                            last_seen_at = active["last_seen_at"]
                             active_start_at = active["actual_start_at"]
                             active_duration_sec = None
                             if active_start_at is not None:
                                 active_duration_sec = int((event_time - active_start_at).total_seconds())
                             if active_duration_sec is not None and active_duration_sec > MAX_DURATION_SEC:
-                                close_at = last_seen_at or event_time
-                                status_on_close = (
-                                    "ENDED"
-                                    if (active.get("instance_type") == "SCHEDULED")
-                                    else "UNSCHEDULED"
+                                close_at = active["last_seen_at"] or event_time
+                                dur_close = max(
+                                    0,
+                                    int((close_at - active_start_at).total_seconds()),
                                 )
+                                if dur_close <= 0:
+                                    print(
+                                        f"[DEBUG] skip force-close runaway (duration<=0) "
+                                        f"instance_id={active['id']}"
+                                    )
+                                else:
+                                    status_on_close = "ENDED"
+                                    cur.execute(
+                                        """
+                                        UPDATE activity_instance
+                                        SET actual_end_at = %s,
+                                            actual_duration_sec = %s,
+                                            status = %s,
+                                            updated_at = %s
+                                        WHERE id = %s
+                                        """,
+                                        (
+                                            close_at,
+                                            dur_close,
+                                            status_on_close,
+                                            utc_now(),
+                                            active["id"],
+                                        ),
+                                    )
+                                    print(
+                                        f"[DEBUG] Force-closed runaway active instance {active['id']} "
+                                        f"duration={active_duration_sec}s cap={MAX_DURATION_SEC}s"
+                                    )
+                                active = None
+                            else:
+                                instance_id = active["id"]
+                                cur.execute(
+                                    """
+                                    SELECT session_id
+                                    FROM activity_instance
+                                    WHERE id = %s
+                                    """,
+                                    (instance_id,),
+                                )
+                                existing = cur.fetchone()
+                                if existing and existing["session_id"]:
+                                    if existing["session_id"] != session_id:
+                                        print(
+                                            f"[SESSION_CONFLICT] "
+                                            f"existing={existing['session_id']} "
+                                            f"incoming={session_id} "
+                                            f"→ reuse bucket active instance_id={instance_id}"
+                                        )
+                                    else:
+                                        print(
+                                            f"[DEBUG] Found active instance → instance_id={instance_id}"
+                                        )
+                                else:
+                                    print(
+                                        f"[DEBUG] Found active instance → instance_id={instance_id}"
+                                    )
+
                                 cur.execute(
                                     """
                                     UPDATE activity_instance
-                                    SET actual_end_at = %s,
-                                        actual_duration_sec = %s,
-                                        status = %s,
+                                    SET last_seen_at = %s,
+                                        actual_start_at = LEAST(COALESCE(actual_start_at, %s), %s),
+                                        actual_end_at = CASE
+                                            WHEN actual_end_at IS NOT NULL THEN
+                                                GREATEST(actual_end_at, %s::timestamptz)
+                                            ELSE actual_end_at
+                                        END,
+                                        zone_id = COALESCE(zone_id, %s),
+                                        session_id = COALESCE(session_id, %s),
+                                        activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                        activity_date = COALESCE(activity_date, %s),
                                         updated_at = %s
                                     WHERE id = %s
                                     """,
                                     (
-                                        close_at,
-                                        max(0, int((close_at - active_start_at).total_seconds())),
-                                        status_on_close,
+                                        event_time,
+                                        event_time,
+                                        event_time,
+                                        event_time,
+                                        zone_id,
+                                        session_id,
+                                        schedule_id,
+                                        activity_date,
                                         utc_now(),
-                                        active["id"],
+                                        instance_id,
                                     ),
                                 )
+                                session_map[session_id] = (instance_id, time.time())
                                 print(
-                                    f"[DEBUG] Force-closed runaway active instance {active['id']} "
-                                    f"duration={active_duration_sec}s cap={MAX_DURATION_SEC}s"
+                                    f"[BUCKET_ACTIVE_REUSE] session={session_id} "
+                                    f"→ instance_id={instance_id}"
                                 )
-                                active = None
-                            elif last_seen_at is None:
-                                print("[DEBUG] GAP BREAK → active instance has no last_seen_at")
-                                active = None
-                            else:
-                                gap_sec = (event_time - last_seen_at).total_seconds()
-                                if gap_sec <= REOPEN_WINDOW_SEC:
-                                    instance_id = active["id"]
-                                    print(f"[DEBUG] Found active instance → instance_id={instance_id}")
-                                else:
-                                    print(
-                                        f"[DEBUG] HARD GAP BREAK → new instance "
-                                        f"(gap_sec={gap_sec:.1f}, reopen_limit={REOPEN_WINDOW_SEC})"
-                                    )
-                                    active = None
+                                queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
+                                continue
 
                         if not active:
                             # STEP 2: Re-open a recently closed row in the same bucket so fragmented
-                            # sessions (new session_id / premature END) stitch into one instance.
+                            # sessions (same session_id / premature END) stitch into one instance.
+                            # Different edge session_id ⇒ new activity; do not reopen (prevents duration inflation).
                             # Previous bug: queried status = IN_PROGRESS AND actual_end_at IS NOT NULL,
                             # which violates lifecycle constraints and matched zero rows.
                             cur.execute(
@@ -944,10 +1843,37 @@ def run(max_loops=None):
                                   AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
                                   AND activity_type_id = %s
                                   AND activity_date = %s
+                                  AND (
+                                        (
+                                          %s IS NOT NULL
+                                          AND (
+                                                activity_schedule_id = %s
+                                                OR activity_schedule_id IS NULL
+                                              )
+                                        )
+                                        OR (
+                                          %s IS NULL
+                                          AND (
+                                                activity_schedule_id IS NOT NULL
+                                                OR activity_schedule_id IS NULL
+                                              )
+                                        )
+                                      )
                                   AND actual_end_at IS NOT NULL
+                                  AND actual_end_at <= %s::timestamptz
+                                  AND EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)) <= %s
                                   AND status <> 'MISSED'
                                   AND status <> 'IN_PROGRESS'
-                                ORDER BY actual_end_at DESC
+                                  AND (session_id IS NULL OR session_id = %s)
+                                ORDER BY
+                                  CASE
+                                    WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
+                                    WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
+                                    WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
+                                    WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
+                                    ELSE 2
+                                  END,
+                                  ABS(EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)))
                                 LIMIT 1
                                 """,
                                 (
@@ -956,23 +1882,32 @@ def run(max_loops=None):
                                     zone_id,
                                     activity_type_id,
                                     activity_date,
+                                    schedule_id,
+                                    schedule_id,
+                                    schedule_id,
+                                    event_time,
+                                    event_time,
+                                    reopen_sec,
+                                    session_id,
+                                    schedule_id,
+                                    schedule_id,
+                                    schedule_id,
+                                    schedule_id,
+                                    schedule_id,
+                                    event_time,
                                 ),
                             )
                             prev = cur.fetchone()
 
                             if prev:
-                                gap_sec = (event_time - prev["actual_end_at"]).total_seconds()
-                                if gap_sec <= REOPEN_WINDOW_SEC:
-                                    instance_id = prev["id"]
-                                else:
+                                prev_date = prev["actual_end_at"].astimezone(farm_tz).date()
+                                current_date = event_time.astimezone(farm_tz).date()
+                                if prev_date != current_date:
                                     prev = None
+
                             if prev:
+                                instance_id = prev["id"]
                                 merged_schedule_id = prev["activity_schedule_id"] or schedule_id
-                                merged_type = (
-                                    "SCHEDULED"
-                                    if merged_schedule_id is not None
-                                    else "UNSCHEDULED"
-                                )
 
                                 cur.execute(
                                     """
@@ -983,11 +1918,12 @@ def run(max_loops=None):
                                         actual_duration_sec = NULL,
                                         started_offset_min = NULL,
                                         ended_offset_min = NULL,
+                                        session_classification = NULL,
                                         status = 'IN_PROGRESS',
-                                        activity_schedule_id = %s,
-                                        instance_type = %s,
-                                        session_id = %s,
+                                        activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                        activity_date = COALESCE(activity_date, %s),
                                         zone_id = COALESCE(zone_id, %s),
+                                        session_id = COALESCE(session_id, %s),
                                         updated_at = %s
                                     WHERE id = %s
                                     """,
@@ -995,9 +1931,9 @@ def run(max_loops=None):
                                         event_time,
                                         event_time,
                                         merged_schedule_id,
-                                        merged_type,
-                                        session_id,
+                                        activity_date,
                                         zone_id,
+                                        session_id,
                                         utc_now(),
                                         instance_id,
                                     ),
@@ -1007,6 +1943,36 @@ def run(max_loops=None):
                                     f"prev_status={prev['status']}"
                                 )
                             else:
+                                # Broad ENDED recovery (replay window) before any INSERT.
+                                recovery_sec_start = ended_recovery_window_sec(activity_type_id)
+                                recovered_start = recover_ended_instance_for_late_frame_end(
+                                    cur,
+                                    session_id,
+                                    farm_id,
+                                    activity_date,
+                                    zone_id,
+                                    activity_type_id,
+                                    schedule_id,
+                                    event_time,
+                                    recovery_sec_start,
+                                )
+                                if recovered_start:
+                                    instance_id = recovered_start
+                                    session_map[session_id] = (instance_id, time.time())
+                                    print(
+                                        f"[START_ENDED_RECOVERY] session={session_id} "
+                                        f"→ instance_id={instance_id}"
+                                    )
+                                    queue_event_link(
+                                        cur,
+                                        e["event_row_id"],
+                                        instance_id,
+                                        event_links,
+                                        schedule_id=schedule_id,
+                                        activity_date=activity_date,
+                                    )
+                                    continue
+
                                 # STEP 3: CREATE new instance
                                 if event_age_sec > MAX_EVENT_DELAY_SEC:
                                     print(
@@ -1027,11 +1993,36 @@ def run(max_loops=None):
                                       AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
                                       AND activity_type_id = %s
                                       AND activity_date = %s
+                                      AND (
+                                            (
+                                              %s IS NOT NULL
+                                              AND (
+                                                    activity_schedule_id = %s
+                                                    OR activity_schedule_id IS NULL
+                                                  )
+                                            )
+                                            OR (
+                                              %s IS NULL
+                                              AND (
+                                                    activity_schedule_id IS NOT NULL
+                                                    OR activity_schedule_id IS NULL
+                                                  )
+                                            )
+                                          )
                                       AND status = 'IN_PROGRESS'
                                       AND actual_end_at IS NULL
                                       AND actual_start_at IS NOT NULL
                                       AND ABS(EXTRACT(EPOCH FROM (actual_start_at - %s))) <= %s
-                                    ORDER BY updated_at DESC
+                                    ORDER BY
+                                      CASE
+                                        WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
+                                        WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
+                                        WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
+                                        WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
+                                        ELSE 2
+                                      END,
+                                      ABS(EXTRACT(EPOCH FROM (actual_start_at - %s))),
+                                      updated_at DESC
                                     LIMIT 1
                                     """,
                                     (
@@ -1040,8 +2031,17 @@ def run(max_loops=None):
                                         zone_id,
                                         activity_type_id,
                                         activity_date,
+                                        schedule_id,
+                                        schedule_id,
+                                        schedule_id,
                                         event_time,
                                         SOFT_DEDUPE_WINDOW_SEC,
+                                        schedule_id,
+                                        schedule_id,
+                                        schedule_id,
+                                        schedule_id,
+                                        schedule_id,
+                                        event_time,
                                     ),
                                 )
                                 soft_dupe = cur.fetchone()
@@ -1051,18 +2051,17 @@ def run(max_loops=None):
                                         """
                                         UPDATE activity_instance
                                         SET last_seen_at = %s,
-                                            session_id = %s,
                                             updated_at = %s
                                         WHERE id = %s
                                         """,
-                                        (event_time, session_id, utc_now(), instance_id),
+                                        (event_time, utc_now(), instance_id),
                                     )
                                     session_map[session_id] = (instance_id, time.time())
                                     print(
                                         f"[DEBUG] Soft-dedupe reused active instance "
                                         f"→ instance_id={instance_id}"
                                     )
-                                    event_links.append((e["event_row_id"], instance_id))
+                                    queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
                                     continue
 
                                 within_ideal_window = False
@@ -1070,7 +2069,7 @@ def run(max_loops=None):
                                     if not matched_schedule:
                                         print(
                                             f"[WARN] activity_schedule {schedule_id} missing in cache "
-                                            f"→ create as UNSCHEDULED for event {e['event_row_id']}"
+                                            f"→ drop schedule binding for event {e['event_row_id']}"
                                         )
                                         schedule_id = None
                                     else:
@@ -1084,7 +2083,39 @@ def run(max_loops=None):
                                             event_time, ideal_start_utc, ideal_end_utc
                                         )
 
-                                instance_type = "SCHEDULED" if schedule_id is not None else "UNSCHEDULED"
+                                if schedule_id is not None:
+                                    cur.execute(
+                                        """
+                                        SELECT id
+                                        FROM activity_instance
+                                        WHERE farm_id = %s
+                                          AND activity_schedule_id = %s
+                                          AND activity_date = %s
+                                          AND status = 'MISSED'
+                                        LIMIT 1
+                                        """,
+                                        (farm_id, schedule_id, activity_date),
+                                    )
+                                    missed_slot = cur.fetchone()
+                                    if missed_slot:
+                                        reopened_id = reopen_missed_activity_instance(
+                                            cur,
+                                            missed_slot["id"],
+                                            zone_id,
+                                            session_id,
+                                            event_time,
+                                            within_ideal_window,
+                                        )
+                                        if reopened_id:
+                                            instance_id = reopened_id
+                                            session_map[session_id] = (instance_id, time.time())
+                                            print(
+                                                f"[DEBUG] Reopened MISSED slot as AI session "
+                                                f"→ instance_id={instance_id} schedule_id={schedule_id}"
+                                            )
+                                            queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
+                                            continue
+
                                 cur.execute("SAVEPOINT ai_insert_sp")
                                 try:
                                     cur.execute(
@@ -1096,7 +2127,6 @@ def run(max_loops=None):
                                             activity_schedule_id,
                                             activity_date,
                                             session_id,
-                                            instance_type,
                                             status,
                                             actual_start_at,
                                             last_seen_at,
@@ -1106,7 +2136,7 @@ def run(max_loops=None):
                                             updated_at
                                         )
                                         VALUES (%s,%s,%s,%s,%s,
-                                                %s,%s,
+                                                %s,
                                                 'IN_PROGRESS',
                                                 %s,%s,
                                                 'AI',
@@ -1121,7 +2151,6 @@ def run(max_loops=None):
                                             schedule_id,
                                             activity_date,
                                             session_id,
-                                            instance_type,
                                             event_time,
                                             event_time,
                                             within_ideal_window,
@@ -1133,149 +2162,46 @@ def run(max_loops=None):
                                     cur.execute("RELEASE SAVEPOINT ai_insert_sp")
                                     print(
                                         f"[DEBUG] CREATED-NEW → instance_id={instance_id} "
-                                        f"type={instance_type}"
+                                        f"schedule_id={schedule_id}"
                                     )
                                 except pg_errors.UniqueViolation as ex:
-                                    # Another row already exists for this key/day. Recover deterministically.
                                     cur.execute("ROLLBACK TO SAVEPOINT ai_insert_sp")
                                     cur.execute("RELEASE SAVEPOINT ai_insert_sp")
-                                    print(f"[ERROR] UniqueViolation details: {ex}")
+                                    print(
+                                        f"[RECOVERY] uniq_active_instance hit "
+                                        f"session={session_id}: {ex}"
+                                    )
 
-                                    if schedule_id is None:
-                                        cur.execute(
-                                            """
-                                            SELECT id, status, source
-                                            FROM activity_instance
-                                            WHERE farm_id = %s
-                                              AND zone_id = %s
-                                              AND activity_type_id = %s
-                                              AND activity_schedule_id IS NULL
-                                              AND activity_date = %s
-                                              AND actual_start_at IS NOT NULL
-                                              AND ABS(EXTRACT(EPOCH FROM (actual_start_at - %s))) < 600
-                                            ORDER BY created_at DESC
-                                            LIMIT 1
-                                            """,
-                                            (
-                                                farm_id,
-                                                zone_id,
-                                                activity_type_id,
-                                                activity_date,
-                                                event_time,
-                                            ),
-                                        )
-                                    else:
-                                        cur.execute(
-                                            """
-                                            SELECT id, status, source
-                                            FROM activity_instance
-                                            WHERE farm_id = %s
-                                              AND zone_id = %s
-                                              AND activity_type_id = %s
-                                              AND activity_schedule_id = %s
-                                              AND activity_date = %s
-                                            ORDER BY created_at DESC
-                                            LIMIT 1
-                                            """,
-                                            (farm_id, zone_id, activity_type_id, schedule_id, activity_date),
-                                        )
-                                    existing = cur.fetchone()
-
-                                    # Fallback: conflicting row can be SYSTEM/MISSED with zone_id NULL.
-                                    if not existing and schedule_id is not None:
-                                        cur.execute(
-                                            """
-                                            SELECT id, status, source
-                                            FROM activity_instance
-                                            WHERE farm_id = %s
-                                              AND activity_type_id = %s
-                                              AND activity_schedule_id = %s
-                                              AND activity_date = %s
-                                            ORDER BY created_at DESC
-                                            LIMIT 1
-                                            """,
-                                            (farm_id, activity_type_id, schedule_id, activity_date),
-                                        )
-                                        existing = cur.fetchone()
-
-                                    if not existing:
+                                    existing_uv_id = find_in_progress_bucket_attach(
+                                        cur,
+                                        farm_id,
+                                        zone_id,
+                                        activity_type_id,
+                                        activity_date,
+                                        schedule_id,
+                                        event_time,
+                                        event_row_id=e["event_row_id"],
+                                    )
+                                    if existing_uv_id:
+                                        instance_id = existing_uv_id
                                         print(
-                                            f"[WARN] Duplicate insert but no row found on recovery "
-                                            f"→ retry later {e['event_row_id']}"
+                                            f"[RECOVERY_ATTACH] session={session_id} "
+                                            f"→ instance_id={instance_id}"
                                         )
-                                        continue
-                                    instance_id = existing["id"]
-                                    existing_status = existing["status"]
-
-                                    if existing_status != "IN_PROGRESS":
-                                        # Finalized rows (including MISSED) are terminal.
-                                        # Never reopen in-place; create a fresh AI row.
-                                        cur.execute("SAVEPOINT ai_fresh_insert_sp")
-                                        try:
-                                            cur.execute(
-                                                """
-                                                INSERT INTO activity_instance (
-                                                    farm_id,
-                                                    zone_id,
-                                                    activity_type_id,
-                                                    activity_schedule_id,
-                                                    activity_date,
-                                                    session_id,
-                                                    instance_type,
-                                                    status,
-                                                    actual_start_at,
-                                                    last_seen_at,
-                                                    source,
-                                                    within_ideal_window,
-                                                    created_at,
-                                                    updated_at
-                                                )
-                                                VALUES (%s,%s,%s,%s,%s,
-                                                        %s,%s,
-                                                        'IN_PROGRESS',
-                                                        %s,%s,
-                                                        'AI',
-                                                        %s,
-                                                        %s,%s)
-                                                RETURNING id
-                                                """,
-                                                (
-                                                    farm_id,
-                                                    zone_id,
-                                                    activity_type_id,
-                                                    schedule_id,
-                                                    activity_date,
-                                                    session_id,
-                                                    instance_type,
-                                                    event_time,
-                                                    event_time,
-                                                    within_ideal_window,
-                                                    utc_now(),
-                                                    utc_now(),
-                                                ),
-                                            )
-                                            instance_id = cur.fetchone()["id"]
-                                            cur.execute("RELEASE SAVEPOINT ai_fresh_insert_sp")
-                                            print(
-                                                f"[DEBUG] CREATED-NEW after finalized-row conflict "
-                                                f"→ instance_id={instance_id}"
-                                            )
-                                        except pg_errors.UniqueViolation:
-                                            cur.execute("ROLLBACK TO SAVEPOINT ai_fresh_insert_sp")
-                                            cur.execute("RELEASE SAVEPOINT ai_fresh_insert_sp")
-                                            print(
-                                                f"[WARN] Finalized row conflict prevented fresh insert "
-                                                f"→ retry later {e['event_row_id']}"
-                                            )
-                                            continue
-                                    else:
                                         cur.execute(
                                             """
                                             UPDATE activity_instance
                                             SET actual_start_at = LEAST(COALESCE(actual_start_at, %s), %s),
                                                 last_seen_at = GREATEST(COALESCE(last_seen_at, %s), %s),
-                                                session_id = COALESCE(session_id, %s),
+                                                actual_end_at = CASE
+                                                    WHEN actual_end_at IS NOT NULL THEN
+                                                        GREATEST(actual_end_at, %s::timestamptz)
+                                                    ELSE actual_end_at
+                                                END,
                                                 zone_id = COALESCE(zone_id, %s),
+                                                session_id = COALESCE(session_id, %s),
+                                                activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                                activity_date = COALESCE(activity_date, %s),
                                                 updated_at = %s
                                             WHERE id = %s
                                             """,
@@ -1284,8 +2210,123 @@ def run(max_loops=None):
                                                 event_time,
                                                 event_time,
                                                 event_time,
-                                                session_id,
+                                                event_time,
                                                 zone_id,
+                                                session_id,
+                                                schedule_id,
+                                                activity_date,
+                                                utc_now(),
+                                                instance_id,
+                                            ),
+                                        )
+                                        session_map[session_id] = (instance_id, time.time())
+                                        queue_event_link(
+                                            cur,
+                                            e["event_row_id"],
+                                            instance_id,
+                                            event_links,
+                                            schedule_id=schedule_id,
+                                            activity_date=activity_date,
+                                        )
+                                        continue
+
+                                    print(f"[WARN] UniqueViolation — no bucket IN_PROGRESS row: {ex}")
+
+                                    cur.execute(
+                                        """
+                                        SELECT id, status, source, activity_schedule_id
+                                        FROM activity_instance
+                                        WHERE farm_id = %s
+                                          AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
+                                          AND activity_type_id = %s
+                                          AND activity_date = %s
+                                          AND actual_start_at IS NOT NULL
+                                          AND ABS(
+                                                EXTRACT(EPOCH FROM (actual_start_at - %s))
+                                              ) < 600
+                                        ORDER BY
+                                          CASE
+                                            WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
+                                            WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
+                                            WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
+                                            WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
+                                            ELSE 2
+                                          END,
+                                          ABS(EXTRACT(EPOCH FROM (actual_start_at - %s))),
+                                          created_at DESC
+                                        LIMIT 1
+                                        """,
+                                        (
+                                            farm_id,
+                                            zone_id,
+                                            zone_id,
+                                            activity_type_id,
+                                            activity_date,
+                                            event_time,
+                                            schedule_id,
+                                            schedule_id,
+                                            schedule_id,
+                                            schedule_id,
+                                            schedule_id,
+                                            event_time,
+                                        ),
+                                    )
+                                    existing = cur.fetchone()
+
+                                    if existing and schedule_id is not None:
+                                        es = existing.get("activity_schedule_id")
+                                        if es is not None and es != schedule_id:
+                                            log_attach_reject(
+                                                "uniq_recovery_schedule_rank",
+                                                event_row_id=e["event_row_id"],
+                                                event_schedule=schedule_id,
+                                                instance_schedule=es,
+                                            )
+
+                                    if not existing:
+                                        instance_id = resolve_fallback_instance_or_skip(
+                                            cur,
+                                            farm_id,
+                                            zone_id,
+                                            activity_type_id,
+                                            schedule_id,
+                                            activity_date,
+                                            session_id,
+                                            event_time,
+                                            farm_tz,
+                                            matched_schedule,
+                                            e["event_row_id"],
+                                            event_columns,
+                                            "START UniqueViolation recovery miss",
+                                        )
+                                        if instance_id is None:
+                                            continue
+                                        session_map[session_id] = (instance_id, time.time())
+                                        queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
+                                        continue
+                                    instance_id = existing["id"]
+                                    existing_status = existing["status"]
+
+                                    if existing_status == "IN_PROGRESS":
+                                        cur.execute(
+                                            """
+                                            UPDATE activity_instance
+                                            SET actual_start_at = LEAST(COALESCE(actual_start_at, %s), %s),
+                                                last_seen_at = GREATEST(COALESCE(last_seen_at, %s), %s),
+                                                zone_id = COALESCE(zone_id, %s),
+                                                activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                                activity_date = COALESCE(activity_date, %s),
+                                                updated_at = %s
+                                            WHERE id = %s
+                                            """,
+                                            (
+                                                event_time,
+                                                event_time,
+                                                event_time,
+                                                event_time,
+                                                zone_id,
+                                                schedule_id,
+                                                activity_date,
                                                 utc_now(),
                                                 instance_id,
                                             ),
@@ -1294,159 +2335,385 @@ def run(max_loops=None):
                                             f"[DEBUG] REUSED-EXISTING IN_PROGRESS (duplicate guard) "
                                             f"→ instance_id={instance_id}"
                                         )
+                                    elif existing_status == "MISSED":
+                                        reopened_id = reopen_missed_activity_instance(
+                                            cur,
+                                            existing["id"],
+                                            zone_id,
+                                            session_id,
+                                            event_time,
+                                            within_ideal_window,
+                                        )
+                                        if reopened_id:
+                                            instance_id = reopened_id
+                                            print(
+                                                f"[DEBUG] UniqueViolation → reopened MISSED row "
+                                                f"→ instance_id={instance_id}"
+                                            )
+                                        else:
+                                            instance_id = resolve_fallback_instance_or_skip(
+                                                cur,
+                                                farm_id,
+                                                zone_id,
+                                                activity_type_id,
+                                                schedule_id,
+                                                activity_date,
+                                                session_id,
+                                                event_time,
+                                                farm_tz,
+                                                matched_schedule,
+                                                e["event_row_id"],
+                                                event_columns,
+                                                "START MISSED reopen raced",
+                                            )
+                                            if instance_id is None:
+                                                continue
+                                            session_map[session_id] = (instance_id, time.time())
+                                            queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
+                                            continue
+                                    else:
+                                        # --------------------------------------------------
+                                        # REPLAY RECOVERY FOR FINALIZED ENDED ROWS
+                                        # --------------------------------------------------
+                                        # Delayed replay events may arrive after instance already
+                                        # finalized as ENDED.
+                                        #
+                                        # In this case:
+                                        # - DO NOT orphan
+                                        # - DO NOT create new instance
+                                        # - Reuse finalized ENDED instance
+                                        # - Reopen into IN_PROGRESS so FRAME/END can continue stitching
+                                        # --------------------------------------------------
+
+                                        if existing_status == "ENDED":
+                                            instance_id = existing["id"]
+
+                                            cur.execute(
+                                                """
+                                                UPDATE activity_instance
+                                                SET status = 'IN_PROGRESS',
+                                                    actual_end_at = NULL,
+                                                    actual_duration_sec = NULL,
+                                                    last_seen_at = %s,
+                                                    session_classification = NULL,
+                                                    started_offset_min = NULL,
+                                                    ended_offset_min = NULL,
+                                                    activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                                    activity_date = COALESCE(activity_date, %s),
+                                                    updated_at = %s
+                                                WHERE id = %s
+                                                """,
+                                                (
+                                                    event_time,
+                                                    schedule_id,
+                                                    activity_date,
+                                                    utc_now(),
+                                                    instance_id,
+                                                ),
+                                            )
+
+                                            session_map[session_id] = (instance_id, time.time())
+
+                                            print(
+                                                f"[REPLAY_RECOVERY] reopened ENDED instance "
+                                                f"→ instance_id={instance_id}"
+                                            )
+
+                                            queue_event_link(
+                                                cur,
+                                                e["event_row_id"],
+                                                instance_id,
+                                                event_links,
+                                                schedule_id=schedule_id,
+                                                activity_date=activity_date,
+                                            )
+
+                                            continue
+
+                                        # --------------------------------------------------
+                                        # FINALIZED NON-RECOVERABLE ROW
+                                        # --------------------------------------------------
+
+                                        instance_id = resolve_fallback_instance_or_skip(
+                                            cur,
+                                            farm_id,
+                                            zone_id,
+                                            activity_type_id,
+                                            schedule_id,
+                                            activity_date,
+                                            session_id,
+                                            event_time,
+                                            farm_tz,
+                                            matched_schedule,
+                                            e["event_row_id"],
+                                            event_columns,
+                                            "START finalized unrecoverable",
+                                        )
+
+                                        if instance_id is None:
+                                            continue
+
+                                        session_map[session_id] = (instance_id, time.time())
+
+                                        queue_event_link(
+                                            cur,
+                                            e["event_row_id"],
+                                            instance_id,
+                                            event_links,
+                                            schedule_id=schedule_id,
+                                            activity_date=activity_date,
+                                        )
+
+                                        continue
+
+                        if instance_id is None:
+                            instance_id = resolve_fallback_instance_or_skip(
+                                cur,
+                                farm_id,
+                                zone_id,
+                                activity_type_id,
+                                schedule_id,
+                                activity_date,
+                                session_id,
+                                event_time,
+                                farm_tz,
+                                matched_schedule,
+                                e["event_row_id"],
+                                event_columns,
+                                "START path exhausted",
+                            )
+                            if instance_id is None:
+                                continue
 
                         # Map this session to the instance
                         session_map[session_id] = (instance_id, time.time())
                         print(f"[DEBUG] MAPPED session {session_id} → instance_id={instance_id}")
 
-                        event_links.append((e["event_row_id"], instance_id))
+                        queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
 
                     # -------------------------------------------------
                     # FRAME / END
                     # -------------------------------------------------
-                    else:
-                        # Session-first attach for FRAME/END to prevent retry loops.
+                    elif etype in ("FRAME_AGGREGATE", "END_CANDIDATE"):
+                        instance_id = None
                         cache_row = session_map.get(session_id)
                         if cache_row:
                             instance_id = cache_row[0]
-                            session_map[session_id] = (instance_id, time.time())
-                            if schedule_id is not None:
-                                cur.execute(
-                                    """
-                                    UPDATE activity_instance
-                                    SET last_seen_at = %s,
-                                        updated_at = %s,
-                                        activity_schedule_id = COALESCE(activity_schedule_id, %s),
-                                        instance_type = CASE
-                                            WHEN activity_schedule_id IS NULL THEN 'SCHEDULED'
-                                            ELSE instance_type
-                                        END
-                                    WHERE id = %s
-                                    """,
-                                    (event_time, utc_now(), schedule_id, instance_id),
-                                )
-                            else:
-                                cur.execute(
-                                    """
-                                    UPDATE activity_instance
-                                    SET last_seen_at = %s,
-                                        updated_at = %s
-                                    WHERE id = %s
-                                    """,
-                                    (event_time, utc_now(), instance_id),
-                                )
-                            event_links.append((e["event_row_id"], instance_id))
-                            continue
-
-                        instance_id = None
 
                         if instance_id is None:
-                            # 🔥 CRITICAL FIX (ISSUE 3): DB Fallback for Restart Safety
-                            # If session_map lost (aggregator restart), recover from DB
-                            cur.execute(
-                                """
-                                SELECT id FROM activity_instance
-                                WHERE session_id = %s
-                                  AND status = 'IN_PROGRESS'
-                                  AND actual_end_at IS NULL
-                                ORDER BY updated_at DESC
-                                LIMIT 1
-                                """,
-                                (session_id,),
+                            resolved_fe = resolve_attachable_instance(
+                                cur,
+                                farm_id,
+                                zone_id,
+                                activity_type_id,
+                                activity_date,
+                                schedule_id,
+                                event_time,
+                                session_id,
+                                try_session_restore=True,
+                                try_ended_recovery_sec=ended_recovery_window_sec(
+                                    activity_type_id
+                                ),
+                                event_row_id=e["event_row_id"],
                             )
-                            row = cur.fetchone()
-                            
-                            if row:
-                                instance_id = row["id"]
-                                # Restore to memory cache
+                            if resolved_fe:
+                                instance_id = resolved_fe
                                 session_map[session_id] = (instance_id, time.time())
-                                print(f"[DEBUG] Restored session map from DB: {session_id} → {instance_id}")
+                                print(
+                                    f"[DEBUG] FRAME/END resolve_attach "
+                                    f"session={session_id} → instance_id={instance_id}"
+                                )
+
+                        if instance_id is None:
+                            instance_id = resolve_fallback_instance_or_skip(
+                                cur,
+                                farm_id,
+                                zone_id,
+                                activity_type_id,
+                                schedule_id,
+                                activity_date,
+                                session_id,
+                                event_time,
+                                farm_tz,
+                                matched_schedule,
+                                e["event_row_id"],
+                                event_columns,
+                                f"{etype} attach exhausted",
+                            )
+                            if instance_id:
+                                session_map[session_id] = (instance_id, time.time())
+                                print(
+                                    f"[DEBUG] FRAME/END fallback instance "
+                                    f"session={session_id} → instance_id={instance_id}"
+                                )
                             else:
-                                # Try business-key recovery (session_id churn), then fallback create.
+                                print(
+                                    f"[ORPHAN_EVENT] "
+                                    f"event_id={e['event_row_id']} "
+                                    f"event_type={etype}"
+                                )
+                                continue
+
+                        cur.execute(
+                            """
+                            SELECT
+                                id,
+                                farm_id,
+                                activity_type_id,
+                                activity_date,
+                                status
+                            FROM activity_instance
+                            WHERE id = %s
+                            """,
+                            (instance_id,),
+                        )
+                        inst = cur.fetchone()
+                        if not inst:
+                            session_map.pop(session_id, None)
+                            continue
+                        if inst["status"] == "IN_PROGRESS":
+                            pass
+                        elif inst["status"] in FINALIZED_ATTACH_STATUSES:
+                            print(
+                                f"[FRAME_END_FINALIZED] updating instance_id={instance_id} "
+                                f"status={inst['status']} event_row_id={e['event_row_id']}"
+                            )
+                        else:
+                            reopened = resolve_attachable_instance(
+                                cur,
+                                farm_id,
+                                zone_id,
+                                activity_type_id,
+                                activity_date,
+                                schedule_id,
+                                event_time,
+                                session_id,
+                                try_session_restore=False,
+                                try_ended_recovery_sec=ended_recovery_window_sec(
+                                    activity_type_id
+                                ),
+                                event_row_id=e["event_row_id"],
+                            )
+                            if reopened:
+                                instance_id = reopened
+                                session_map[session_id] = (instance_id, time.time())
                                 cur.execute(
                                     """
-                                    SELECT id
+                                    SELECT
+                                        id,
+                                        farm_id,
+                                        activity_type_id,
+                                        activity_date,
+                                        status
                                     FROM activity_instance
-                                    WHERE farm_id = %s
-                                      AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
-                                      AND activity_type_id = %s
-                                      AND activity_date = %s
-                                      AND status = 'IN_PROGRESS'
-                                      AND actual_end_at IS NULL
-                                    ORDER BY updated_at DESC
-                                    LIMIT 1
+                                    WHERE id = %s
                                     """,
-                                    (
-                                        farm_id,
-                                        zone_id,
-                                        zone_id,
-                                        activity_type_id,
-                                        activity_date,
-                                    ),
+                                    (instance_id,),
                                 )
-                                by_key = cur.fetchone()
-                                if by_key:
-                                    instance_id = by_key["id"]
-                                    if schedule_id is not None:
-                                        cur.execute(
-                                            """
-                                            UPDATE activity_instance
-                                            SET last_seen_at = %s,
-                                                updated_at = %s,
-                                                activity_schedule_id = COALESCE(activity_schedule_id, %s),
-                                                instance_type = CASE
-                                                    WHEN activity_schedule_id IS NULL THEN 'SCHEDULED'
-                                                    ELSE instance_type
-                                                END
-                                            WHERE id = %s
-                                            """,
-                                            (event_time, utc_now(), schedule_id, instance_id),
-                                        )
-                                    else:
-                                        cur.execute(
-                                            """
-                                            UPDATE activity_instance
-                                            SET last_seen_at = %s,
-                                                updated_at = %s
-                                            WHERE id = %s
-                                            """,
-                                            (event_time, utc_now(), instance_id),
-                                        )
-                                    session_map[session_id] = (instance_id, time.time())
-                                    print(
-                                        f"[DEBUG] Recovered active instance by business key "
-                                        f"→ session={session_id} instance_id={instance_id}"
-                                    )
-                                else:
-                                    instance_id = create_fallback_activity_instance(
-                                        cur,
-                                        farm_id,
-                                        zone_id,
-                                        activity_type_id,
-                                        schedule_id,
-                                        activity_date,
-                                        session_id,
-                                        event_time,
-                                        farm_tz,
-                                        matched_schedule,
-                                        e["event_row_id"],
-                                    )
-                                    if instance_id is None:
-                                        print(
-                                            f"[WARN] TEMP SKIP (will retry) {etype} "
-                                            f"→ event_id={e['event_row_id']} session={session_id}"
-                                        )
-                                        continue
-                                    session_map[session_id] = (instance_id, time.time())
-                                    print(
-                                        f"[DEBUG] FRAME/END fallback mapped session "
-                                        f"{session_id} → instance_id={instance_id}"
-                                    )
-                        else:
-                            # Refresh last-touch timestamp for long sessions.
-                            session_map[session_id] = (instance_id, time.time())
+                                inst = cur.fetchone()
+                            if not inst or (
+                                inst["status"] != "IN_PROGRESS"
+                                and inst["status"] not in FINALIZED_ATTACH_STATUSES
+                            ):
+                                session_map.pop(session_id, None)
+                                continue
+                        if inst["activity_date"] != activity_date:
+                            session_map.pop(session_id, None)
+                            continue
+                        if inst["farm_id"] != farm_id:
+                            session_map.pop(session_id, None)
+                            continue
+                        if inst["activity_type_id"] != activity_type_id:
+                            session_map.pop(session_id, None)
+                            continue
 
-                        # Refresh instance state (get latest values)
+                        session_map[session_id] = (instance_id, time.time())
+
+                        finalized_extend = inst["status"] in FINALIZED_ATTACH_STATUSES
+                        cls_reset_sql = (
+                            """
+                                    , session_classification = NULL
+                                    , started_offset_min = NULL
+                                    , ended_offset_min = NULL"""
+                            if finalized_extend
+                            else ""
+                        )
+
+                        if schedule_id is not None:
+                            cur.execute(
+                                f"""
+                                UPDATE activity_instance
+                                SET last_seen_at = %s,
+                                    updated_at = %s,
+                                    activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                    activity_date = COALESCE(activity_date, %s),
+                                    actual_end_at = CASE
+                                        WHEN actual_end_at IS NOT NULL THEN
+                                            GREATEST(actual_end_at, %s::timestamptz)
+                                        ELSE actual_end_at
+                                    END,
+                                    actual_duration_sec = CASE
+                                        WHEN actual_start_at IS NOT NULL THEN
+                                            CAST(
+                                                EXTRACT(
+                                                    EPOCH FROM (
+                                                        GREATEST(actual_end_at, %s::timestamptz)
+                                                        - actual_start_at
+                                                    )
+                                                ) AS INTEGER
+                                            )
+                                        ELSE actual_duration_sec
+                                    END
+                                    {cls_reset_sql}
+                                WHERE id = %s
+                                """,
+                                (
+                                    event_time,
+                                    utc_now(),
+                                    schedule_id,
+                                    activity_date,
+                                    event_time,
+                                    event_time,
+                                    instance_id,
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                f"""
+                                UPDATE activity_instance
+                                SET last_seen_at = %s,
+                                    updated_at = %s,
+                                    activity_date = COALESCE(activity_date, %s),
+                                    actual_end_at = CASE
+                                        WHEN actual_end_at IS NOT NULL THEN
+                                            GREATEST(actual_end_at, %s::timestamptz)
+                                        ELSE actual_end_at
+                                    END,
+                                    actual_duration_sec = CASE
+                                        WHEN actual_start_at IS NOT NULL THEN
+                                            CAST(
+                                                EXTRACT(
+                                                    EPOCH FROM (
+                                                        GREATEST(actual_end_at, %s::timestamptz)
+                                                        - actual_start_at
+                                                    )
+                                                ) AS INTEGER
+                                            )
+                                        ELSE actual_duration_sec
+                                    END
+                                    {cls_reset_sql}
+                                WHERE id = %s
+                                """,
+                                (
+                                    event_time,
+                                    utc_now(),
+                                    activity_date,
+                                    event_time,
+                                    event_time,
+                                    instance_id,
+                                ),
+                            )
+
                         cur.execute(
                             """
                             SELECT actual_start_at, actual_end_at, activity_schedule_id
@@ -1458,63 +2725,37 @@ def run(max_loops=None):
                         row = cur.fetchone()
                         if not row:
                             session_map.pop(session_id, None)
-                            print(f"[WARN] Instance disappeared → retry later {e['event_row_id']}")
+                            print(
+                                f"[ORPHAN_EVENT] "
+                                f"event_id={e['event_row_id']} "
+                                f"event_type={etype}"
+                            )
                             continue
                         actual_start_at = row["actual_start_at"]
-                        current_end_at = row["actual_end_at"]
 
-                        if etype == "FRAME_AGGREGATE":
-                            cur.execute(
-                                """
-                                UPDATE activity_instance
-                                SET last_seen_at = %s,
-                                    updated_at = %s
-                                WHERE id = %s
-                                """,
-                                (event_time, utc_now(), instance_id),
-                            )
-
-                        elif etype == "END_CANDIDATE":
-                            # Always defer real closure to cleanup_stale_instances after
-                            # CLOSE_DELAY_SEC of inactivity. Classifying NOISE from the *first*
-                            # END_CANDIDATE while duration < NOISE_DURATION_SEC falsely splits real
-                            # sessions (edge often emits END during brief detection gaps).
+                        if etype == "END_CANDIDATE":
                             if actual_start_at is None:
-                                cur.execute(
-                                    """
-                                    UPDATE activity_instance
-                                    SET last_seen_at = %s,
-                                        updated_at = %s
-                                    WHERE id = %s
-                                    """,
-                                    (event_time, utc_now(), instance_id),
-                                )
                                 print(
                                     "[WARN] END_CANDIDATE but no start -> fallback update "
                                     f"instance_id={instance_id}"
                                 )
                             else:
-                                duration_sec = int((event_time - actual_start_at).total_seconds())
-                                cur.execute(
-                                    """
-                                    UPDATE activity_instance
-                                    SET last_seen_at = %s,
-                                        updated_at = %s
-                                    WHERE id = %s
-                                    """,
-                                    (event_time, utc_now(), instance_id),
+                                duration_sec = int(
+                                    (event_time - actual_start_at).total_seconds()
                                 )
                                 print(
                                     "[DEBUG] END_CANDIDATE -> deferred close (stitch mode) "
                                     f"instance_id={instance_id} duration={duration_sec}s"
                                 )
 
-                        event_links.append((e["event_row_id"], instance_id))
+                        queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
 
                 bulk_link_events(cur, event_links)
+                normalize_null_instance_statuses(cur)
                 cur.connection.commit()
 
-            cleanup_stale_instances(cur, ai_columns)
+            cleanup_stale_instances(cur, session_map)
+            normalize_null_instance_statuses(cur)
             cur.connection.commit()
 
         if not processed:

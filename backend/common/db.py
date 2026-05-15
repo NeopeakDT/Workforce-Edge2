@@ -10,9 +10,15 @@ To test this file run python scripts/test_auth_jwt.py
 # common/db.py
 
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load .env from predictable paths (systemd units use different WorkingDirectory values).
+_backend_root = Path(__file__).resolve().parents[1]
+_repo_root = _backend_root.parent
+load_dotenv(_backend_root / ".env")
+load_dotenv(_repo_root / ".env")
 load_dotenv()
 
 #Database Library Imports-
