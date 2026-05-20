@@ -174,6 +174,8 @@ PROCESSING_FPS = float(os.getenv("EDGE_PROCESSING_FPS", "5.0"))
 EDGE_MODE = os.getenv("EDGE_MODE", "LIVE")  # LIVE or BATCH
 WATCHDOG_FILE_PATH = os.getenv("EDGE_WATCHDOG_FILE", "/tmp/workforce_edge_alive")
 PROCESS_STARTED_AT = time.time()
+MILKING_MODEL_ENABLED = True
+MILKING_MODEL_PATH = "models/WF_Milking_v1.1_best.engine"
 
 # ------------------------------------------------------------------
 # Utils
@@ -731,7 +733,7 @@ def _process_camera_impl(
     smoothers = {
         "SCRAPPING": TemporalSmoother(),
         "FEEDING": TemporalSmoother(),
-        "MILKING": TemporalSmoother(start_sec=8, end_sec=20),
+        "MILKING": TemporalSmoother(start_sec=5, end_sec=12),
     }
 
     activity_state = {
@@ -1113,28 +1115,40 @@ def _process_camera_impl(
 
         for det in detections_milking_model:
             det["class"] = str(det.get("class", "")).lower()
-        detections = detections_activity + detections_milking_model
+        detections_common = detections_activity
+        detections_milking_only = detections_milking_model
 
         # Apply ROI filtering if enabled and ROI polygons are configured
         frame_h, frame_w = frame.shape[:2]
 
         # SCRAPPING ROI filtering (precompute polygon/mask on size change)
         if ROI_ENABLED and scrap_roi_cfg:
-            detections_scrap = filter_by_roi(detections, scrap_polygon, frame.shape, roi_mask=scrap_mask)
+            detections_scrap = filter_by_roi(
+                detections_common,
+                scrap_polygon,
+                frame.shape,
+                roi_mask=scrap_mask,
+            )
         else:
-            detections_scrap = detections
+            detections_scrap = detections_common
 
         # FEEDING ROI filtering (precompute polygon/mask on size change)
         if ROI_ENABLED and feed_roi_cfg:
-            detections_feed = filter_by_roi(detections, feed_polygon, frame.shape, roi_mask=feed_mask)
+            detections_feed = filter_by_roi(
+                detections_common,
+                feed_polygon,
+                frame.shape,
+                roi_mask=feed_mask,
+            )
         else:
-            detections_feed = detections
+            detections_feed = detections_common
 
         if ROI_ENABLED and milking_polygon is not None:
             detections_milking = filter_by_roi(
-                detections,
+                detections_milking_only,
                 milking_polygon,
                 frame.shape,
+                min_overlap_ratio=0.01,
                 roi_mask=milking_mask,
             )
         elif zone_milking and milking_polygon is None:
@@ -1146,7 +1160,7 @@ def _process_camera_impl(
                 milking_roi_missing_warned = True
             detections_milking = []
         else:
-            detections_milking = detections
+            detections_milking = detections_milking_only
 
         frame_processing_time = time.time() - t0
         total_processing_time += frame_processing_time
@@ -1581,21 +1595,20 @@ def main():
 
     logger.info("Edge Detector: Using device: %s", device)
 
-    model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
+    activity_model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
 
     # Create shared ModelRunner (once per device, NOT per camera)
-    activity_runner = ModelRunner(model_path, device=device)
-    logger.info("Activity model loaded: %s", model_path)
+    activity_runner = ModelRunner(activity_model_path, device=device)
+    logger.info("Activity model loaded: %s", activity_model_path)
 
-    milking_model_relpath = os.getenv("MILKING_MODEL_PATH", "models/milking.engine")
-    milking_model_path = os.path.join(PROJECT_ROOT, milking_model_relpath)
+    milking_model_path = os.path.join(PROJECT_ROOT, MILKING_MODEL_PATH)
     milking_cameras = [
         c for c in cfg.get("cameras", [])
         if resolve_zone_id(c, "MILKING")
     ]
     milking_model_enabled = False
     milking_runner = None
-    if milking_cameras:
+    if MILKING_MODEL_ENABLED and milking_cameras:
         if not os.path.exists(milking_model_path):
             logger.warning(
                 "MILKING model not found at %s; MILKING inference disabled",

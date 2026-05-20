@@ -25,7 +25,10 @@ Operational notes:
 - Env `AGG_ENDED_RECOVERY_WINDOW_SEC`: optional override for late FRAME/END stitch into `ENDED` rows
   (see `ended_recovery_window_sec` for activity-type defaults; separate from live attach guard).
 - Default `AGG_CLOSE_DELAY_SEC` / `AGG_END_GAP_SEC` is 900s unless overridden (use 1800+ for heavy replay).
-- Live attach uses `live_attach_guard_sec` for open rows and `ended_recovery_window_sec` for recent finalized rows.
+- Live attach uses `MERGE_GAP_SEC` / `live_attach_guard_sec` (strict + soft `IN_PROGRESS` only).
+  Historical replay uses nearest-neighbor on `activity_date` then bounded contiguity
+  (`AGG_HISTORICAL_REPLAY_GAP_SEC`, default 1800s). When `event_age_sec > live_attach_guard_sec`,
+  resolver skips live paths and uses replay mode only.
 - Periodic reconciliation: `AGG_RECONCILE_EVERY_LOOPS` (default 5) pulls NULL-linked events via
   `retry_unlinked_events`; lookback `AGG_RECONCILE_LOOKBACK_DAYS` (default 7); batch `AGG_RECONCILE_BATCH_SIZE`.
   Orphans stay retriable (`merge_processed` unchanged).
@@ -33,10 +36,8 @@ Operational notes:
   START converts that row back to `IN_PROGRESS` instead of inserting another row.
 
 Critical rules:
-- Attach logic is centralized in `resolve_attachable_instance` / `find_in_progress_bucket_attach`:
-  same farm / type / day / zone-soft; **open** rows attach by `last_seen_at` within `live_attach_guard_sec`;
-  **finalized** rows (`ENDED` / timed classifications) attach by proximity to `actual_end_at` within
-  `ended_recovery_window_sec`. Schedule is ranking only (soft NULL match).
+- Attach logic: live = strict + soft `IN_PROGRESS` (same day). Historical = nearest contiguous bucket on
+  `activity_date` with replay gap (default 1800s). `ended_recovery_window_sec` (7200s) is for same-day ENDED stitch only.
 - `recover_ended_instance_for_late_frame_end` extends **ENDED** rows in-place (`actual_end_at` / duration /
   `last_seen_at`) without setting `status = 'IN_PROGRESS'`, preserving `check_valid_lifecycle`.
 - `session_id` is a hint for ordering/cache; bucket keys are farm / zone-soft / activity_type / day.
@@ -69,10 +70,12 @@ from aggregation.activity_schedule_resolver import (
     is_actual_start_within_ideal_window,
 )
 
-MERGE_GAP_MINUTES = {
-    1: 10,  # MILKING
-    2: 5,  # FEEDING
-    3: 30,  # SCRAPPING — align reopen/merge-on-start with long sparse-session recovery (see ended_recovery_window_sec)
+# Max gap (seconds) between events to treat as one activity instance.
+# A schedule may contain many instances; compliance aggregates across them.
+MERGE_GAP_SEC = {
+    1: 900,  # milking
+    2: 900,  # feeding / TRM — match CLOSE_DELAY_SEC (sparse frames / inference gaps)
+    3: 300,  # scrapping / cleaning
 }
 
 MIN_VALID_DURATION_SEC = {
@@ -92,10 +95,33 @@ FINALIZED_LIFECYCLE_STATUSES = (
 FINALIZED_ATTACH_STATUSES = frozenset(FINALIZED_LIFECYCLE_STATUSES)
 
 
+def merge_gap_sec(activity_type_id: int) -> int:
+    """Seconds allowed between last activity and attach/reopen continuity."""
+    return MERGE_GAP_SEC.get(activity_type_id, 600)
+
+
 def reopen_window_sec(activity_type_id: int) -> int:
-    """Seconds allowed between last activity and a new attach/reopen; keyed by activity_type_id."""
-    minutes = MERGE_GAP_MINUTES.get(activity_type_id, 10)
-    return minutes * 60
+    """Alias for merge gap (reopen / merge-on-start use the same continuity bound)."""
+    return merge_gap_sec(activity_type_id)
+
+
+def continuity_gap_exceeded(
+    activity_type_id: int, event_time, anchor_at
+) -> bool:
+    """Hard reject attach/reopen when gap since anchor exceeds activity merge gap."""
+    if anchor_at is None:
+        return False
+    gap_sec = abs((event_time - anchor_at).total_seconds())
+    return gap_sec > merge_gap_sec(activity_type_id)
+
+
+def continuity_anchor_at(row) -> datetime | None:
+    """Reference time for continuity: last_seen on open rows, actual_end on finalized."""
+    if row.get("status") == "IN_PROGRESS":
+        return row.get("last_seen_at")
+    if row.get("actual_end_at") is not None:
+        return row["actual_end_at"]
+    return row.get("last_seen_at")
 
 
 def reopen_missed_activity_instance(
@@ -153,6 +179,102 @@ STALE_START_SESSION_EVENT_MIN = int(os.getenv("AGG_STALE_START_SESSION_EVENT_MIN
 SOFT_DEDUPE_WINDOW_SEC = int(os.getenv("AGG_SOFT_DEDUPE_WINDOW_SEC", "30"))
 # When > 0, skip processing events older than this many seconds (debug / backlog isolation).
 MAX_EVENT_AGE_SEC = int(os.getenv("AGG_MAX_EVENT_AGE_SEC", "0"))
+
+
+def historical_replay_gap_sec(activity_type_id: int) -> int:
+    """
+    Max continuity gap (seconds) for replay attach to an existing bucket — repairs outages,
+    not separate operational sessions. Override: AGG_HISTORICAL_REPLAY_GAP_SEC or _<type_id>
+    (legacy: AGG_HISTORICAL_MAX_DISTANCE_SEC / _<type_id>).
+    """
+    env = os.getenv("AGG_HISTORICAL_REPLAY_GAP_SEC")
+    if env:
+        return int(env)
+    per = os.getenv(f"AGG_HISTORICAL_REPLAY_GAP_SEC_{activity_type_id}")
+    if per:
+        return int(per)
+    legacy = os.getenv("AGG_HISTORICAL_MAX_DISTANCE_SEC")
+    if legacy:
+        return int(legacy)
+    per_legacy = os.getenv(f"AGG_HISTORICAL_MAX_DISTANCE_SEC_{activity_type_id}")
+    if per_legacy:
+        return int(per_legacy)
+    defaults = {
+        1: 1800,  # milking 30 min replay continuity
+        2: 1800,  # feeding 30 min
+        3: 1800,  # scrapping 30 min
+    }
+    return defaults.get(activity_type_id, 1800)
+
+
+def historical_max_distance_sec(activity_type_id: int) -> int:
+    """Alias for `historical_replay_gap_sec` (backward-compatible name)."""
+    return historical_replay_gap_sec(activity_type_id)
+
+
+def historical_start_tolerance_sec(activity_type_id: int) -> int:
+    """How far before `actual_start_at` a replay event may still attach."""
+    env = os.getenv("AGG_HISTORICAL_START_TOLERANCE_SEC")
+    if env:
+        return int(env)
+    per = os.getenv(f"AGG_HISTORICAL_START_TOLERANCE_SEC_{activity_type_id}")
+    if per:
+        return int(per)
+    return live_attach_guard_sec(activity_type_id)
+
+
+# SQL fragment: temporal anchor for historical nearest-neighbor (no live window in WHERE).
+_HISTORICAL_ANCHOR_SQL = "COALESCE(last_seen_at, actual_end_at, actual_start_at)"
+
+
+def historical_instance_anchor(row) -> datetime | None:
+    """Temporal anchor for nearest-neighbor historical matching."""
+    return row.get("last_seen_at") or row.get("actual_end_at") or row.get("actual_start_at")
+
+
+def historical_contiguity_allows(row, event_time, activity_type_id: int):
+    """
+  Replay attach only to a contiguous bucket: bounded gap vs last activity, not whole-day chaining.
+  Returns (allowed, reject_reason, log_fields).
+    """
+    replay_gap = historical_replay_gap_sec(activity_type_id)
+    start_tol = historical_start_tolerance_sec(activity_type_id)
+    start_at = row.get("actual_start_at")
+    last_seen = row.get("last_seen_at")
+    actual_end = row.get("actual_end_at")
+    anchor = historical_instance_anchor(row)
+    log_fields = {
+        "replay_gap_sec": replay_gap,
+        "start_tolerance_sec": start_tol,
+    }
+
+    if anchor is None:
+        return False, "historical_no_anchor", log_fields
+
+    gap_sec = abs((event_time - anchor).total_seconds())
+    log_fields["gap_sec"] = int(gap_sec)
+
+    if gap_sec > replay_gap:
+        return False, "historical_gap_exceeded", log_fields
+
+    if start_at and event_time < start_at - timedelta(seconds=start_tol):
+        log_fields["actual_start_at"] = start_at
+        return False, "historical_before_start", log_fields
+
+    activity_ceiling = last_seen or actual_end or start_at
+    if activity_ceiling and event_time > activity_ceiling + timedelta(
+        seconds=replay_gap
+    ):
+        log_fields["activity_ceiling"] = activity_ceiling
+        return False, "historical_after_window", log_fields
+
+    return True, None, log_fields
+
+
+def is_historical_replay_event(event_time, activity_type_id: int) -> bool:
+    """True when ingestion lag exceeds the live attach window → replay mode only."""
+    age_sec = (utc_now() - event_time).total_seconds()
+    return age_sec > live_attach_guard_sec(activity_type_id)
 
 
 def compute_activity_date(cur, farm_id, event_time_utc):
@@ -224,11 +346,6 @@ def resolve_schedule_for_event(cur, farm_id, activity_type_id, event_time_utc, f
                 minutes=(sched["tolerance_late_min"] or 0)
             )
             
-            print(
-                f"[WINDOW_DEBUG] event={event_local}, "
-                f"start={window_start}, end={window_end}"
-            )
-
             # Check if event falls within tolerance window
             if window_start <= event_local <= window_end:
                 distance_from_start = int((event_local - ideal_start_local).total_seconds() / 60)
@@ -275,11 +392,6 @@ def resolve_schedule_from_rows(schedules, event_time_utc, farm_tz):
             )
             window_end = ideal_end_local + timedelta(
                 minutes=(sched["tolerance_late_min"] or 0)
-            )
-
-            print(
-                f"[WINDOW_DEBUG] event={event_local}, "
-                f"start={window_start}, end={window_end}"
             )
 
             if window_start <= event_local <= window_end:
@@ -342,36 +454,46 @@ def backfill_instance_schedule_date(cur, instance_id, schedule_id, activity_date
 
 
 def normalize_instance_status_for_row(cur, instance_id):
-    """If this instance still has NULL `status`, derive from `actual_end_at` (single-row repair)."""
+    """Repair lifecycle status from actual_end_at."""
     if not instance_id:
         return
+
     cur.execute(
         """
         UPDATE activity_instance
-        SET status = CASE
-            WHEN actual_end_at IS NULL THEN 'IN_PROGRESS'
-            ELSE 'ENDED'
-        END,
+        SET
+            status = (
+                CASE
+                    WHEN actual_end_at IS NULL
+                        THEN 'IN_PROGRESS'
+                    ELSE 'ENDED'
+                END
+            )::activity_status,
             updated_at = %s
         WHERE id = %s
-          AND status IS NULL
         """,
-        (utc_now(), instance_id),
+        (
+            utc_now(),
+            instance_id,
+        ),
     )
 
 
 def normalize_null_instance_statuses(cur):
     """
-    Repair rows where lifecycle writers left `status` NULL (historical + edge paths).
-    Derives status only from `actual_end_at` (aligns with check_valid_lifecycle).
+    Repair rows where lifecycle writers left status NULL.
     """
     cur.execute(
         """
         UPDATE activity_instance
-        SET status = CASE
-            WHEN actual_end_at IS NULL THEN 'IN_PROGRESS'
-            ELSE 'ENDED'
-        END,
+        SET
+            status = (
+                CASE
+                    WHEN actual_end_at IS NULL
+                        THEN 'IN_PROGRESS'
+                    ELSE 'ENDED'
+                END
+            )::activity_status,
             updated_at = %s
         WHERE status IS NULL
         """,
@@ -512,7 +634,25 @@ def resolve_fallback_instance_or_skip(
     except pg_errors.UniqueViolation:
         cur.execute("ROLLBACK TO SAVEPOINT fallback_instance_sp")
         cur.execute("RELEASE SAVEPOINT fallback_instance_sp")
-        alt = find_in_progress_bucket_attach(
+        replay = is_historical_replay_event(event_time, activity_type_id)
+        if not replay:
+            alt = find_in_progress_bucket_attach(
+                cur,
+                farm_id,
+                zone_id,
+                activity_type_id,
+                activity_date,
+                schedule_id,
+                event_time,
+                event_row_id=event_row_id,
+            )
+            if alt:
+                print(
+                    f"[FALLBACK_INSTANCE] uniq race → reuse instance_id={alt} "
+                    f"event_row_id={event_row_id}"
+                )
+                return alt
+        hist_row = recover_historical_instance_attach(
             cur,
             farm_id,
             zone_id,
@@ -522,12 +662,24 @@ def resolve_fallback_instance_or_skip(
             event_time,
             event_row_id=event_row_id,
         )
-        if alt:
-            print(
-                f"[FALLBACK_INSTANCE] uniq race → reuse instance_id={alt} "
-                f"event_row_id={event_row_id}"
+        if hist_row:
+            alt_hist = _attach_from_historical_row(
+                cur,
+                hist_row,
+                session_id,
+                farm_id,
+                activity_date,
+                zone_id,
+                activity_type_id,
+                schedule_id,
+                event_time,
             )
-            return alt
+            if alt_hist:
+                print(
+                    f"[FALLBACK_INSTANCE] historical → reuse instance_id={alt_hist} "
+                    f"event_row_id={event_row_id}"
+                )
+                return alt_hist
         print(
             f"[ORPHAN_EVENT] event_row_id={event_row_id} type={fatal_label} "
             "(UniqueViolation; no attach row)"
@@ -558,14 +710,14 @@ def ended_recovery_window_sec(activity_type_id: int):
     if env_override:
         return int(env_override)
 
-    # activity-specific defaults
+    # activity-specific defaults (historical / ENDED replay — separate from live attach guard)
     defaults = {
-        1: 1800,  # milking 30 min
-        2: 900,  # feeding 15 min
-        3: 1800,  # scrapping 30 min — late FRAME/END after sparse visibility / cleanup delay
+        1: 7200,  # milking 2 h
+        2: 7200,  # feeding 2 h
+        3: 7200,  # scrapping 2 h
     }
 
-    return defaults.get(activity_type_id, 900)
+    return defaults.get(activity_type_id, 7200)
 
 
 def attach_guard_window_sec(activity_type_id: int) -> int:
@@ -585,18 +737,47 @@ def live_attach_guard_sec(activity_type_id: int) -> int:
     per = os.getenv(f"AGG_LIVE_ATTACH_GUARD_SEC_{activity_type_id}")
     if per:
         return int(per)
-    defaults = {
-        1: 300,  # milking
-        2: 300,  # feeding
-        3: 600,  # scrapping — sparse motion / ROI gaps; IN_PROGRESS attach vs last_seen_at
-    }
-    return int(defaults.get(activity_type_id, 180))
+    return merge_gap_sec(activity_type_id)
 
 
 def log_attach_reject(reason: str, **fields):
     """Structured attach failure log (grep-friendly)."""
     parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
     print(f"[ATTACH_REJECT] reason={reason} {parts}".rstrip())
+
+
+def _live_attach_schedule_params(schedule_id):
+    """Bind params for schedule-soft WHERE + ORDER BY (8 placeholders)."""
+    return (
+        schedule_id,
+        schedule_id,
+        schedule_id,
+        schedule_id,
+        schedule_id,
+        schedule_id,
+        schedule_id,
+        schedule_id,
+    )
+
+
+def _finalize_live_attach_row(row, schedule_id, event_row_id, *, soft_label=None):
+    inst_sched = row["activity_schedule_id"]
+    if (
+        schedule_id is not None
+        and inst_sched is not None
+        and inst_sched != schedule_id
+    ):
+        print(
+            f"[ATTACH_SOFT] schedule_soft_match_used "
+            f"event_row_id={event_row_id} event_schedule={schedule_id} "
+            f"instance_schedule={inst_sched}"
+        )
+    if soft_label:
+        print(
+            f"[{soft_label}] instance_id={row['id']} "
+            f"event_row_id={event_row_id} last_seen_at={row.get('last_seen_at')}"
+        )
+    return row["id"]
 
 
 def find_in_progress_bucket_attach(
@@ -611,39 +792,27 @@ def find_in_progress_bucket_attach(
     event_row_id=None,
 ):
     """
-    Bucket attach: open `IN_PROGRESS` rows by `live_attach_guard_sec` vs `last_seen_at`, or recent
-    finalized rows by `ended_recovery_window_sec` vs `actual_end_at`. Schedule is ranking only.
+    Live bucket attach only (same `activity_date`): strict `IN_PROGRESS` within
+    `live_attach_guard_sec`, then soft `IN_PROGRESS` (most recent `last_seen_at`).
+    Does not attach to `ENDED` — use `recover_historical_instance_attach` for replay.
     """
     guard_sec = live_attach_guard_sec(activity_type_id)
-    ended_sec = ended_recovery_window_sec(activity_type_id)
+    sched = _live_attach_schedule_params(schedule_id)
 
+    # STEP 1 — strict live attach
     cur.execute(
-        f"""
-        SELECT id, activity_schedule_id, status
+        """
+        SELECT id, activity_schedule_id, status, last_seen_at, actual_end_at
         FROM activity_instance
         WHERE farm_id = %s
           AND activity_type_id = %s
           AND activity_date = %s
-          AND (
-                zone_id = %s
-                OR zone_id IS NULL
-              )
-          AND (
-                (
-                  status = 'IN_PROGRESS'
-                  AND last_seen_at IS NOT NULL
-                  AND ABS(
-                        EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at))
-                      ) <= %s
-                )
-                OR (
-                  status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
-                  AND actual_end_at IS NOT NULL
-                  AND ABS(
-                        EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at))
-                      ) <= %s
-                )
-              )
+          AND (zone_id = %s OR zone_id IS NULL)
+          AND status = 'IN_PROGRESS'
+          AND last_seen_at IS NOT NULL
+          AND ABS(
+                EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at))
+              ) <= %s
           AND (
                 (
                   %s IS NOT NULL
@@ -661,7 +830,6 @@ def find_in_progress_bucket_attach(
                 )
               )
         ORDER BY
-          CASE WHEN status = 'IN_PROGRESS' THEN 0 ELSE 1 END,
           CASE
             WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
             WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
@@ -669,12 +837,7 @@ def find_in_progress_bucket_attach(
             WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
             ELSE 2
           END,
-          CASE
-            WHEN status = 'IN_PROGRESS' THEN
-              ABS(EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at)))
-            ELSE
-              ABS(EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)))
-          END
+          ABS(EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at)))
         LIMIT 1
         """,
         (
@@ -684,40 +847,74 @@ def find_in_progress_bucket_attach(
             zone_id,
             event_time,
             guard_sec,
-            *FINALIZED_LIFECYCLE_STATUSES,
-            event_time,
-            ended_sec,
-            schedule_id,
-            schedule_id,
-            schedule_id,
-            schedule_id,
-            schedule_id,
-            schedule_id,
-            schedule_id,
-            schedule_id,
-            event_time,
+            *sched,
             event_time,
         ),
     )
     row = cur.fetchone()
     if row:
-        inst_sched = row["activity_schedule_id"]
-        if (
-            schedule_id is not None
-            and inst_sched is not None
-            and inst_sched != schedule_id
-        ):
-            print(
-                f"[ATTACH_SOFT] schedule_soft_match_used "
-                f"event_row_id={event_row_id} event_schedule={schedule_id} "
-                f"instance_schedule={inst_sched}"
+        anchor = continuity_anchor_at(row)
+        if continuity_gap_exceeded(activity_type_id, event_time, anchor):
+            log_attach_reject(
+                "merge_gap_exceeded",
+                event_row_id=event_row_id,
+                farm_id=farm_id,
+                activity_type_id=activity_type_id,
+                activity_date=activity_date,
+                zone_id=zone_id,
+                event_schedule=schedule_id,
+                instance_id=row["id"],
+                gap_sec=int(abs((event_time - anchor).total_seconds()))
+                if anchor
+                else None,
+                merge_gap_sec=merge_gap_sec(activity_type_id),
             )
-        if row["status"] != "IN_PROGRESS":
-            print(
-                f"[ATTACH_FINALIZED] attaching to status={row['status']} instance_id={row['id']} "
-                f"event_row_id={event_row_id}"
-            )
-        return row["id"]
+        else:
+            return _finalize_live_attach_row(row, schedule_id, event_row_id)
+
+    # STEP 2 — soft live attach (fragmented inference gaps; no time guard)
+    cur.execute(
+        """
+        SELECT id, activity_schedule_id, status, last_seen_at, actual_end_at
+        FROM activity_instance
+        WHERE farm_id = %s
+          AND activity_type_id = %s
+          AND activity_date = %s
+          AND (zone_id = %s OR zone_id IS NULL)
+          AND status = 'IN_PROGRESS'
+          AND last_seen_at IS NOT NULL
+          AND (
+                (
+                  %s IS NOT NULL
+                  AND (
+                        activity_schedule_id = %s
+                        OR activity_schedule_id IS NULL
+                      )
+                )
+                OR (
+                  %s IS NULL
+                  AND (
+                        activity_schedule_id IS NOT NULL
+                        OR activity_schedule_id IS NULL
+                      )
+                )
+              )
+        ORDER BY last_seen_at DESC
+        LIMIT 1
+        """,
+        (
+            farm_id,
+            activity_type_id,
+            activity_date,
+            zone_id,
+            *sched[:4],
+        ),
+    )
+    row = cur.fetchone()
+    if row:
+        return _finalize_live_attach_row(
+            row, schedule_id, event_row_id, soft_label="ATTACH_SOFT_LIVE"
+        )
 
     cur.execute(
         """
@@ -734,45 +931,24 @@ def find_in_progress_bucket_attach(
     any_open = int(cur.fetchone()["c"] or 0)
 
     cur.execute(
-        f"""
+        """
         SELECT COUNT(*) AS c
         FROM activity_instance
         WHERE farm_id = %s
           AND activity_type_id = %s
           AND activity_date = %s
           AND (zone_id = %s OR zone_id IS NULL)
-          AND (
-                (
-                  status = 'IN_PROGRESS'
-                  AND last_seen_at IS NOT NULL
-                  AND ABS(
-                        EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at))
-                      ) <= %s
-                )
-                OR (
-                  status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
-                  AND actual_end_at IS NOT NULL
-                  AND ABS(
-                        EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at))
-                      ) <= %s
-                )
-              )
+          AND status = 'IN_PROGRESS'
+          AND last_seen_at IS NOT NULL
+          AND ABS(
+                EXTRACT(EPOCH FROM (%s::timestamptz - last_seen_at))
+              ) <= %s
         """,
-        (
-            farm_id,
-            activity_type_id,
-            activity_date,
-            zone_id,
-            event_time,
-            guard_sec,
-            *FINALIZED_LIFECYCLE_STATUSES,
-            event_time,
-            ended_sec,
-        ),
+        (farm_id, activity_type_id, activity_date, zone_id, event_time, guard_sec),
     )
-    in_window = int(cur.fetchone()["c"] or 0)
+    in_guard = int(cur.fetchone()["c"] or 0)
 
-    if any_open <= 0 and in_window <= 0:
+    if any_open <= 0:
         log_attach_reject(
             "no_attach_bucket",
             event_row_id=event_row_id,
@@ -782,9 +958,8 @@ def find_in_progress_bucket_attach(
             zone_id=zone_id,
             event_schedule=schedule_id,
             guard_sec=guard_sec,
-            ended_sec=ended_sec,
         )
-    elif in_window <= 0:
+    elif in_guard <= 0:
         log_attach_reject(
             "outside_attach_guard",
             event_row_id=event_row_id,
@@ -794,7 +969,6 @@ def find_in_progress_bucket_attach(
             zone_id=zone_id,
             event_schedule=schedule_id,
             guard_sec=guard_sec,
-            ended_sec=ended_sec,
             open_rows=any_open,
         )
     else:
@@ -807,10 +981,106 @@ def find_in_progress_bucket_attach(
             zone_id=zone_id,
             event_schedule=schedule_id,
             guard_sec=guard_sec,
-            ended_sec=ended_sec,
-            in_window_rows=in_window,
+            in_guard_rows=in_guard,
         )
     return None
+
+
+def recover_historical_instance_attach(
+    cur,
+    farm_id,
+    zone_id,
+    activity_type_id,
+    activity_date,
+    schedule_id,
+    event_time,
+    *,
+    event_row_id=None,
+):
+    """
+    Historical / replay attach: nearest contiguous `IN_PROGRESS` or `ENDED` on `activity_date`.
+    No temporal SQL pre-filter. Post-check: `historical_contiguity_allows` (default replay gap 1800s).
+    """
+    params = (
+        farm_id,
+        activity_type_id,
+        activity_date,
+        zone_id,
+        schedule_id,
+        event_time,
+    )
+
+    cur.execute(
+        f"""
+        SELECT
+            id,
+            status,
+            actual_start_at,
+            actual_end_at,
+            last_seen_at,
+            activity_schedule_id
+        FROM activity_instance
+        WHERE farm_id = %s
+          AND activity_type_id = %s
+          AND activity_date = %s
+          AND status IN ('IN_PROGRESS', 'ENDED')
+          AND (
+                zone_id = %s
+                OR zone_id IS NULL
+              )
+        ORDER BY
+          CASE
+            WHEN activity_schedule_id = %s THEN 0
+            WHEN activity_schedule_id IS NULL THEN 1
+            ELSE 2
+          END,
+          ABS(
+            EXTRACT(
+              EPOCH FROM (
+                %s::timestamptz - {_HISTORICAL_ANCHOR_SQL}
+              )
+            )
+          ) ASC
+        LIMIT 1
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    if not row:
+        log_attach_reject(
+            "historical_miss",
+            event_row_id=event_row_id,
+            farm_id=farm_id,
+            activity_type_id=activity_type_id,
+            activity_date=activity_date,
+            zone_id=zone_id,
+            event_schedule=schedule_id,
+        )
+        return None
+
+    allowed, reject_reason, log_fields = historical_contiguity_allows(
+        row, event_time, activity_type_id
+    )
+    if not allowed:
+        log_attach_reject(
+            reject_reason,
+            event_row_id=event_row_id,
+            farm_id=farm_id,
+            activity_type_id=activity_type_id,
+            activity_date=activity_date,
+            zone_id=zone_id,
+            instance_id=row["id"],
+            event_schedule=schedule_id,
+            **log_fields,
+        )
+        return None
+
+    print(
+        f"[ATTACH_HISTORICAL] instance_id={row['id']} status={row['status']} "
+        f"event_row_id={event_row_id} gap_sec={log_fields.get('gap_sec')} "
+        f"replay_gap_sec={log_fields.get('replay_gap_sec')}"
+    )
+    return row
 
 
 def recover_ended_instance_for_late_frame_end(
@@ -823,11 +1093,21 @@ def recover_ended_instance_for_late_frame_end(
     schedule_id,
     event_time,
     recovery_sec,
+    *,
+    target_instance_id=None,
+    temporal_limit_sec=None,
+    relaxed_select=False,
 ):
     """
     Extend finalized instances in-place (`actual_end_at` / duration / `last_seen_at`) for late FRAME/END
     replays — never sets `status = 'IN_PROGRESS'` while `actual_end_at` remains set (lifecycle-safe).
+    When `event_time` falls within `[actual_start_at, actual_end_at]`, link only (no lifecycle mutation).
+    `temporal_limit_sec` overrides `recovery_sec` for distance checks (replay uses historical max).
+    `relaxed_select`: nearest-neighbor on `activity_date` without live window in SQL.
     """
+    distance_limit = (
+        temporal_limit_sec if temporal_limit_sec is not None else recovery_sec
+    )
 
     def _extend_ended_row(evt, now_ts, sid, zid, sched_id, row_id):
         cur.execute(
@@ -881,67 +1161,185 @@ def recover_ended_instance_for_late_frame_end(
         row = cur.fetchone()
         return row["id"] if row else None
 
-    cur.execute(
-        f"""
-        SELECT
-            id,
-            actual_start_at,
-            actual_end_at,
-            zone_id,
-            activity_schedule_id
-        FROM activity_instance
-        WHERE farm_id = %s
-          AND activity_type_id = %s
-          AND status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
-          AND actual_end_at IS NOT NULL
-          AND (
-                zone_id = %s
-                OR zone_id IS NULL
-              )
-          AND activity_date = %s
-          AND ABS(
-                EXTRACT(
-                    EPOCH FROM (%s::timestamptz - actual_end_at)
-                )
-              ) <= %s
-        ORDER BY
-          CASE
-            WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
-            WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
-            WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
-            WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
-            ELSE 2
-          END,
-          ABS(EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)))
-        LIMIT 1
-        """,
-        (
+    if target_instance_id is not None:
+        cur.execute(
+            f"""
+            SELECT
+                id,
+                actual_start_at,
+                actual_end_at,
+                last_seen_at,
+                zone_id,
+                activity_schedule_id,
+                status
+            FROM activity_instance
+            WHERE id = %s
+              AND farm_id = %s
+              AND activity_type_id = %s
+              AND status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+              AND actual_end_at IS NOT NULL
+            """,
+            (
+                target_instance_id,
+                farm_id,
+                activity_type_id,
+                *FINALIZED_LIFECYCLE_STATUSES,
+            ),
+        )
+        hit = cur.fetchone()
+        if hit:
+            allowed, _, _ = historical_contiguity_allows(
+                hit, event_time, activity_type_id
+            )
+            if not allowed:
+                hit = None
+    elif relaxed_select:
+        relaxed_params = (
             farm_id,
             activity_type_id,
             *FINALIZED_LIFECYCLE_STATUSES,
-            zone_id,
             activity_date,
-            event_time,
-            recovery_sec,
-            schedule_id,
-            schedule_id,
-            schedule_id,
-            schedule_id,
+            zone_id,
             schedule_id,
             event_time,
-        ),
-    )
-    hit = cur.fetchone()
+        )
+        cur.execute(
+            f"""
+            SELECT
+                id,
+                actual_start_at,
+                actual_end_at,
+                last_seen_at,
+                zone_id,
+                activity_schedule_id,
+                status
+            FROM activity_instance
+            WHERE farm_id = %s
+              AND activity_type_id = %s
+              AND status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+              AND actual_end_at IS NOT NULL
+              AND activity_date = %s
+              AND (
+                    zone_id = %s
+                    OR zone_id IS NULL
+                  )
+            ORDER BY
+              CASE
+                WHEN activity_schedule_id = %s THEN 0
+                WHEN activity_schedule_id IS NULL THEN 1
+                ELSE 2
+              END,
+              ABS(
+                EXTRACT(
+                  EPOCH FROM (
+                    %s::timestamptz - {_HISTORICAL_ANCHOR_SQL}
+                  )
+                )
+              ) ASC
+            LIMIT 1
+            """,
+            relaxed_params,
+        )
+        hit = cur.fetchone()
+        if hit:
+            allowed, _, _ = historical_contiguity_allows(
+                hit, event_time, activity_type_id
+            )
+            if not allowed:
+                hit = None
+    else:
+        cur.execute(
+            f"""
+            SELECT
+                id,
+                actual_start_at,
+                actual_end_at,
+                last_seen_at,
+                zone_id,
+                activity_schedule_id,
+                status
+            FROM activity_instance
+            WHERE farm_id = %s
+              AND activity_type_id = %s
+              AND status IN ({",".join("%s" for _ in FINALIZED_LIFECYCLE_STATUSES)})
+              AND actual_end_at IS NOT NULL
+              AND (
+                    zone_id = %s
+                    OR zone_id IS NULL
+                  )
+              AND activity_date = %s
+              AND ABS(
+                    EXTRACT(
+                        EPOCH FROM (%s::timestamptz - actual_end_at)
+                    )
+                  ) <= %s
+            ORDER BY
+              CASE
+                WHEN %s IS NOT NULL AND activity_schedule_id = %s THEN 0
+                WHEN %s IS NULL AND activity_schedule_id IS NULL THEN 0
+                WHEN %s IS NULL AND activity_schedule_id IS NOT NULL THEN 1
+                WHEN %s IS NOT NULL AND activity_schedule_id IS NULL THEN 1
+                ELSE 2
+              END,
+              ABS(EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)))
+            LIMIT 1
+            """,
+            (
+                farm_id,
+                activity_type_id,
+                *FINALIZED_LIFECYCLE_STATUSES,
+                zone_id,
+                activity_date,
+                event_time,
+                recovery_sec,
+                schedule_id,
+                schedule_id,
+                schedule_id,
+                schedule_id,
+                schedule_id,
+                event_time,
+            ),
+        )
+        hit = cur.fetchone()
 
     if hit:
-        if (
-            hit["actual_start_at"] is not None
-            and event_time < hit["actual_start_at"] - timedelta(minutes=30)
-        ):
+        start_at = hit["actual_start_at"]
+        end_at = hit["actual_end_at"]
+        if start_at is not None and event_time < start_at - timedelta(minutes=30):
             hit = None
+        elif (
+            start_at is not None
+            and end_at is not None
+            and start_at <= event_time <= end_at
+        ):
+            print(
+                f"[ENDED_RECOVERY] link-only within span instance_id={hit['id']} "
+                f"event_row_time={event_time}"
+            )
+            return hit["id"]
+        elif start_at is not None and end_at is not None and event_time < start_at:
+            anchor = historical_instance_anchor(hit)
+            if (
+                anchor is not None
+                and abs((event_time - anchor).total_seconds()) > distance_limit
+            ):
+                hit = None
+            elif hit:
+                print(
+                    f"[ENDED_RECOVERY] link-only before span instance_id={hit['id']} "
+                    f"event_row_time={event_time}"
+                )
+                return hit["id"]
 
     if not hit:
         return None
+
+    if hit["actual_end_at"] is not None and event_time <= hit["actual_end_at"]:
+        print(
+            f"[ENDED_RECOVERY] link-only (no extension) instance_id={hit['id']} "
+            f"event_row_time={event_time}"
+        )
+        return hit["id"]
 
     now = utc_now()
     rid = _extend_ended_row(
@@ -961,6 +1359,36 @@ def recover_ended_instance_for_late_frame_end(
     return rid
 
 
+def _attach_from_historical_row(
+    cur,
+    hist_row,
+    session_id,
+    farm_id,
+    activity_date,
+    zone_id,
+    activity_type_id,
+    schedule_id,
+    event_time,
+):
+    """Apply ENDED lifecycle rules or return IN_PROGRESS id from historical match."""
+    replay_gap = historical_replay_gap_sec(activity_type_id)
+    if hist_row["status"] == "ENDED":
+        return recover_ended_instance_for_late_frame_end(
+            cur,
+            session_id,
+            farm_id,
+            activity_date,
+            zone_id,
+            activity_type_id,
+            schedule_id,
+            event_time,
+            replay_gap,
+            target_instance_id=hist_row["id"],
+            temporal_limit_sec=replay_gap,
+        )
+    return hist_row["id"]
+
+
 def resolve_attachable_instance(
     cur,
     farm_id,
@@ -974,18 +1402,69 @@ def resolve_attachable_instance(
     try_session_restore=True,
     try_ended_recovery_sec=None,
     event_row_id=None,
+    event_age_sec=None,
 ):
     """
-    Resolver for FRAME / END / session hint: bounded session restore (open + recent finalized rows),
-    then bucket attach (`find_in_progress_bucket_attach`), then optional ENDED-only extension pass.
+    Resolver for FRAME / END / session hint. When `event_age_sec` exceeds the live attach window,
+    uses replay mode only (historical nearest-neighbor + relaxed ENDED). Otherwise: session restore,
+    live attach, historical, then same-day ENDED fallback.
     """
     guard_sec = live_attach_guard_sec(activity_type_id)
     ended_sec = ended_recovery_window_sec(activity_type_id)
+    max_hist = historical_replay_gap_sec(activity_type_id)
+    if event_age_sec is None:
+        event_age_sec = (utc_now() - event_time).total_seconds()
+
+    # Replay: historical nearest-neighbor only — no session restore / strict / soft live.
+    if is_historical_replay_event(event_time, activity_type_id):
+        print(
+            f"[REPLAY_MODE] event_row_id={event_row_id} age_sec={int(event_age_sec)} "
+            f"live_window_sec={guard_sec}"
+        )
+        hist_row = recover_historical_instance_attach(
+            cur,
+            farm_id,
+            zone_id,
+            activity_type_id,
+            activity_date,
+            schedule_id,
+            event_time,
+            event_row_id=event_row_id,
+        )
+        if hist_row:
+            attached = _attach_from_historical_row(
+                cur,
+                hist_row,
+                session_id,
+                farm_id,
+                activity_date,
+                zone_id,
+                activity_type_id,
+                schedule_id,
+                event_time,
+            )
+            if attached:
+                return attached
+        if try_ended_recovery_sec is not None and try_ended_recovery_sec > 0:
+            return recover_ended_instance_for_late_frame_end(
+                cur,
+                session_id,
+                farm_id,
+                activity_date,
+                zone_id,
+                activity_type_id,
+                schedule_id,
+                event_time,
+                max_hist,
+                temporal_limit_sec=max_hist,
+                relaxed_select=True,
+            )
+        return None
 
     if try_session_restore and session_id:
         cur.execute(
             f"""
-            SELECT id, activity_schedule_id, status
+            SELECT id, activity_schedule_id, status, last_seen_at, actual_end_at
             FROM activity_instance
             WHERE session_id = %s
               AND farm_id = %s
@@ -1051,23 +1530,39 @@ def resolve_attachable_instance(
         )
         row = cur.fetchone()
         if row:
-            inst_sched = row["activity_schedule_id"]
-            if (
-                schedule_id is not None
-                and inst_sched is not None
-                and inst_sched != schedule_id
-            ):
-                print(
-                    f"[ATTACH_SOFT] session_restore_schedule_soft_match "
-                    f"event_row_id={event_row_id} event_schedule={schedule_id} "
-                    f"instance_schedule={inst_sched}"
+            anchor = continuity_anchor_at(row)
+            if continuity_gap_exceeded(activity_type_id, event_time, anchor):
+                log_attach_reject(
+                    "merge_gap_exceeded",
+                    event_row_id=event_row_id,
+                    session_id=session_id,
+                    farm_id=farm_id,
+                    activity_type_id=activity_type_id,
+                    activity_date=activity_date,
+                    instance_id=row["id"],
+                    gap_sec=int(abs((event_time - anchor).total_seconds()))
+                    if anchor
+                    else None,
+                    merge_gap_sec=merge_gap_sec(activity_type_id),
                 )
-            if row.get("status") and row["status"] != "IN_PROGRESS":
-                print(
-                    f"[SESSION_RESTORE_FINALIZED] instance_id={row['id']} "
-                    f"status={row['status']} event_row_id={event_row_id}"
-                )
-            return row["id"]
+            else:
+                inst_sched = row["activity_schedule_id"]
+                if (
+                    schedule_id is not None
+                    and inst_sched is not None
+                    and inst_sched != schedule_id
+                ):
+                    print(
+                        f"[ATTACH_SOFT] session_restore_schedule_soft_match "
+                        f"event_row_id={event_row_id} event_schedule={schedule_id} "
+                        f"instance_schedule={inst_sched}"
+                    )
+                if row.get("status") and row["status"] != "IN_PROGRESS":
+                    print(
+                        f"[SESSION_RESTORE_FINALIZED] instance_id={row['id']} "
+                        f"status={row['status']} event_row_id={event_row_id}"
+                    )
+                return row["id"]
         log_attach_reject(
             "session_restore_miss",
             event_row_id=event_row_id,
@@ -1092,6 +1587,29 @@ def resolve_attachable_instance(
     )
     if bid:
         return bid
+
+    hist_row = recover_historical_instance_attach(
+        cur,
+        farm_id,
+        zone_id,
+        activity_type_id,
+        activity_date,
+        schedule_id,
+        event_time,
+        event_row_id=event_row_id,
+    )
+    if hist_row:
+        return _attach_from_historical_row(
+            cur,
+            hist_row,
+            session_id,
+            farm_id,
+            activity_date,
+            zone_id,
+            activity_type_id,
+            schedule_id,
+            event_time,
+        )
 
     if try_ended_recovery_sec is not None and try_ended_recovery_sec > 0:
         return recover_ended_instance_for_late_frame_end(
@@ -1631,7 +2149,7 @@ def run(max_loops=None):
                             )
                             continue
 
-                        reopen_sec = reopen_window_sec(activity_type_id)
+                        merge_gap = merge_gap_sec(activity_type_id)
                         instance_id = None
                         event_age_sec = (utc_now() - event_time).total_seconds()
                         print(
@@ -1681,7 +2199,7 @@ def run(max_loops=None):
                         if existing_session_instance:
                             cur.execute(
                                 """
-                                SELECT status, actual_end_at
+                                SELECT status, actual_end_at, last_seen_at
                                 FROM activity_instance
                                 WHERE id = %s
                                 """,
@@ -1689,27 +2207,44 @@ def run(max_loops=None):
                             )
                             row_sess = cur.fetchone()
                             if row_sess and row_sess["status"] == "IN_PROGRESS":
-                                instance_id = existing_session_instance["id"]
-                                session_map[session_id] = (instance_id, time.time())
-                                print(
-                                    f"[DEBUG] Existing session instance reused "
-                                    f"→ instance_id={instance_id}"
-                                )
-                                queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
-                                continue
+                                if continuity_gap_exceeded(
+                                    activity_type_id,
+                                    event_time,
+                                    row_sess.get("last_seen_at"),
+                                ):
+                                    log_attach_reject(
+                                        "merge_gap_exceeded",
+                                        event_row_id=e["event_row_id"],
+                                        session_id=session_id,
+                                        instance_id=existing_session_instance["id"],
+                                        merge_gap_sec=merge_gap,
+                                    )
+                                else:
+                                    instance_id = existing_session_instance["id"]
+                                    session_map[session_id] = (instance_id, time.time())
+                                    print(
+                                        f"[DEBUG] Existing session instance reused "
+                                        f"→ instance_id={instance_id}"
+                                    )
+                                    queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
+                                    continue
 
-                        # Bucket IN_PROGRESS attach (time-first + schedule rank via
-                        # `find_in_progress_bucket_attach`). Includes runaway close before attach.
-                        bucket_attach_id = find_in_progress_bucket_attach(
-                            cur,
-                            farm_id,
-                            zone_id,
-                            activity_type_id,
-                            activity_date,
-                            schedule_id,
-                            event_time,
-                            event_row_id=e["event_row_id"],
+                        # Bucket IN_PROGRESS attach (skipped in replay mode — use historical).
+                        replay_start = is_historical_replay_event(
+                            event_time, activity_type_id
                         )
+                        bucket_attach_id = None
+                        if not replay_start:
+                            bucket_attach_id = find_in_progress_bucket_attach(
+                                cur,
+                                farm_id,
+                                zone_id,
+                                activity_type_id,
+                                activity_date,
+                                schedule_id,
+                                event_time,
+                                event_row_id=e["event_row_id"],
+                            )
                         active = None
                         if bucket_attach_id:
                             cur.execute(
@@ -1761,6 +2296,19 @@ def run(max_loops=None):
                                         f"[DEBUG] Force-closed runaway active instance {active['id']} "
                                         f"duration={active_duration_sec}s cap={MAX_DURATION_SEC}s"
                                     )
+                                active = None
+                            elif continuity_gap_exceeded(
+                                activity_type_id,
+                                event_time,
+                                active.get("last_seen_at"),
+                            ):
+                                log_attach_reject(
+                                    "merge_gap_exceeded",
+                                    event_row_id=e["event_row_id"],
+                                    session_id=session_id,
+                                    instance_id=active["id"],
+                                    merge_gap_sec=merge_gap,
+                                )
                                 active = None
                             else:
                                 instance_id = active["id"]
@@ -1887,7 +2435,7 @@ def run(max_loops=None):
                                     schedule_id,
                                     event_time,
                                     event_time,
-                                    reopen_sec,
+                                    merge_gap,
                                     session_id,
                                     schedule_id,
                                     schedule_id,
@@ -1903,6 +2451,19 @@ def run(max_loops=None):
                                 prev_date = prev["actual_end_at"].astimezone(farm_tz).date()
                                 current_date = event_time.astimezone(farm_tz).date()
                                 if prev_date != current_date:
+                                    prev = None
+                                elif continuity_gap_exceeded(
+                                    activity_type_id,
+                                    event_time,
+                                    prev["actual_end_at"],
+                                ):
+                                    log_attach_reject(
+                                        "merge_gap_exceeded",
+                                        event_row_id=e["event_row_id"],
+                                        session_id=session_id,
+                                        instance_id=prev["id"],
+                                        merge_gap_sec=merge_gap,
+                                    )
                                     prev = None
 
                             if prev:
@@ -1943,19 +2504,55 @@ def run(max_loops=None):
                                     f"prev_status={prev['status']}"
                                 )
                             else:
-                                # Broad ENDED recovery (replay window) before any INSERT.
-                                recovery_sec_start = ended_recovery_window_sec(activity_type_id)
-                                recovered_start = recover_ended_instance_for_late_frame_end(
+                                # Historical / ENDED recovery before any INSERT.
+                                max_hist_start = historical_replay_gap_sec(
+                                    activity_type_id
+                                )
+                                recovery_sec_start = ended_recovery_window_sec(
+                                    activity_type_id
+                                )
+                                hist_start = recover_historical_instance_attach(
                                     cur,
-                                    session_id,
                                     farm_id,
-                                    activity_date,
                                     zone_id,
                                     activity_type_id,
+                                    activity_date,
                                     schedule_id,
                                     event_time,
-                                    recovery_sec_start,
+                                    event_row_id=e["event_row_id"],
                                 )
+                                if hist_start:
+                                    recovered_start = _attach_from_historical_row(
+                                        cur,
+                                        hist_start,
+                                        session_id,
+                                        farm_id,
+                                        activity_date,
+                                        zone_id,
+                                        activity_type_id,
+                                        schedule_id,
+                                        event_time,
+                                    )
+                                else:
+                                    recovered_start = (
+                                        recover_ended_instance_for_late_frame_end(
+                                            cur,
+                                            session_id,
+                                            farm_id,
+                                            activity_date,
+                                            zone_id,
+                                            activity_type_id,
+                                            schedule_id,
+                                            event_time,
+                                            max_hist_start
+                                            if replay_start
+                                            else recovery_sec_start,
+                                            temporal_limit_sec=max_hist_start
+                                            if replay_start
+                                            else None,
+                                            relaxed_select=replay_start,
+                                        )
+                                    )
                                 if recovered_start:
                                     instance_id = recovered_start
                                     session_map[session_id] = (instance_id, time.time())
@@ -2172,16 +2769,44 @@ def run(max_loops=None):
                                         f"session={session_id}: {ex}"
                                     )
 
-                                    existing_uv_id = find_in_progress_bucket_attach(
-                                        cur,
-                                        farm_id,
-                                        zone_id,
-                                        activity_type_id,
-                                        activity_date,
-                                        schedule_id,
-                                        event_time,
-                                        event_row_id=e["event_row_id"],
+                                    replay_uv = is_historical_replay_event(
+                                        event_time, activity_type_id
                                     )
+                                    existing_uv_id = None
+                                    if not replay_uv:
+                                        existing_uv_id = find_in_progress_bucket_attach(
+                                            cur,
+                                            farm_id,
+                                            zone_id,
+                                            activity_type_id,
+                                            activity_date,
+                                            schedule_id,
+                                            event_time,
+                                            event_row_id=e["event_row_id"],
+                                        )
+                                    if not existing_uv_id:
+                                        hist_uv = recover_historical_instance_attach(
+                                            cur,
+                                            farm_id,
+                                            zone_id,
+                                            activity_type_id,
+                                            activity_date,
+                                            schedule_id,
+                                            event_time,
+                                            event_row_id=e["event_row_id"],
+                                        )
+                                        if hist_uv:
+                                            existing_uv_id = _attach_from_historical_row(
+                                                cur,
+                                                hist_uv,
+                                                session_id,
+                                                farm_id,
+                                                activity_date,
+                                                zone_id,
+                                                activity_type_id,
+                                                schedule_id,
+                                                event_time,
+                                            )
                                     if existing_uv_id:
                                         instance_id = existing_uv_id
                                         print(
@@ -2310,31 +2935,69 @@ def run(max_loops=None):
                                     if existing_status == "IN_PROGRESS":
                                         cur.execute(
                                             """
-                                            UPDATE activity_instance
-                                            SET actual_start_at = LEAST(COALESCE(actual_start_at, %s), %s),
-                                                last_seen_at = GREATEST(COALESCE(last_seen_at, %s), %s),
-                                                zone_id = COALESCE(zone_id, %s),
-                                                activity_schedule_id = COALESCE(activity_schedule_id, %s),
-                                                activity_date = COALESCE(activity_date, %s),
-                                                updated_at = %s
+                                            SELECT last_seen_at
+                                            FROM activity_instance
                                             WHERE id = %s
                                             """,
-                                            (
-                                                event_time,
-                                                event_time,
-                                                event_time,
-                                                event_time,
+                                            (instance_id,),
+                                        )
+                                        ls_row = cur.fetchone()
+                                        if continuity_gap_exceeded(
+                                            activity_type_id,
+                                            event_time,
+                                            ls_row["last_seen_at"] if ls_row else None,
+                                        ):
+                                            log_attach_reject(
+                                                "merge_gap_exceeded",
+                                                event_row_id=e["event_row_id"],
+                                                instance_id=instance_id,
+                                                merge_gap_sec=merge_gap,
+                                            )
+                                            instance_id = resolve_fallback_instance_or_skip(
+                                                cur,
+                                                farm_id,
                                                 zone_id,
+                                                activity_type_id,
                                                 schedule_id,
                                                 activity_date,
-                                                utc_now(),
-                                                instance_id,
-                                            ),
-                                        )
-                                        print(
-                                            f"[DEBUG] REUSED-EXISTING IN_PROGRESS (duplicate guard) "
-                                            f"→ instance_id={instance_id}"
-                                        )
+                                                session_id,
+                                                event_time,
+                                                farm_tz,
+                                                matched_schedule,
+                                                e["event_row_id"],
+                                                event_columns,
+                                                "START duplicate guard gap exceeded",
+                                            )
+                                            if instance_id is None:
+                                                continue
+                                        else:
+                                            cur.execute(
+                                                """
+                                                UPDATE activity_instance
+                                                SET actual_start_at = LEAST(COALESCE(actual_start_at, %s), %s),
+                                                    last_seen_at = GREATEST(COALESCE(last_seen_at, %s), %s),
+                                                    zone_id = COALESCE(zone_id, %s),
+                                                    activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                                    activity_date = COALESCE(activity_date, %s),
+                                                    updated_at = %s
+                                                WHERE id = %s
+                                                """,
+                                                (
+                                                    event_time,
+                                                    event_time,
+                                                    event_time,
+                                                    event_time,
+                                                    zone_id,
+                                                    schedule_id,
+                                                    activity_date,
+                                                    utc_now(),
+                                                    instance_id,
+                                                ),
+                                            )
+                                            print(
+                                                f"[DEBUG] REUSED-EXISTING IN_PROGRESS (duplicate guard) "
+                                                f"→ instance_id={instance_id}"
+                                            )
                                     elif existing_status == "MISSED":
                                         reopened_id = reopen_missed_activity_instance(
                                             cur,
@@ -2386,38 +3049,82 @@ def run(max_loops=None):
                                         # --------------------------------------------------
 
                                         if existing_status == "ENDED":
-                                            instance_id = existing["id"]
-
                                             cur.execute(
                                                 """
-                                                UPDATE activity_instance
-                                                SET status = 'IN_PROGRESS',
-                                                    actual_end_at = NULL,
-                                                    actual_duration_sec = NULL,
-                                                    last_seen_at = %s,
-                                                    session_classification = NULL,
-                                                    started_offset_min = NULL,
-                                                    ended_offset_min = NULL,
-                                                    activity_schedule_id = COALESCE(activity_schedule_id, %s),
-                                                    activity_date = COALESCE(activity_date, %s),
-                                                    updated_at = %s
+                                                SELECT actual_end_at, last_seen_at
+                                                FROM activity_instance
                                                 WHERE id = %s
                                                 """,
-                                                (
-                                                    event_time,
+                                                (existing["id"],),
+                                            )
+                                            ended_row = cur.fetchone()
+                                            ended_anchor = None
+                                            if ended_row:
+                                                ended_anchor = (
+                                                    ended_row.get("actual_end_at")
+                                                    or ended_row.get("last_seen_at")
+                                                )
+                                            if continuity_gap_exceeded(
+                                                activity_type_id,
+                                                event_time,
+                                                ended_anchor,
+                                            ):
+                                                log_attach_reject(
+                                                    "merge_gap_exceeded",
+                                                    event_row_id=e["event_row_id"],
+                                                    instance_id=existing["id"],
+                                                    merge_gap_sec=merge_gap,
+                                                )
+                                                instance_id = resolve_fallback_instance_or_skip(
+                                                    cur,
+                                                    farm_id,
+                                                    zone_id,
+                                                    activity_type_id,
                                                     schedule_id,
                                                     activity_date,
-                                                    utc_now(),
-                                                    instance_id,
-                                                ),
-                                            )
+                                                    session_id,
+                                                    event_time,
+                                                    farm_tz,
+                                                    matched_schedule,
+                                                    e["event_row_id"],
+                                                    event_columns,
+                                                    "START ENDED replay gap exceeded",
+                                                )
+                                                if instance_id is None:
+                                                    continue
+                                            else:
+                                                instance_id = existing["id"]
+
+                                                cur.execute(
+                                                    """
+                                                    UPDATE activity_instance
+                                                    SET status = 'IN_PROGRESS',
+                                                        actual_end_at = NULL,
+                                                        actual_duration_sec = NULL,
+                                                        last_seen_at = %s,
+                                                        session_classification = NULL,
+                                                        started_offset_min = NULL,
+                                                        ended_offset_min = NULL,
+                                                        activity_schedule_id = COALESCE(activity_schedule_id, %s),
+                                                        activity_date = COALESCE(activity_date, %s),
+                                                        updated_at = %s
+                                                    WHERE id = %s
+                                                    """,
+                                                    (
+                                                        event_time,
+                                                        schedule_id,
+                                                        activity_date,
+                                                        utc_now(),
+                                                        instance_id,
+                                                    ),
+                                                )
+
+                                                print(
+                                                    f"[REPLAY_RECOVERY] reopened ENDED instance "
+                                                    f"→ instance_id={instance_id}"
+                                                )
 
                                             session_map[session_id] = (instance_id, time.time())
-
-                                            print(
-                                                f"[REPLAY_RECOVERY] reopened ENDED instance "
-                                                f"→ instance_id={instance_id}"
-                                            )
 
                                             queue_event_link(
                                                 cur,
@@ -2501,6 +3208,7 @@ def run(max_loops=None):
                             instance_id = cache_row[0]
 
                         if instance_id is None:
+                            fe_age_sec = (utc_now() - event_time).total_seconds()
                             resolved_fe = resolve_attachable_instance(
                                 cur,
                                 farm_id,
@@ -2515,6 +3223,7 @@ def run(max_loops=None):
                                     activity_type_id
                                 ),
                                 event_row_id=e["event_row_id"],
+                                event_age_sec=fe_age_sec,
                             )
                             if resolved_fe:
                                 instance_id = resolved_fe
@@ -2593,6 +3302,7 @@ def run(max_loops=None):
                                     activity_type_id
                                 ),
                                 event_row_id=e["event_row_id"],
+                                event_age_sec=(utc_now() - event_time).total_seconds(),
                             )
                             if reopened:
                                 instance_id = reopened
