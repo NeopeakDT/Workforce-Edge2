@@ -143,3 +143,20 @@ class ModelRunner:
             batch_detections.append(dets)
         
         return batch_detections if is_batch else batch_detections[0]
+
+
+def create_edge_runners(
+    wf_model_path: str,
+    *,
+    device: str = "cuda",
+    milking_enabled: bool = True,
+    milking_model_path: str | None = None,
+):
+    """
+    Load workforce + optional milking ModelRunner instances (dual-engine edge).
+    """
+    wf_runner = ModelRunner(wf_model_path, device=device)
+    milking_runner = None
+    if milking_enabled and milking_model_path and os.path.exists(milking_model_path):
+        milking_runner = ModelRunner(milking_model_path, device=device)
+    return wf_runner, milking_runner

@@ -73,13 +73,13 @@ from aggregation.activity_schedule_resolver import (
 # Max gap (seconds) between events to treat as one activity instance.
 # A schedule may contain many instances; compliance aggregates across them.
 MERGE_GAP_SEC = {
-    1: 900,  # milking
+    1: 180,  # milking
     2: 900,  # feeding / TRM — match CLOSE_DELAY_SEC (sparse frames / inference gaps)
     3: 300,  # scrapping / cleaning
 }
 
 MIN_VALID_DURATION_SEC = {
-    1: 300,  # MILKING
+    1: 120,  # MILKING
     2: 60,  # FEEDING
     3: 30,  # SCRAPPING
 }

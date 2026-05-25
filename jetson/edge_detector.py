@@ -34,11 +34,13 @@ from queue import Queue
 from threading import Thread
 import threading
 import subprocess
-from uuid import uuid4
+from uuid import uuid4, UUID, uuid5
 
 from dotenv import load_dotenv
 from config.local_cache import load_config
-from runtime.model_loader import ModelRunner
+from config.model_classes import WF_CLASSES, MILKING_CLASSES
+from utils.camera_routing import is_milking_camera
+from runtime.model_loader import ModelRunner, create_edge_runners
 from runtime.temporal_smoother import TemporalSmoother
 from runtime.video_stream import open_stream, _validate_gstreamer
 
@@ -175,7 +177,16 @@ EDGE_MODE = os.getenv("EDGE_MODE", "LIVE")  # LIVE or BATCH
 WATCHDOG_FILE_PATH = os.getenv("EDGE_WATCHDOG_FILE", "/tmp/workforce_edge_alive")
 PROCESS_STARTED_AT = time.time()
 MILKING_MODEL_ENABLED = True
-MILKING_MODEL_PATH = "models/WF_Milking_v1.1_best.engine"
+MILKING_MODEL_PATH = "models/milking_best.engine"
+WF_MIN_OVERLAP_RATIO = 0.2
+MILKING_MIN_OVERLAP_RATIO = 0.01
+MILKING_CLUSTER_MEMORY_SEC = 20
+MILKING_INTERSECT_PAD = 10
+SESSION_BUCKET_SEC = 300
+# UUID namespaces: stable 5-min bucket keys encoded as RFC-4122 UUIDs (ingest requires UUID).
+WF_SESSION_NAMESPACE = UUID("a3f2c8e1-7b4d-4e9f-8c2a-1d5e6f7a8b9c")
+MILKING_SESSION_NAMESPACE = UUID("b4e3d9f2-8c5e-41a0-9d3b-2e6f7a8b9c0d")
+MILKING_CAMERA_STATE = {}
 
 # ------------------------------------------------------------------
 # Utils
@@ -397,12 +408,12 @@ def resend_failed_events():
 # ------------------------------------------------------------------
 # GPU Inference Worker — Dedicated Thread for TensorRT
 # ------------------------------------------------------------------
-def inference_worker(activity_runner, milking_runner):
+def inference_worker(wf_runner, milking_runner):
     """
     Batched GPU worker for better utilization.
-    Safe for Orin NX 8GB with batch=2 engine.
+    WF TensorRT engine: batch=2. Milking TensorRT engine: batch=1.
     """
-    BATCH_SIZE = 2  # Match exported engine batch
+    BATCH_SIZE = 2  # WF exported engine batch (unchanged)
 
     deferred_items = deque()
     while True:
@@ -440,10 +451,13 @@ def inference_worker(activity_runner, milking_runner):
             callbacks.append(callback)
             processed_items_count += 1
 
+            # WF engine batch=2; milking engine batch=1 (static TensorRT profiles differ).
+            required_batch = 1 if model_type == "MILKING" else BATCH_SIZE
+
             # Allow micro-wait window to fill batch
             batch_deadline = time.time() + 0.003  # 3ms accumulation window
 
-            while len(batch) < BATCH_SIZE:
+            while len(batch) < required_batch:
                 try:
                     timeout = max(0, batch_deadline - time.time())
                     if timeout <= 0:
@@ -473,10 +487,10 @@ def inference_worker(activity_runner, milking_runner):
         try:
             actual_batch = len(batch)
 
-            # TensorRT static engine requires fixed batch
-            if actual_batch < BATCH_SIZE:
-                # duplicate last frame to pad batch
-                while len(batch) < BATCH_SIZE:
+            # TensorRT static batch handling (WF=2, milking=1).
+            required_batch = 1 if model_type == "MILKING" else BATCH_SIZE
+            if actual_batch < required_batch:
+                while len(batch) < required_batch:
                     batch.append(batch[-1])
                     callbacks.append(None)
 
@@ -485,7 +499,9 @@ def inference_worker(activity_runner, milking_runner):
                     raise RuntimeError("MILKING inference requested but milking runner not loaded")
                 results = milking_runner.infer(batch)
             else:
-                results = activity_runner.infer(batch)
+                if wf_runner is None:
+                    raise RuntimeError("WF inference requested but workforce runner not loaded")
+                results = wf_runner.infer(batch)
 
             for dets, cb in zip(results[:actual_batch], callbacks[:actual_batch]):
                 if cb:
@@ -629,6 +645,113 @@ def build_pixel_roi(normalized_roi, frame_w, frame_h):
     ]
 
 
+def bucket_session_id(
+    pipeline: str,
+    camera_id: str,
+    activity_type: str,
+    activity_start_ts: float,
+) -> str:
+    """
+    Camera + activity + 5-minute bucket → stable session UUID (reconnect/replay safe).
+    """
+    bucket = int(activity_start_ts // SESSION_BUCKET_SEC)
+    if pipeline == "milking":
+        key = f"milking_{camera_id}_{bucket}"
+        namespace = MILKING_SESSION_NAMESPACE
+    else:
+        key = f"wf_{camera_id}_{activity_type}_{bucket}"
+        namespace = WF_SESSION_NAMESPACE
+    return str(uuid5(namespace, key))
+
+
+def detections_to_objects_all(detections):
+    """Group detections by class name for camera-level milking logic."""
+    objects_all = defaultdict(list)
+    for det in detections or []:
+        cls = str(det.get("class", "")).lower()
+        bbox = det.get("bbox")
+        if bbox is not None:
+            objects_all[cls].append(bbox)
+    return objects_all
+
+
+def detect_milking_camera(camera_id, objects_all, ts):
+    """
+    Camera-level milking detection (cluster ∩ udder, cluster memory, udder-only fallback).
+    No per-track IDs — activity continuity is per camera session.
+    """
+    state = MILKING_CAMERA_STATE.setdefault(
+        camera_id,
+        {
+            "last_cluster_seen_ts": None,
+            "active": False,
+        },
+    )
+
+    clusters = objects_all.get("cluster_attached", [])
+    udders = objects_all.get("cow_leg_udder", [])
+    persons = objects_all.get("person", [])
+
+    valid_cluster = False
+    for c in clusters:
+        for u in udders:
+            if bbox_intersects(c, u, pad=MILKING_INTERSECT_PAD):
+                valid_cluster = True
+                break
+        if valid_cluster:
+            break
+
+    has_udder = len(udders) > 0
+    has_person = len(persons) > 0
+
+    # -------------------------------------------------
+    # Cluster memory
+    # -------------------------------------------------
+    if valid_cluster:
+        state["last_cluster_seen_ts"] = ts
+
+    cluster_recent = (
+        state["last_cluster_seen_ts"] is not None
+        and (ts - state["last_cluster_seen_ts"]) < MILKING_CLUSTER_MEMORY_SEC
+    )
+
+    # -------------------------------------------------
+    # Sustained udder fallback
+    # Real parlour visibility often misses cluster box
+    # -------------------------------------------------
+    udder_only_detected = has_udder and not has_person
+
+    milking_detected = (
+        valid_cluster
+        or (has_udder and cluster_recent)
+        or udder_only_detected
+    )
+
+    logger.warning(
+        "[MILKING GATE] "
+        "clusters=%d udders=%d persons=%d "
+        "valid_cluster=%s cluster_recent=%s detected=%s",
+        len(clusters),
+        len(udders),
+        len(persons),
+        valid_cluster,
+        cluster_recent,
+        milking_detected,
+    )
+
+    # Temporal persistence is handled by TemporalSmoother (no second active buffer).
+    state["active"] = milking_detected
+    return milking_detected
+
+
+def filter_detections_by_classes(detections, allowed_classes):
+    allowed = {c.lower() for c in allowed_classes}
+    return [
+        d for d in (detections or [])
+        if str(d.get("class", "")).lower() in allowed
+    ]
+
+
 def resolve_zone_id(camera_cfg: dict, activity: str):
     """
     Resolve zone_id for a given activity from camera config.
@@ -668,7 +791,7 @@ def detect_cluster_udder_intersection(detections):
 
     for cluster in clusters:
         for udder in udders:
-            if bbox_intersects(cluster["bbox"], udder["bbox"], pad=10):
+            if bbox_intersects(cluster["bbox"], udder["bbox"], pad=MILKING_INTERSECT_PAD):
                 return True
     return False
 
@@ -727,43 +850,61 @@ def _process_camera_impl(
     }
     last_seen_scrap_ts = None
     last_seen_feed_ts = None
-    last_cluster_seen_ts = None
-    CLUSTER_MEMORY_SEC = 300
 
-    smoothers = {
-        "SCRAPPING": TemporalSmoother(),
-        "FEEDING": TemporalSmoother(),
-        "MILKING": TemporalSmoother(start_sec=5, end_sec=12),
-    }
-
-    activity_state = {
-        "SCRAPPING": {
-            "state": "INACTIVE",
-            "session_id": None,
-            "last_frame_emit": 0.0,
-        },
-        "FEEDING": {
-            "state": "INACTIVE",
-            "session_id": None,
-            "last_frame_emit": 0.0,
-        },
-        "MILKING": {
-            "state": "INACTIVE",
-            "session_id": None,
-            "last_frame_emit": 0.0,
-        },
-    }
-
-    # Resolve zone IDs for activities (may be None)
+    milking_camera = is_milking_camera(camera)
     zone_scrapping = resolve_zone_id(camera, "SCRAPPING")
     zone_feeding = resolve_zone_id(camera, "FEEDING")
     zone_milking = resolve_zone_id(camera, "MILKING")
-    use_milking_model = bool(zone_milking and milking_model_enabled)
-    if zone_milking and not milking_model_enabled:
-        logger.warning(
-            "[CAMERA %s] MILKING zone configured but milking model not loaded; MILKING detection disabled",
-            camera_id,
-        )
+
+    run_wf_pipeline = not milking_camera
+    run_milking_pipeline = milking_camera and milking_model_enabled and zone_milking
+
+    if milking_camera:
+        milking_smoother = TemporalSmoother(start_sec=5, end_sec=15)
+        smoothers = {"MILKING": milking_smoother}
+        activity_state = {
+            "MILKING": {
+                "state": "INACTIVE",
+                "session_id": None,
+                "last_frame_emit": 0.0,
+            },
+        }
+        if not milking_model_enabled:
+            logger.warning(
+                "[CAMERA %s] Milking camera but milking model not loaded; MILKING disabled",
+                camera_id,
+            )
+        elif not zone_milking:
+            logger.warning(
+                "[CAMERA %s] Milking camera but MILKING zone missing; MILKING disabled",
+                camera_id,
+            )
+    else:
+        wf_smoothers = {
+            "SCRAPPING": TemporalSmoother(start_sec=10, end_sec=30),
+            "FEEDING": TemporalSmoother(start_sec=10, end_sec=30),
+        }
+        smoothers = wf_smoothers
+        activity_state = {
+            "SCRAPPING": {
+                "state": "INACTIVE",
+                "session_id": None,
+                "last_frame_emit": 0.0,
+            },
+            "FEEDING": {
+                "state": "INACTIVE",
+                "session_id": None,
+                "last_frame_emit": 0.0,
+            },
+        }
+
+    logger.info(
+        "[CAMERA %s] pipeline=%s wf=%s milking=%s",
+        camera_id,
+        "MILKING" if milking_camera else "WORKFORCE",
+        run_wf_pipeline,
+        run_milking_pipeline,
+    )
 
     # --------------------------------------------------
     # Open video stream (FILE / RTSP / NVR_CHANNEL)
@@ -1085,82 +1226,98 @@ def _process_camera_impl(
                 logger.debug("[CAMERA %s] GPU queue full — dropping frame", camera_id)
                 return False
 
-        activity_queued = enqueue_inference("ACTIVITY", set_activity_detections)
-        milking_queued = False
-        if use_milking_model:
+        detections_wf = []
+        detections_milking_only = []
+
+        if run_wf_pipeline:
+            wf_queued = enqueue_inference("WF", set_activity_detections)
+            if wf_queued:
+                if not activity_done.wait(timeout=0.4):
+                    now_ts = time.time()
+                    if now_ts - last_timeout_log > 10:
+                        logger.warning(
+                            "[CAMERA %s] WF inference timeout, skipping frame",
+                            camera_id,
+                        )
+                        last_timeout_log = now_ts
+                else:
+                    detections_wf = filter_detections_by_classes(
+                        activity_result.get("detections", []),
+                        WF_CLASSES,
+                    )
+
+        if run_milking_pipeline:
             milking_queued = enqueue_inference("MILKING", set_milking_detections)
+            if milking_queued:
+                if not milking_done.wait(timeout=0.4):
+                    now_ts = time.time()
+                    if now_ts - last_timeout_log > 10:
+                        logger.warning(
+                            "[CAMERA %s] Milking inference timeout, skipping frame",
+                            camera_id,
+                        )
+                        last_timeout_log = now_ts
+                else:
+                    raw_milking = milking_result.get("detections", [])
+                    logger.warning(
+                        "[MILKING RAW] %s",
+                        [
+                            (d.get("class"), round(d.get("confidence", 0), 2))
+                            for d in raw_milking
+                        ],
+                    )
+                    for det in raw_milking:
+                        det["class"] = str(det.get("class", "")).lower()
+                    detections_milking_only = filter_detections_by_classes(
+                        raw_milking,
+                        MILKING_CLASSES,
+                    )
 
-        if activity_queued:
-            if not activity_done.wait(timeout=0.4):
-                now_ts = time.time()
-                if now_ts - last_timeout_log > 10:
-                    logger.warning("[CAMERA %s] Activity inference timeout, skipping frame", camera_id)
-                    last_timeout_log = now_ts
-                detections_activity = []
-            else:
-                detections_activity = activity_result.get("detections", [])
-        else:
-            detections_activity = []
+        detections_scrap = []
+        detections_feed = []
+        detections_milking = []
 
-        if milking_queued:
-            if not milking_done.wait(timeout=0.4):
-                now_ts = time.time()
-                if now_ts - last_timeout_log > 10:
-                    logger.warning("[CAMERA %s] Milking inference timeout, skipping frame", camera_id)
-                    last_timeout_log = now_ts
-            else:
-                detections_milking_model = milking_result.get("detections", [])
-        else:
-            detections_milking_model = []
-
-        for det in detections_milking_model:
-            det["class"] = str(det.get("class", "")).lower()
-        detections_common = detections_activity
-        detections_milking_only = detections_milking_model
-
-        # Apply ROI filtering if enabled and ROI polygons are configured
-        frame_h, frame_w = frame.shape[:2]
-
-        # SCRAPPING ROI filtering (precompute polygon/mask on size change)
-        if ROI_ENABLED and scrap_roi_cfg:
-            detections_scrap = filter_by_roi(
-                detections_common,
-                scrap_polygon,
-                frame.shape,
-                roi_mask=scrap_mask,
-            )
-        else:
-            detections_scrap = detections_common
-
-        # FEEDING ROI filtering (precompute polygon/mask on size change)
-        if ROI_ENABLED and feed_roi_cfg:
-            detections_feed = filter_by_roi(
-                detections_common,
-                feed_polygon,
-                frame.shape,
-                roi_mask=feed_mask,
-            )
-        else:
-            detections_feed = detections_common
-
-        if ROI_ENABLED and milking_polygon is not None:
-            detections_milking = filter_by_roi(
-                detections_milking_only,
-                milking_polygon,
-                frame.shape,
-                min_overlap_ratio=0.01,
-                roi_mask=milking_mask,
-            )
-        elif zone_milking and milking_polygon is None:
-            if not milking_roi_missing_warned:
-                logger.warning(
-                    "[CAMERA %s] MILKING zone exists but ROI missing — disabling milking",
-                    camera_id,
+        if run_wf_pipeline:
+            if ROI_ENABLED and scrap_roi_cfg:
+                detections_scrap = filter_by_roi(
+                    detections_wf,
+                    scrap_polygon,
+                    frame.shape,
+                    min_overlap_ratio=WF_MIN_OVERLAP_RATIO,
+                    roi_mask=scrap_mask,
                 )
-                milking_roi_missing_warned = True
-            detections_milking = []
-        else:
-            detections_milking = detections_milking_only
+            else:
+                detections_scrap = detections_wf
+
+            if ROI_ENABLED and feed_roi_cfg:
+                detections_feed = filter_by_roi(
+                    detections_wf,
+                    feed_polygon,
+                    frame.shape,
+                    min_overlap_ratio=WF_MIN_OVERLAP_RATIO,
+                    roi_mask=feed_mask,
+                )
+            else:
+                detections_feed = detections_wf
+
+        if run_milking_pipeline:
+            if ROI_ENABLED and milking_polygon is not None:
+                detections_milking = filter_by_roi(
+                    detections_milking_only,
+                    milking_polygon,
+                    frame.shape,
+                    min_overlap_ratio=MILKING_MIN_OVERLAP_RATIO,
+                    roi_mask=milking_mask,
+                )
+            elif zone_milking and milking_polygon is None:
+                if not milking_roi_missing_warned:
+                    logger.warning(
+                        "[CAMERA %s] MILKING zone exists but ROI missing — disabling milking",
+                        camera_id,
+                    )
+                    milking_roi_missing_warned = True
+            else:
+                detections_milking = detections_milking_only
 
         frame_processing_time = time.time() - t0
         total_processing_time += frame_processing_time
@@ -1176,292 +1333,225 @@ def _process_camera_impl(
         now = time.time()
 
         # ------------------------------------------------------------------
-        # SCRAPPING - State Machine (using ROI-filtered detections)
+        # SCRAPPING / FEEDING — workforce pipeline only (isolated from milking)
         # ------------------------------------------------------------------
-        scrapping_detected = detect_scrapping(
-            detections_scrap, person_classes, tool_classes, max_dist
-        )
-        if scrapping_detected:
-            last_seen_scrap_ts = ts
-        scrapping = (
-            last_seen_scrap_ts is not None
-            and (ts - last_seen_scrap_ts) < SCRAP_ACTIVE_BUFFER_SEC
-        )
-        sig = smoothers["SCRAPPING"].update(scrapping, ts)
-        state = activity_state["SCRAPPING"]
+        if run_wf_pipeline:
+            scrapping_detected = detect_scrapping(
+                detections_scrap, person_classes, tool_classes, max_dist
+            )
+            if scrapping_detected:
+                last_seen_scrap_ts = ts
+            scrapping = (
+                last_seen_scrap_ts is not None
+                and (ts - last_seen_scrap_ts) < SCRAP_ACTIVE_BUFFER_SEC
+            )
+            sig = smoothers["SCRAPPING"].update(scrapping, ts)
+            state = activity_state["SCRAPPING"]
 
-        # 1. START transition: INACTIVE -> ACTIVE
-        if zone_scrapping and sig == "START" and state["state"] == "INACTIVE":
-            state["state"] = "ACTIVE"
-            state["session_id"] = str(uuid4())
-            state["last_frame_emit"] = 0.0
+            # 1. START transition: INACTIVE -> ACTIVE
+            if zone_scrapping and sig == "START" and state["state"] == "INACTIVE":
+                state["state"] = "ACTIVE"
+                activity_start_ts = ts
+                state["activity_start_ts"] = activity_start_ts
+                state["session_id"] = bucket_session_id(
+                    "wf", camera_id, "SCRAPPING", activity_start_ts
+                )
+                state["last_frame_emit"] = 0.0
 
-            payload = build_event_payload("SCRAPPING", "START_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
-            try:
-                # Log only START/END events, not FRAME_AGGREGATE (production filter)
-                if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
-                    logger.info(
-                        "[EVENT] %s | %s | cam=%s | conf=%.2f",
-                        payload["activity_type"],
-                        payload["event_type"],
-                        payload["camera_id"],
-                        payload["confidence"],
-                    )
-                if EVENT_QUEUE.full():
-                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                payload = build_event_payload("SCRAPPING", "START_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
+                try:
+                    if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
+                        logger.info(
+                            "[EVENT] %s | %s | cam=%s | conf=%.2f",
+                            payload["activity_type"],
+                            payload["event_type"],
+                            payload["camera_id"],
+                            payload["confidence"],
+                        )
+                    if EVENT_QUEUE.full():
+                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                    else:
+                        EVENT_QUEUE.put(payload, block=False)
+                except Exception as e:
+                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+
+            # 2. END transition: ACTIVE -> INACTIVE
+            elif zone_scrapping and sig == "END" and state["state"] == "ACTIVE":
+                payload = build_event_payload("SCRAPPING", "END_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
+                try:
+                    if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
+                        logger.info(
+                            "[EVENT] %s | %s | cam=%s | conf=%.2f",
+                            payload["activity_type"],
+                            payload["event_type"],
+                            payload["camera_id"],
+                            payload["confidence"],
+                        )
+                    if EVENT_QUEUE.full():
+                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                    else:
+                        EVENT_QUEUE.put(payload, block=False)
+                except Exception as e:
+                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+
+                state["state"] = "INACTIVE"
+                state["session_id"] = None
+                state["last_frame_emit"] = 0.0
+
+            # 3. FRAME_AGGREGATE
+            elif state["state"] == "ACTIVE":
+                if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+                    if zone_scrapping:
+                        payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
+                        try:
+                            if EVENT_QUEUE.full():
+                                logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                            else:
+                                EVENT_QUEUE.put(payload, block=False)
+                                state["last_frame_emit"] = now
+                        except Exception as e:
+                            logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+                    else:
+                        state["last_frame_emit"] = now
+
+            # FEEDING — motion-based detection
+            feeding_detected = False
+
+            for cls in ["tractor", "tmr_machine"]:
+                boxes = [
+                    d["bbox"]
+                    for d in detections_feed
+                    if d["class"].lower() == cls
+                ]
+
+                if not boxes:
+                    CLASS_MOTION_MEMORY[cls] = None
+                    continue
+
+                box = max(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
+                cx = (box[0] + box[2]) / 2
+                cy = (box[1] + box[3]) / 2
+                area = (box[2] - box[0]) * (box[3] - box[1])
+                mem = CLASS_MOTION_MEMORY[cls]
+
+                if mem is None:
+                    CLASS_MOTION_MEMORY[cls] = {
+                        "prev_center": (cx, cy),
+                        "prev_area": area,
+                        "prev_ts": ts,
+                        "moving_since": None,
+                    }
+                    continue
+
+                dt = min(max(ts - mem["prev_ts"], 1e-6), 1.0)
+                dx = cx - mem["prev_center"][0]
+                dy = cy - mem["prev_center"][1]
+                velocity = (dx*dx + dy*dy)**0.5 / dt
+                area_delta = abs(area - mem["prev_area"])
+                area_velocity = area_delta / dt
+                mem["prev_center"] = (cx, cy)
+                mem["prev_area"] = area
+                mem["prev_ts"] = ts
+                translation_motion = velocity > 3
+                area_motion = area_velocity > 1000
+
+                if translation_motion or area_motion:
+                    if mem["moving_since"] is None:
+                        mem["moving_since"] = ts
+                    elif ts - mem["moving_since"] >= 3:
+                        feeding_detected = True
                 else:
-                    EVENT_QUEUE.put(payload, block=False)
-            except Exception as e:
-                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+                    mem["moving_since"] = None
 
-        # 2. END transition: ACTIVE -> INACTIVE
-        elif zone_scrapping and sig == "END" and state["state"] == "ACTIVE":
-            session_id_short = state["session_id"][:8] if state["session_id"] else "None"
-            payload = build_event_payload("SCRAPPING", "END_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
-            try:
-                # Log only START/END events, not FRAME_AGGREGATE (production filter)
-                if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
-                    logger.info(
-                        "[EVENT] %s | %s | cam=%s | conf=%.2f",
-                        payload["activity_type"],
-                        payload["event_type"],
-                        payload["camera_id"],
-                        payload["confidence"],
-                    )
-                if EVENT_QUEUE.full():
-                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                else:
-                    EVENT_QUEUE.put(payload, block=False)
-            except Exception as e:
-                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+            if feeding_detected:
+                last_seen_feed_ts = ts
+            feeding = (
+                last_seen_feed_ts is not None
+                and (ts - last_seen_feed_ts) < FEED_ACTIVE_BUFFER_SEC
+            )
 
-            state["state"] = "INACTIVE"
-            state["session_id"] = None
-            state["last_frame_emit"] = 0.0  # Reset for next session
+            sig = smoothers["FEEDING"].update(feeding, ts)
+            state = activity_state["FEEDING"]
 
-        # 3. FRAME_AGGREGATE: Only when ACTIVE and interval elapsed (AFTER START/END checks)
-        elif state["state"] == "ACTIVE":
-            if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
-                if zone_scrapping:
-                    payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
-                    try:
-                        # FRAME_AGGREGATE is not logged in production (silent queue)
-                        if EVENT_QUEUE.full():
-                            logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                        else:
-                            EVENT_QUEUE.put(payload, block=False)
-                            state["last_frame_emit"] = now
-                    except Exception as e:
-                        logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-                else:
+            if zone_feeding and sig == "START" and state["state"] == "INACTIVE":
+                state["state"] = "ACTIVE"
+                activity_start_ts = ts
+                state["activity_start_ts"] = activity_start_ts
+                state["session_id"] = bucket_session_id(
+                    "wf", camera_id, "FEEDING", activity_start_ts
+                )
+                state["last_frame_emit"] = 0.0
+                payload = build_event_payload("FEEDING", "START_CANDIDATE", camera_id, zone_feeding, detections_feed, state["session_id"])
+                try:
+                    if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
+                        logger.info(
+                            "[EVENT] %s | %s | cam=%s | conf=%.2f",
+                            payload["activity_type"],
+                            payload["event_type"],
+                            payload["camera_id"],
+                            payload["confidence"],
+                        )
+                    if EVENT_QUEUE.full():
+                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                    else:
+                        EVENT_QUEUE.put(payload, block=False)
+                except Exception as e:
+                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+
+            elif zone_feeding and sig == "END" and state["state"] == "ACTIVE":
+                payload = build_event_payload("FEEDING", "END_CANDIDATE", camera_id, zone_feeding, detections_feed, state["session_id"])
+                try:
+                    if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
+                        logger.info(
+                            "[EVENT] %s | %s | cam=%s | conf=%.2f",
+                            payload["activity_type"],
+                            payload["event_type"],
+                            payload["camera_id"],
+                            payload["confidence"],
+                        )
+                    if EVENT_QUEUE.full():
+                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                    else:
+                        EVENT_QUEUE.put(payload, block=False)
+                except Exception as e:
+                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+                state["state"] = "INACTIVE"
+                state["session_id"] = None
+                state["last_frame_emit"] = 0.0
+
+            elif state["state"] == "ACTIVE":
+                if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+                    if zone_feeding:
+                        payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, zone_feeding, detections_feed, state["session_id"])
+                        try:
+                            if EVENT_QUEUE.full():
+                                logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                            else:
+                                EVENT_QUEUE.put(payload, block=False)
+                        except Exception as e:
+                            logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
                     state["last_frame_emit"] = now
 
         # ------------------------------------------------------------------
-        # FEEDING - State Machine (using ROI-filtered detections)
+        # MILKING — milking pipeline only (isolated from workforce)
         # ------------------------------------------------------------------
-        # Motion-based detection: Requires sustained movement of tractor/TMR
-        feeding_detected = False
+        if run_milking_pipeline:
+            objects_all = detections_to_objects_all(detections_milking)
+            milking_signal = detect_milking_camera(camera_id, objects_all, ts)
+            sig = smoothers["MILKING"].update(milking_signal, ts)
+            state = activity_state["MILKING"]
 
-        for cls in ["tractor", "tmr_machine"]:
-            boxes = [
-                d["bbox"]
-                for d in detections_feed
-                if d["class"].lower() == cls
-            ]
-
-            if not boxes:
-                CLASS_MOTION_MEMORY[cls] = None
-                continue
-
-            # Choose largest box (most stable reference)
-            box = max(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
-
-            cx = (box[0] + box[2]) / 2
-            cy = (box[1] + box[3]) / 2
-            area = (box[2] - box[0]) * (box[3] - box[1])
-
-            mem = CLASS_MOTION_MEMORY[cls]
-
-            if mem is None:
-                CLASS_MOTION_MEMORY[cls] = {
-                    "prev_center": (cx, cy),
-                    "prev_area": area,
-                    "prev_ts": ts,
-                    "moving_since": None,
-                }
-                continue
-
-            dt = min(max(ts - mem["prev_ts"], 1e-6), 1.0)
-
-            dx = cx - mem["prev_center"][0]
-            dy = cy - mem["prev_center"][1]
-            velocity = (dx*dx + dy*dy)**0.5 / dt
-
-            area_delta = abs(area - mem["prev_area"])
-            area_velocity = area_delta / dt
-
-            mem["prev_center"] = (cx, cy)
-            mem["prev_area"] = area
-            mem["prev_ts"] = ts
-
-            translation_motion = velocity > 3
-            area_motion = area_velocity > 1000
-
-            if translation_motion or area_motion:
-                if mem["moving_since"] is None:
-                    mem["moving_since"] = ts
-                elif ts - mem["moving_since"] >= 3:
-                    feeding_detected = True
-            else:
-                mem["moving_since"] = None
-
-        if feeding_detected:
-            last_seen_feed_ts = ts
-        feeding = (
-            last_seen_feed_ts is not None
-            and (ts - last_seen_feed_ts) < FEED_ACTIVE_BUFFER_SEC
-        )
-
-        sig = smoothers["FEEDING"].update(feeding, ts)
-        state = activity_state["FEEDING"]
-
-        # 1. START transition: INACTIVE -> ACTIVE
-        if zone_feeding and sig == "START" and state["state"] == "INACTIVE":
-            state["state"] = "ACTIVE"
-            state["session_id"] = str(uuid4())
-            state["last_frame_emit"] = 0.0
-
-            payload = build_event_payload("FEEDING", "START_CANDIDATE", camera_id, zone_feeding, detections_feed, state["session_id"])
-            try:
-                # Log only START/END events, not FRAME_AGGREGATE (production filter)
-                if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
-                    logger.info(
-                        "[EVENT] %s | %s | cam=%s | conf=%.2f",
-                        payload["activity_type"],
-                        payload["event_type"],
-                        payload["camera_id"],
-                        payload["confidence"],
-                    )
-                if EVENT_QUEUE.full():
-                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                else:
-                    EVENT_QUEUE.put(payload, block=False)
-            except Exception as e:
-                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-
-        # 2. END transition: ACTIVE -> INACTIVE
-        elif zone_feeding and sig == "END" and state["state"] == "ACTIVE":
-            session_id_short = state["session_id"][:8] if state["session_id"] else "None"
-            payload = build_event_payload("FEEDING", "END_CANDIDATE", camera_id, zone_feeding, detections_feed, state["session_id"])
-            try:
-                # Log only START/END events, not FRAME_AGGREGATE (production filter)
-                if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
-                    logger.info(
-                        "[EVENT] %s | %s | cam=%s | conf=%.2f",
-                        payload["activity_type"],
-                        payload["event_type"],
-                        payload["camera_id"],
-                        payload["confidence"],
-                    )
-                if EVENT_QUEUE.full():
-                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                else:
-                    EVENT_QUEUE.put(payload, block=False)
-            except Exception as e:
-                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-
-            state["state"] = "INACTIVE"
-            state["session_id"] = None
-            state["last_frame_emit"] = 0.0  # Reset for next session
-
-        # 3. FRAME_AGGREGATE: Only when ACTIVE and interval elapsed (AFTER START/END checks)
-        elif state["state"] == "ACTIVE":
-            if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
-                if zone_feeding:
-                    payload = build_event_payload("FEEDING", "FRAME_AGGREGATE", camera_id, zone_feeding, detections_feed, state["session_id"])
-                    try:
-                        # FRAME_AGGREGATE is not logged in production (silent queue)
-                        if EVENT_QUEUE.full():
-                            logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                        else:
-                            EVENT_QUEUE.put(payload, block=False)
-                    except Exception as e:
-                        logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-                state["last_frame_emit"] = now
-
-        # ------------------------------------------------------------------
-        # MILKING - State Machine
-        # ------------------------------------------------------------------
-        has_cluster = any(
-            d["class"].lower() == "cluster_attached"
-            for d in detections_milking
-        )
-        has_udder = any(
-            d["class"].lower() == "cow_leg_udder"
-            for d in detections_milking
-        )
-        if has_cluster:
-            last_cluster_seen_ts = ts
-        cluster_recent = (
-            last_cluster_seen_ts is not None
-            and (ts - last_cluster_seen_ts) < CLUSTER_MEMORY_SEC
-        )
-        intersection_detected = detect_cluster_udder_intersection(detections_milking)
-        milking_detected = (
-            intersection_detected
-            or (has_udder and cluster_recent)
-        )
-        sig = smoothers["MILKING"].update(milking_detected, ts)
-        state = activity_state["MILKING"]
-
-        # START
-        if zone_milking and sig == "START" and state["state"] == "INACTIVE":
-            state["state"] = "ACTIVE"
-            state["session_id"] = str(uuid4())
-            state["last_frame_emit"] = 0.0
-            payload = build_event_payload(
-                "MILKING",
-                "START_CANDIDATE",
-                camera_id,
-                zone_milking,
-                detections_milking,
-                state["session_id"],
-            )
-            try:
-                if EVENT_QUEUE.full():
-                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                else:
-                    EVENT_QUEUE.put(payload, block=False)
-            except Exception as e:
-                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-
-        # END
-        elif zone_milking and sig == "END" and state["state"] == "ACTIVE":
-            payload = build_event_payload(
-                "MILKING",
-                "END_CANDIDATE",
-                camera_id,
-                zone_milking,
-                detections_milking,
-                state["session_id"],
-            )
-            try:
-                if EVENT_QUEUE.full():
-                    logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                else:
-                    EVENT_QUEUE.put(payload, block=False)
-            except Exception as e:
-                logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-            state["state"] = "INACTIVE"
-            state["session_id"] = None
-            state["last_frame_emit"] = 0.0
-
-        # FRAME_AGGREGATE
-        elif state["state"] == "ACTIVE":
-            if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+            if zone_milking and sig == "START" and state["state"] == "INACTIVE":
+                state["state"] = "ACTIVE"
+                activity_start_ts = ts
+                state["activity_start_ts"] = activity_start_ts
+                state["session_id"] = bucket_session_id(
+                    "milking", camera_id, "MILKING", activity_start_ts
+                )
+                state["last_frame_emit"] = 0.0
                 payload = build_event_payload(
                     "MILKING",
-                    "FRAME_AGGREGATE",
+                    "START_CANDIDATE",
                     camera_id,
                     zone_milking,
                     detections_milking,
@@ -1474,7 +1564,45 @@ def _process_camera_impl(
                         EVENT_QUEUE.put(payload, block=False)
                 except Exception as e:
                     logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
-                state["last_frame_emit"] = now
+
+            elif zone_milking and sig == "END" and state["state"] == "ACTIVE":
+                payload = build_event_payload(
+                    "MILKING",
+                    "END_CANDIDATE",
+                    camera_id,
+                    zone_milking,
+                    detections_milking,
+                    state["session_id"],
+                )
+                try:
+                    if EVENT_QUEUE.full():
+                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                    else:
+                        EVENT_QUEUE.put(payload, block=False)
+                except Exception as e:
+                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+                state["state"] = "INACTIVE"
+                state["session_id"] = None
+                state["last_frame_emit"] = 0.0
+
+            elif state["state"] == "ACTIVE":
+                if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+                    payload = build_event_payload(
+                        "MILKING",
+                        "FRAME_AGGREGATE",
+                        camera_id,
+                        zone_milking,
+                        detections_milking,
+                        state["session_id"],
+                    )
+                    try:
+                        if EVENT_QUEUE.full():
+                            logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                        else:
+                            EVENT_QUEUE.put(payload, block=False)
+                    except Exception as e:
+                        logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+                    state["last_frame_emit"] = now
 
     stream.release()
 
@@ -1595,36 +1723,42 @@ def main():
 
     logger.info("Edge Detector: Using device: %s", device)
 
-    activity_model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
-
-    # Create shared ModelRunner (once per device, NOT per camera)
-    activity_runner = ModelRunner(activity_model_path, device=device)
-    logger.info("Activity model loaded: %s", activity_model_path)
-
+    wf_model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
     milking_model_path = os.path.join(PROJECT_ROOT, MILKING_MODEL_PATH)
-    milking_cameras = [
-        c for c in cfg.get("cameras", [])
-        if resolve_zone_id(c, "MILKING")
-    ]
-    milking_model_enabled = False
-    milking_runner = None
-    if MILKING_MODEL_ENABLED and milking_cameras:
-        if not os.path.exists(milking_model_path):
-            logger.warning(
-                "MILKING model not found at %s; MILKING inference disabled",
-                milking_model_path,
-            )
-        else:
-            milking_runner = ModelRunner(milking_model_path, device=device)
-            milking_model_enabled = True
-            logger.info("Milking model loaded: %s", milking_model_path)
+    if not os.path.exists(milking_model_path):
+        fallback_milking = os.path.join(PROJECT_ROOT, "models/WF_Milking_v1.1_best.engine")
+        if os.path.exists(fallback_milking):
+            milking_model_path = fallback_milking
+            logger.info("Using fallback milking engine: %s", milking_model_path)
+
+    milking_cameras = [c for c in cfg.get("cameras", []) if is_milking_camera(c)]
+    wf_runner, milking_runner = create_edge_runners(
+        wf_model_path,
+        device=device,
+        milking_enabled=MILKING_MODEL_ENABLED and bool(milking_cameras),
+        milking_model_path=milking_model_path,
+    )
+    logger.info("Workforce model loaded: %s", wf_model_path)
+
+    milking_model_enabled = milking_runner is not None
+    if MILKING_MODEL_ENABLED and milking_cameras and not milking_model_enabled:
+        logger.warning(
+            "MILKING model not found at %s; MILKING inference disabled",
+            milking_model_path,
+        )
+    elif milking_model_enabled:
+        logger.info(
+            "Milking model loaded: %s (%d milking camera(s))",
+            milking_model_path,
+            len(milking_cameras),
+        )
 
     # Warmup TensorRT engine (avoids first-frame latency spike)
     logger.info("Warming up TensorRT engine...")
     dummy = np.zeros((512, 512, 3), dtype=np.uint8)
     for _ in range(5):
         try:
-            activity_runner.infer([dummy, dummy])
+            wf_runner.infer([dummy, dummy])
         except:
             pass
     if milking_model_enabled and milking_runner is not None:
@@ -1638,7 +1772,7 @@ def main():
     # Start dedicated single GPU inference worker with multi-model routing
     Thread(
         target=inference_worker,
-        args=(activity_runner, milking_runner),
+        args=(wf_runner, milking_runner),
         daemon=True,
     ).start()
     logger.info("Started GPU inference worker (multi-model queue routing)")

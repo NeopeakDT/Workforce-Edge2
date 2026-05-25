@@ -2,6 +2,11 @@
 import cv2
 import numpy as np
 
+# Default for filter_by_roi() when callers omit min_overlap_ratio.
+DEFAULT_FILTER_OVERLAP = 0.03
+# Milking only: tiny cluster/udder boxes + parlour angles need a lower threshold.
+MILKING_MIN_OVERLAP_RATIO = 0.01
+
 
 def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.02, roi_mask=None):
     """
@@ -35,11 +40,20 @@ def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.02, roi_
     return overlap_ratio >= min_overlap_ratio
 
 
-def filter_by_roi(detections, roi_polygon, frame_shape, min_overlap_ratio=0.03, roi_mask=None):
+def filter_by_roi(
+    detections,
+    roi_polygon,
+    frame_shape,
+    min_overlap_ratio=DEFAULT_FILTER_OVERLAP,
+    roi_mask=None,
+):
     """
     Filter detections using bbox overlap logic.
 
     If roi_mask is provided, it is reused for all detections in the frame.
+
+    Milking pipelines must pass min_overlap_ratio=MILKING_MIN_OVERLAP_RATIO (0.01).
+    Feeding/scrapping typically use a higher threshold at the call site (e.g. 0.2).
     """
     if not roi_polygon:
         return detections
