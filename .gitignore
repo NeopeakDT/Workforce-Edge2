@@ -1,3 +1,5 @@
+event_retry.db
+
 # data-
 data/1.pseudo_labeled/
 data/2.qa_sample/
@@ -45,4 +47,9 @@ complete_project_code.zip/
 complete_project_code.zip
 project_code.zip
 torch_env-requirements.txt
+
+# Python bytecode / cache (auto-generated on each machine)
+__pycache__/
+*.pyc
+*.pyo
 
