@@ -1,4 +1,5 @@
 """
+jetson/config/local_cache.py
 Local Cache Configuration Manager
 
 Single trusted access point for loading and validating cached configuration.
@@ -23,11 +24,13 @@ from typing import Dict, Any
 CACHE_PATH = Path(__file__).parent / "local_cache.json"
 
 REQUIRED_KEYS = {
-    "farm_camera",
-    "camera_stream_config",
-    "device_model_assignment",
+    "device_id",
+    "farm_id",
+    "farm_timezone",
+    "cameras",
     "ml_model_version",
 }
+
 
 def load_config() -> Dict[str, Any]:
    

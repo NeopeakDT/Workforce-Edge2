@@ -1,0 +1,19 @@
+-- STEP-6 — OPTIONAL: repair NULL `status` and (later) NOT NULL constraint
+--
+-- The aggregator now runs the same status repair every commit (`normalize_null_instance_statuses`).
+-- Use this file for one-off DB repair or to add NOT NULL after cleanup.
+--
+-- One-shot (uncomment to run manually):
+-- UPDATE activity_instance
+-- SET status = CASE
+--     WHEN actual_end_at IS NULL THEN 'IN_PROGRESS'
+--     ELSE 'ENDED'
+--   END,
+--     updated_at = NOW()
+-- WHERE status IS NULL;
+--
+-- Verify: SELECT COUNT(*) FROM activity_instance WHERE status IS NULL;
+--
+-- ONLY when count is 0 (uncomment):
+-- ALTER TABLE activity_instance
+--   ALTER COLUMN status SET NOT NULL;

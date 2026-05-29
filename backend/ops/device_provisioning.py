@@ -13,6 +13,12 @@ Purpose:
 IMPORTANT:
 - Run ONLY from admin/backend machine
 - Do NOT run on Jetson
+
+# How to run this file -
+python ops/device_provisioning.py \
+  --farm-id 07dbc890-2076-4018-b5fc-9f93cf2900e3 \
+  --device-name "Jetson_Camera_01" \
+  --device-code "JETSON_001"
 """
 
 import argparse

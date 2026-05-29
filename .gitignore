@@ -1,3 +1,5 @@
+event_retry.db
+
 # data-
 data/1.pseudo_labeled/
 data/2.qa_sample/
@@ -7,6 +9,18 @@ data/unlabeled/
 Activities/01-Milking/best.pt
 
 input_videos/
+test_data/
+models/
+runs/
+project_code.zip
+
+IMPLEMENTATION_VS_SPEC_ANALYSIS.md
+Updated_project_code.zip
+VERIFICATION_SUMMARY.md
+WORKFORCE_EVENT_PIPELINE.md
+workforce_execution_checklist.txt
+workforce_full_conversation_export.txt
+Data-cleanup-SQL.txt
 
 # Ignore all .txt files except requirements.txt
 # backend/requirements.txt
@@ -28,3 +42,14 @@ input_videos/
 # backend/.env.example
 # */.env
 # **/.env
+
+complete_project_code.zip/
+complete_project_code.zip
+project_code.zip
+torch_env-requirements.txt
+
+# Python bytecode / cache (auto-generated on each machine)
+__pycache__/
+*.pyc
+*.pyo
+

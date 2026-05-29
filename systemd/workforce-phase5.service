@@ -1,0 +1,30 @@
+# Workforce Phase-5 Service (Resolver + Missed)
+#
+# What it does:
+# - Runs Phase-5 batch jobs once per invocation.
+# - STEP-5A: resolves schedules and finalizes EARLY/ON_TIME/LATE.
+# - STEP-5B: creates MISSED records when schedule windows are missed.
+#
+# How to use:
+# 1) sudo cp systemd/workforce-phase5.service /etc/systemd/system/workforce-phase5.service
+# 2) sudo cp systemd/workforce-phase5.timer /etc/systemd/system/workforce-phase5.timer
+# 3) sudo systemctl daemon-reload
+# 4) sudo systemctl enable workforce-phase5.timer
+# 5) sudo systemctl start workforce-phase5.timer
+     sudo systemctl stop workforce-phase5.timer
+# 6) systemctl list-timers --all | grep workforce-phase5 (--status)
+     journalctl -u workforce-phase5.service -f (--log)
+#-----------------------------------------------------------------------------------------------
+
+
+[Unit]
+Description=Workforce Phase 5 (Resolver + Missed)
+After=network.target
+
+[Service]
+Type=oneshot
+# Use backend/ as cwd so python-dotenv loads the same .env as workforce-backend (DATABASE_URL, etc.).
+WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/backend
+ExecStart=/home/neopeak/torch_env/bin/python run_phase5.py
+Environment=PYTHONUNBUFFERED=1
+User=neopeak

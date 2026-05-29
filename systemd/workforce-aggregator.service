@@ -1,0 +1,32 @@
+# Workforce Aggregator Service (STEP-4)
+#
+# What it does:
+# - Runs backend/aggregation/activity_aggregator.py as a continuous worker.
+# - Converts raw detection events into activity_instance records.
+# - Keeps running and auto-restarts on failure.
+#
+# How to use:
+# 1) sudo cp systemd/workforce-aggregator.service /etc/systemd/system/workforce-aggregator.service(only once)
+# 2) sudo systemctl daemon-reload(only once)
+# 3) sudo systemctl enable workforce-aggregator(only once)
+# 4) sudo systemctl start workforce-aggregator
+#    sudo systemctl stop workforce-aggregator
+# 5) sudo systemctl status workforce-aggregator --no-pager
+# 6) journalctl -u workforce-aggregator -f
+#--------------------------------------------------------------------------------
+
+[Unit]
+Description=Workforce Activity Aggregator (Phase 4)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
+ExecStart=/home/neopeak/torch_env/bin/python /home/neopeak/Desktop/WF-project/WF/Workforce-Detection/backend/aggregation/activity_aggregator.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+User=neopeak
+
+[Install]
+WantedBy=multi-user.target

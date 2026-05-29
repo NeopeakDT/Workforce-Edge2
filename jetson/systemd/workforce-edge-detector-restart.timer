@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily restart for Workforce Edge Detector
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=workforce-edge-detector-restart.service
+
+[Install]
+WantedBy=timers.target

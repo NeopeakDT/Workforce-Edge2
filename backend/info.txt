@@ -58,20 +58,20 @@ Idempotency and uniqueness enforcement for IN_PROGRESS activities
 EARLY/LATE computation only in backend (never on edge)
 
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-07/1/2025- device_provisioning.py
+19/1/2025- device_provisioning.py
 
-PS C:\Users\offic\OneDrive\Desktop\Pranjal\Workforce-Detection\backend> 
-python ops/device_provisioning.py --farm-id 9fa991d5-23ee-429f-8c7f-09b4acc3a415 --device-name harmony-jetson-01 --device-code HARMONY_JETSON_01
->> 
+neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ python backend/ops/device_provisioning.py --farm-id 07dbc890-2076-4018-b5fc-9f93cf2900e3 --device-name Harmony_dairy_01 --device-code HD_test_01
 ✅ Device provisioned successfully
-Device ID      : 6eb487b5-17c4-4f62-a613-84db27397621
-Device Name    : harmony-jetson-01
-Device Code    : HARMONY_JETSON_01
-API Key (SAVE) : 5c399d607fe890ea61d3405b0fc40d6b17a15dac6751d6c49e61fd78ce0992a8
+Device ID      : 3259cd10-d54c-42e3-88d6-b85a05e262be
+Device Name    : Harmony_dairy_01
+Device Code    : HD_TEST_01
+API Key (SAVE) : 25fbc2da62e189e8c3845475b1f6dbc36fcb58d2849b82b2b9f5595e494573ab
 
 ⚠️  WARNING: Save this API key now!
    It will NOT be shown again.
    Store it securely on the Jetson device.
+neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ 
+
 -----------------------------------------------------------------------------------------------
 main.py
 

@@ -1,80 +1,95 @@
 """
-Temporal Smoother
+jetson/runtime/temporal_smoother.py
+Temporal Smoother (Time-Based)
 
-START/END debouncing for detection signals. Converts noisy frame-level detections
-into stable activity signals using sliding window approach.
+Time-based START/END debouncing for activity signals.
+Deterministic, FPS-independent, works for both LIVE and BATCH processing.
 
 Key Features:
-    - Converts noisy frames → stable signals
-    - START/END debouncing (prevents false positives)
-    - Sliding window buffer for temporal consistency
-    - No activities, no timestamps (pure signal processing)
+    - Time-based debouncing (not frame-based)
+    - Configurable START and END thresholds (seconds)
+    - Deterministic: same input → same output
+    - Works for both LIVE (real-time) and BATCH (video file) modes
+    - Pure signal processing (no activity tracking)
 
 Usage:
     from runtime.temporal_smoother import TemporalSmoother
     
-    smoother = TemporalSmoother(window=5)
-    result = smoother.update(detections)
-    # Returns: {"type": "START_CANDIDATE"}, {"type": "END_CANDIDATE"}, 
-    #          {"type": "FRAME_AGGREGATE"}, or None
+    smoother = TemporalSmoother(start_sec=3.0, end_sec=5.0)
+    result = smoother.update(condition, timestamp)
+    # Returns: "START", "END", or None (semantic signals)
 """
 
-from collections import deque
+import time
 
 
 class TemporalSmoother:
     """
-    Temporal smoothing for detection signals.
+    Time-based temporal smoothing for activity signals.
     
-    Uses sliding window to debounce START/END events and prevent false positives
-    from noisy frame-level detections.
+    Debounces START/END events based on duration, not frame count.
+    Prevents false positives from transient detections.
     """
     
-    def __init__(self, window=5):
+    def __init__(self, start_sec=3.0, end_sec=5.0):
         """
-        Initialize temporal smoother.
+        Initialize temporal smoother with time-based thresholds.
         
         Args:
-            window: Size of sliding window buffer (default: 5 frames)
+            start_sec: Duration (seconds) condition must be true to trigger START (default: 3.0)
+            end_sec: Duration (seconds) condition must be false to trigger END (default: 5.0)
         """
-        self.window = window
-        self.buffer = deque(maxlen=window)
+        self.start_sec = start_sec
+        self.end_sec = end_sec
         self.active = False
-    
-    def update(self, detections):
+        self.true_since = None
+        self.false_since = None
+
+    def update(self, condition, timestamp=None):
         """
-        Update smoother with new frame detections.
+        Update smoother with new condition state.
         
-        Converts noisy frame-level detections into stable activity signals.
-        Returns event type when activity state changes.
+        Time-based debouncing:
+        - START: Condition stays true for start_sec seconds
+        - END: Condition stays false for end_sec seconds
+        - FPS-independent (uses wall-clock or video timestamp)
         
         Args:
-            detections: List of detections (empty list = no detection)
+            condition: Boolean condition (True = activity present, False = activity absent)
+            timestamp: Optional timestamp (defaults to time.time() if not provided)
             
         Returns:
-            Dict with "type" key:
-                - "START_CANDIDATE": Activity likely started
-                - "END_CANDIDATE": Activity likely ended
-                - "FRAME_AGGREGATE": Activity ongoing
-            None: No significant signal
-        
-        Logic:
-            - START: Need 3+ detections in window (out of 5)
-            - END: Need 1 or fewer detections in window (out of 5)
-            - Prevents false positives from single-frame noise
+            "START": Activity transitioned from absent → present (sustained start_sec)
+            "END": Activity transitioned from present → absent (sustained end_sec)
+            None: No state change
         """
-        present = bool(detections)
-        self.buffer.append(present)
-        
-        if not self.active and sum(self.buffer) >= 3:
-            self.active = True
-            return {"type": "START_CANDIDATE"}
-        
-        if self.active and sum(self.buffer) <= 1:
-            self.active = False
-            return {"type": "END_CANDIDATE"}
-        
-        if self.active:
-            return {"type": "FRAME_AGGREGATE"}
-        
+        if timestamp is None:
+            timestamp = time.time()
+
+        # --- START logic: transition from INACTIVE to ACTIVE ---
+        if not self.active:
+            if condition:
+                if self.true_since is None:
+                    self.true_since = timestamp
+                elif timestamp - self.true_since >= self.start_sec:
+                    self.active = True
+                    self.true_since = None
+                    self.false_since = None
+                    return "START"
+            else:
+                self.true_since = None
+
+        # --- END logic: transition from ACTIVE to INACTIVE ---
+        else:
+            if not condition:
+                if self.false_since is None:
+                    self.false_since = timestamp
+                elif timestamp - self.false_since >= self.end_sec:
+                    self.active = False
+                    self.false_since = None
+                    self.true_since = None
+                    return "END"
+            else:
+                self.false_since = None
+
         return None

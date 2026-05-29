@@ -1,0 +1,39 @@
+# ------------------------------------------------------------------------------
+# Workforce Edge Heartbeat Agent Service - Sends device health (CPU/GPU/etc) to backend every 300 sec
+#
+# Purpose:
+# Runs the device heartbeat agent as a background system service so the backend
+# keeps receiving CPU/GPU/memory health updates even across restarts.
+#
+# What it does:
+# - Runs jetson/edge_heartbeat_agent.py using the project virtual environment
+# - Sends heartbeat/telemetry to the backend every HEARTBEAT_INTERVAL seconds
+# - Auto-restarts on failure
+# - Logs output via journalctl
+
+# How to use:
+# Start:    sudo systemctl start workforce-heartbeat
+# Stop:     sudo systemctl stop workforce-heartbeat
+# Restart:  sudo systemctl restart workforce-heartbeat
+# Status:   sudo systemctl status workforce-heartbeat
+# Logs:     journalctl -u workforce-heartbeat -f
+
+# ------------------------------------------------------------------------------
+[Unit]
+Description=Workforce Edge Heartbeat Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
+ExecStart=/home/neopeak/torch_env/bin/python jetson/edge_heartbeat_agent.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+User=neopeak
+
+[Install]
+WantedBy=multi-user.target

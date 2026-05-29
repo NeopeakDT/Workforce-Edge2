@@ -1,8 +1,27 @@
 """
+backend/alerts/alert_evaluator.py
 STEP 6.1 — Alert Evaluation Engine (ACTIVITY ONLY)
 
 Evaluates alert rules against FINAL activity truth.
+
+---------------------------------------------------------
+
+Activity Finalized 
+    ↓ (alert_evaluator.py)
+Alert Created (alert_log.status='SENT')
+    ↓ (notification_dispatcher.py)  
+Alert Delivered (alert_log updated with channel/message)
+
 """
+
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
 
 from common.db import get_cursor
 from common.time_utils import utc_now
@@ -107,3 +126,23 @@ def evaluate_activity_alerts(activity_instance_id: str):
                     activity["id"],
                 ),
             )
+
+
+if __name__ == "__main__":
+    # For testing - evaluate alerts for the most recent activity instance
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT id FROM activity_instance
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        latest = cur.fetchone()
+
+        if latest:
+            print(f"Evaluating alerts for activity instance: {latest['id']}")
+            evaluate_activity_alerts(latest['id'])
+            print("Alert evaluation completed")
+        else:
+            print("No activity instances found to evaluate")

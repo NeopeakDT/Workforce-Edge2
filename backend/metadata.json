@@ -1,16 +1,22 @@
 {
-   "supported_activity_codes": ["MILKING", "FEEDING", "SCRAPING"],
-   "model_format": ".pt",
-   "input_size": [640, 640],
-   "precision": "fp16",
-   "postprocess": {
-     "nms_iou": 0.55,
-     "conf_threshold": 0.75
-   },
-   "activity_thresholds": {
-     "MILKING": { "min_frames": 30, "min_conf": 0.75 },
-     "FEEDING": { "min_frames": 20, "min_conf": 0.70 },
-     "SCRAPING": { "min_frames": 25, "min_conf": 0.70 }
-   }
- }
+  "supported_activity_codes": ["MILKING", "FEEDING", "SCRAPPING"],
+  "model_format": ".engine",
+  "input_size": [640, 640],
+  "precision": "fp16",
+  "class_map": {
+    "TMR": ["tmr_machine", "feeder_wagon"],
+    "PERSON": ["person"],
+    "TRACTOR": ["tractor"],
+    "SCRAPPING_TOOL": ["scrapping_tool", "shovel"]
+  },
+  "postprocess": {
+    "nms_iou": 0.55,
+    "conf_threshold": 0.75
+  },
+  "activity_thresholds": {
+    "MILKING": { "min_frames": 30, "min_conf": 0.75 },
+    "FEEDING": { "min_frames": 20, "min_conf": 0.70 },
+    "SCRAPPING": { "min_frames": 25, "min_conf": 0.70 }
+  }
+}
  

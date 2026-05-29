@@ -1,0 +1,23 @@
+# Workforce Phase-5 Timer
+#
+# What it does:
+# - Triggers workforce-phase5.service every 60 seconds.
+# - Starts one minute after boot.
+#
+# How to use:
+# 1) sudo cp systemd/workforce-phase5.timer /etc/systemd/system/workforce-phase5.timer
+# 2) sudo systemctl daemon-reload
+# 3) sudo systemctl enable workforce-phase5.timer
+# 4) sudo systemctl start workforce-phase5.timer
+# 5) systemctl list-timers --all | grep workforce-phase5
+
+[Unit]
+Description=Run Phase 5 every 1 minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+Unit=workforce-phase5.service
+
+[Install]
+WantedBy=timers.target

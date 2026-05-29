@@ -1,55 +1,85 @@
-"""
-ROI (Region of Interest) Utilities
+# jetson/runtime/roi_utils.py
+import cv2
+import numpy as np
 
-Pure geometry filtering for detections. Filters detections to only process
-relevant regions of the frame using polygon-based ROI.
-
-Key Features:
-    - Geometry-only filtering (no class semantics)
-    - Deterministic point-in-polygon checks
-    - Filters detections by bounding box center point
-
-Usage:
-    from runtime.roi_utils import filter_by_roi
-    
-    roi_polygon = [(0, 0), (640, 0), (640, 480), (0, 480)]  # Full frame
-    filtered = filter_by_roi(detections, roi_polygon)
-"""
-
-from shapely.geometry import Point, Polygon
+# Default for filter_by_roi() when callers omit min_overlap_ratio.
+DEFAULT_FILTER_OVERLAP = 0.03
+# Milking only: tiny cluster/udder boxes + parlour angles need a lower threshold.
+MILKING_MIN_OVERLAP_RATIO = 0.01
 
 
-def filter_by_roi(detections, roi_polygon):
+def bbox_roi_overlap(box, roi_polygon, frame_shape, min_overlap_ratio=0.02, roi_mask=None):
     """
-    Filter detections to only include those within ROI polygon.
-    
-    Uses bounding box center point for point-in-polygon check.
-    Pure geometry - no class semantics, deterministic.
-    
-    Args:
-        detections: List of detection dictionaries with "bbox" key
-        roi_polygon: List of (x, y) tuples defining polygon vertices
-        
-    Returns:
-        List of detection dictionaries that are within ROI
-        
-    Example:
-        >>> detections = [
-        ...     {"bbox": [100, 50, 200, 150], "class": "milking", ...},
-        ...     {"bbox": [500, 300, 600, 400], "class": "scraping", ...}
-        ... ]
-        >>> roi = [(0, 0), (400, 0), (400, 300), (0, 300)]  # Left half
-        >>> filtered = filter_by_roi(detections, roi)
-        >>> # Returns only first detection (center at 150, 100 - inside ROI)
+    Fast bbox-ROI overlap using mask intersection.
+
+    If roi_mask is provided, it is used directly to avoid re-allocating
+    a full-frame ROI mask for every detection.
     """
-    poly = Polygon(roi_polygon)
-    out = []
-    
-    for d in detections:
-        x1, y1, x2, y2 = d["bbox"]
-        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        
-        if poly.contains(Point(cx, cy)):
-            out.append(d)
-    
-    return out
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = map(int, box)
+
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(0, min(w, x2))
+    y2 = max(0, min(h, y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    if roi_mask is None:
+        roi_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(roi_mask, [roi_polygon], 1)
+
+    intersection = int(roi_mask[y1:y2, x1:x2].sum())
+    bbox_area = (x2 - x1) * (y2 - y1)
+
+    if bbox_area == 0:
+        return False
+
+    overlap_ratio = intersection / bbox_area
+    return overlap_ratio >= min_overlap_ratio
+
+
+def filter_by_roi(
+    detections,
+    roi_polygon,
+    frame_shape,
+    min_overlap_ratio=DEFAULT_FILTER_OVERLAP,
+    roi_mask=None,
+):
+    """
+    Filter detections using bbox overlap logic.
+
+    If roi_mask is provided, it is reused for all detections in the frame.
+
+    Milking pipelines must pass min_overlap_ratio=MILKING_MIN_OVERLAP_RATIO (0.01).
+    Feeding/scrapping typically use a higher threshold at the call site (e.g. 0.2).
+    """
+    if not roi_polygon:
+        return detections
+
+    filtered = []
+
+    if roi_mask is not None:
+        for d in detections:
+            if bbox_roi_overlap(
+                d["bbox"],
+                roi_polygon,
+                frame_shape,
+                min_overlap_ratio=min_overlap_ratio,
+                roi_mask=roi_mask,
+            ):
+                filtered.append(d)
+    else:
+        poly = np.array(roi_polygon, dtype=np.int32)
+        for d in detections:
+            if bbox_roi_overlap(
+                d["bbox"],
+                poly,
+                frame_shape,
+                min_overlap_ratio=min_overlap_ratio,
+                roi_mask=None,
+            ):
+                filtered.append(d)
+
+    return filtered

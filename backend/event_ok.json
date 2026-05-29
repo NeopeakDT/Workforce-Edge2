@@ -1,12 +1,9 @@
 {
-  "camera_id": "31cd7e65-af3c-4531-9fd2-6aa4a233d0a4",
+  "camera_id": "7792f15f-d5d6-45e5-9d22-b380a2eafb87",
   "activity_type": "MILKING",
   "confidence": 0.9,
-  "event_type": "START_CANDIDATE",
-  "frame_ts": "2026-01-19T23:35:00Z",
-  "objects": {
-    "person": [{ "id": 1 }],
-    "cow":[{"id":1}]
-  },
-  "idempotency_key": "milking-inprogress-001"
+  "event_type": "END_CANDIDATE",
+  "frame_ts": "2026-01-27T00:15:00Z",
+  "objects": { "person": [{ "id": 1 }] },
+  "idempotency_key": "milking-morning-end-06"
 }

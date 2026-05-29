@@ -1,0 +1,26 @@
+# Workforce Backend Service (API)
+#
+# What it does:
+# - Runs the Workforce FastAPI backend with Uvicorn.
+# - Exposes API on port 8000 for edge ingestion and backend endpoints.
+#
+# How to use:
+# 1) sudo cp systemd/workforce-backend.service /etc/systemd/system/workforce-backend.service
+# 2) sudo systemctl daemon-reload
+# 3) sudo systemctl enable workforce-backend
+# 4) sudo systemctl start workforce-backend
+# 5) sudo systemctl status workforce-backend --no-pager
+# 6) journalctl -u workforce-backend -f
+
+[Unit]
+Description=Workforce Backend API
+After=network.target
+
+[Service]
+WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/backend
+ExecStart=/home/neopeak/torch_env/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+User=neopeak
+
+[Install]
+WantedBy=multi-user.target

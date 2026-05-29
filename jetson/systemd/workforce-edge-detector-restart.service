@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart Workforce Edge Detector
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart workforce-edge-detector.service
