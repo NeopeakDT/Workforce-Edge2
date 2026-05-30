@@ -177,7 +177,7 @@ EDGE_MODE = os.getenv("EDGE_MODE", "LIVE")  # LIVE or BATCH
 WATCHDOG_FILE_PATH = os.getenv("EDGE_WATCHDOG_FILE", "/tmp/workforce_edge_alive")
 PROCESS_STARTED_AT = time.time()
 MILKING_MODEL_ENABLED = True
-MILKING_MODEL_PATH = "models/milking_best.engine"
+MILKING_MODEL_PATH = "models/WF_Milking_v1.1_best.pt"
 WF_MIN_OVERLAP_RATIO = 0.2
 MILKING_MIN_OVERLAP_RATIO = 0.01
 MILKING_CLUSTER_MEMORY_SEC = 20
@@ -1725,6 +1725,11 @@ def main():
 
     wf_model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
     milking_model_path = os.path.join(PROJECT_ROOT, MILKING_MODEL_PATH)
+    if not os.path.exists(wf_model_path):
+        raise FileNotFoundError(
+            f"Workforce model not found: {wf_model_path} "
+            f"(check ml_model_version.model_path in local_cache.json)"
+        )
     if not os.path.exists(milking_model_path):
         fallback_milking = os.path.join(PROJECT_ROOT, "models/WF_Milking_v1.1_best.engine")
         if os.path.exists(fallback_milking):
