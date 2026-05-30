@@ -727,17 +727,17 @@ def detect_milking_camera(camera_id, objects_all, ts):
         or udder_only_detected
     )
 
-    logger.warning(
-        "[MILKING GATE] "
-        "clusters=%d udders=%d persons=%d "
-        "valid_cluster=%s cluster_recent=%s detected=%s",
-        len(clusters),
-        len(udders),
-        len(persons),
-        valid_cluster,
-        cluster_recent,
-        milking_detected,
-    )
+    # logger.warning(
+    #     "[MILKING GATE] "
+    #     "clusters=%d udders=%d persons=%d "
+    #     "valid_cluster=%s cluster_recent=%s detected=%s",
+    #     len(clusters),
+    #     len(udders),
+    #     len(persons),
+    #     valid_cluster,
+    #     cluster_recent,
+    #     milking_detected,
+    # )
 
     # Temporal persistence is handled by TemporalSmoother (no second active buffer).
     state["active"] = milking_detected
@@ -1259,13 +1259,13 @@ def _process_camera_impl(
                         last_timeout_log = now_ts
                 else:
                     raw_milking = milking_result.get("detections", [])
-                    logger.warning(
-                        "[MILKING RAW] %s",
-                        [
-                            (d.get("class"), round(d.get("confidence", 0), 2))
-                            for d in raw_milking
-                        ],
-                    )
+                    # logger.warning(
+                    #     "[MILKING RAW] %s",
+                    #     [
+                    #         (d.get("class"), round(d.get("confidence", 0), 2))
+                    #         for d in raw_milking
+                    #     ],
+                    # )
                     for det in raw_milking:
                         det["class"] = str(det.get("class", "")).lower()
                     detections_milking_only = filter_detections_by_classes(

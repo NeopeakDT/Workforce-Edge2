@@ -737,6 +737,7 @@ sudo systemctl restart workforce-phase5.timer
 sudo systemctl restart workforce-phase5.service
 sudo systemctl restart workforce-heartbeat
 sudo systemctl restart workforce-watchdog
+journalctl -u workforce-edge -f
 
 journalctl -u workforce-backend -f
 journalctl -u workforce-edge -f
