@@ -8,8 +8,8 @@ import threading
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 # Hardware-aware decode control: limit concurrent GPU-decoded streams.
-# NOTE: This is process-wide for the Jetson edge_detector process.
-MAX_GPU_STREAMS = 3
+# NOTE: This is process-wide for the edge_detector process.
+MAX_GPU_STREAMS = 10
 gpu_stream_count = 0
 gpu_stream_count_lock = threading.Lock()
 
@@ -50,35 +50,32 @@ def _validate_gstreamer():
 def build_pipeline(rtsp_url, codec):
 	"""
 	Build production-ready GStreamer pipeline for RTSP streams.
-	Supports h264 and h265 with hardware acceleration (nvv4l2decoder).
-	
+	Supports h264 and h265 with NVIDIA x86 NVDEC (nvh264dec / nvh265dec).
+
 	Key features:
 	- protocols=tcp: Prevents UDP packet drops on real deployments
-	- non-zero latency + jitter buffer: Better tolerance to RTP jitter
-	- bounded leaky queue: Avoids backlog while staying realtime
-	- nvv4l2decoder: Hardware H.264/H.265 decode
+	- drop-on-latency=true: Drops stale frames on network hiccups (real-time AI)
+	- rtspsrc connects directly to depayloader (dynamic RTP pad negotiation)
+	- nvh264dec / nvh265dec: Hardware H.264/H.265 decode via NVDEC
 	- timeout=5000000: Prevents infinite hang on disconnect (5s timeout)
 	"""
 	if codec == "h264":
-		depay = "rtph264depay ! h264parse"
+		depay = "rtph264depay ! h264parse ! nvh264dec"
 	else:
-		depay = "rtph265depay ! h265parse"
+		depay = "rtph265depay ! h265parse ! nvh265dec"
 
 	return (
-		f"rtspsrc location={rtsp_url} latency=100 protocols=tcp timeout=5000000 ! "
-		"rtpjitterbuffer latency=100 drop-on-latency=false ! "
-		"queue max-size-buffers=4 leaky=downstream ! "
+		f"rtspsrc location={rtsp_url} protocols=tcp latency=100 drop-on-latency=true timeout=5000000 ! "
 		f"{depay} ! "
-		"nvv4l2decoder enable-max-performance=1 ! "
-		"nvvidconv ! video/x-raw,format=BGRx ! "
-		"videoconvert ! video/x-raw,format=BGR ! "
+		"videoconvert ! "
+		"video/x-raw,format=BGR ! "
 		"appsink drop=true max-buffers=1 sync=false"
 	)
 
 
 def open_file_nvdec(path):
 	"""
-	Open local video files using Jetson hardware decode.
+	Open local video files using NVIDIA x86 NVDEC hardware decode.
 	Supports MP4, MPEG-PS, H264, H265.
 	"""
 
@@ -86,26 +83,22 @@ def open_file_nvdec(path):
 
 		# MPEG-PS + H265 (DVR export)
 		f'filesrc location="{path}" ! mpegpsdemux ! h265parse ! '
-		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
-		'videoconvert ! video/x-raw,format=BGR ! '
+		'nvh265dec ! videoconvert ! '
 		'appsink drop=true max-buffers=1 sync=false',
 
 		# MPEG-PS + H264
 		f'filesrc location="{path}" ! mpegpsdemux ! h264parse ! '
-		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
-		'videoconvert ! video/x-raw,format=BGR ! '
+		'nvh264dec ! videoconvert ! '
 		'appsink drop=true max-buffers=1 sync=false',
 
 		# MP4 container
 		f'filesrc location="{path}" ! qtdemux ! h265parse ! '
-		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
-		'videoconvert ! video/x-raw,format=BGR ! '
+		'nvh265dec ! videoconvert ! '
 		'appsink drop=true max-buffers=1 sync=false',
 
 		# MP4 container + H264
 		f'filesrc location="{path}" ! qtdemux ! h264parse ! '
-		'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! '
-		'videoconvert ! video/x-raw,format=BGR ! '
+		'nvh264dec ! videoconvert ! '
 		'appsink drop=true max-buffers=1 sync=false',
 
 		# Fallback
@@ -135,14 +128,13 @@ def open_file_nvdec(path):
 
 def open_rtsp_auto(rtsp_url):
 	"""
-	Open RTSP stream with hardware acceleration (nvv4l2decoder).
-	
-	Attempts both H.264 and H.265 codecs to handle varying camera/NVR configurations.
+	Open RTSP stream with NVIDIA x86 NVDEC (nvh264dec / nvh265dec).
+
+	Attempts H.264 first (farm substreams), then H.265 as fallback.
 	Includes 500ms warm-up delay for camera initialization.
 	"""
 
-	# Use H.264 only for RTSP stability with this deployment.
-	for codec in ("h264",):
+	for codec in ("h264", "h265"):
 		pipeline = build_pipeline(rtsp_url, codec)
 
 		# Retry loop to handle flaky RTSP connections / camera timeouts.
@@ -150,7 +142,7 @@ def open_rtsp_auto(rtsp_url):
 			cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
 			# NOTE: Do not call CAP_PROP_BUFFERSIZE on GStreamer.
-			# On Jetson OpenCV-GStreamer this often logs "unhandled property"
+			# OpenCV-GStreamer often logs "unhandled property" for this
 			# and can destabilize the pipeline.
 
 			if not cap.isOpened():
@@ -287,7 +279,7 @@ def open_stream(camera_cfg):
 			# Open RTSP stream based on the GPU decode decision above.
 			with rtsp_semaphore:
 				if use_gpu:
-					# GPU decode: use GStreamer + nvv4l2decoder
+					# GPU decode: use GStreamer + nvh264dec / nvh265dec
 					try:
 						cap = open_rtsp_auto(rtsp_url)
 						if decode_mode in ("GPU", "AUTO"):
