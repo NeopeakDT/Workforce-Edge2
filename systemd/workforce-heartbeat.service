@@ -26,8 +26,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
-ExecStart=/home/neopeak/torch_env/bin/python jetson/edge_heartbeat_agent.py
+WorkingDirectory=/home/neopeak/Desktop/workforce/Edge2
+ExecStart=/home/neopeak/edge2/bin/python jetson/edge_heartbeat_agent.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

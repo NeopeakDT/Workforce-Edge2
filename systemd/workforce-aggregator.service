@@ -21,8 +21,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
-ExecStart=/home/neopeak/torch_env/bin/python /home/neopeak/Desktop/WF-project/WF/Workforce-Detection/backend/aggregation/activity_aggregator.py
+WorkingDirectory=/home/neopeak/Desktop/workforce/Edge2
+ExecStart=/home/neopeak/edge2/bin/python /home/neopeak/Desktop/workforce/Edge2/backend/aggregation/activity_aggregator.py
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5

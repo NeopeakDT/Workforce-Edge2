@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Edge2 device
 PHASE-5 ORCHESTRATOR (AUTHORITATIVE)
 
 Order (MANDATORY):

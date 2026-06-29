@@ -11,6 +11,7 @@ Usage:
 
 import sys
 from pathlib import Path
+import os
 
 # Setup path for imports (allows script to run from any directory)
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -24,7 +25,10 @@ from common.device_auth import resolve_device_from_headers, DeviceAuthError
 
 # PASTE A REAL DEVICE API KEY HERE
 # Get it from device_provisioning.py output when provisioning a device
-DEVICE_API_KEY = "wf_test_device_key_001"
+DEVICE_API_KEY = os.environ["EDGE_DEVICE_KEY"]
+
+if not DEVICE_API_KEY:
+    raise RuntimeError("EDGE_DEVICE_KEY not found in .env")
 
 
 def main():

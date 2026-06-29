@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Edge2 device
 jetson/edge_detector.py
 EDGE DETECTOR — FINAL (FRAME_AGGREGATE ENABLED)
 
@@ -1731,7 +1732,7 @@ def main():
             f"(check ml_model_version.model_path in local_cache.json)"
         )
     if not os.path.exists(milking_model_path):
-        fallback_milking = os.path.join(PROJECT_ROOT, "models/WF_Milking_v1.1_best.engine")
+        fallback_milking = os.path.join(PROJECT_ROOT, "models/WF_Milking_v1.1_best.pt")
         if os.path.exists(fallback_milking):
             milking_model_path = fallback_milking
             logger.info("Using fallback milking engine: %s", milking_model_path)

@@ -560,6 +560,11 @@ git archive --format=zip --output=project_code.zip HEAD
 7/4/2026 - RTSP Link - 
 gst-launch-1.0 rtspsrc location="rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/502" latency=0 ! \
 rtph265depay ! h265parse ! nvv4l2decoder ! nvvidconv ! nveglglessink  
+--------------------------------------------------------------
+27/6/26 -  for egde2 -
+gst-launch-1.0 -v rtspsrc location="rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1302" latency=200 ! rtph264depay ! h264parse ! avdec_h264 ! autovideosink
+
+
 ==========================================================================================================
 
 (torch_env) neopeak@Neopeak-Jetson:~/Desktop/WF-project/WF/Workforce-Detection$ python jetson/edge_detector.py

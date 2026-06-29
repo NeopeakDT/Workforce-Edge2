@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Edge2 device
 STEP-4 - Activity Aggregator (schedule-aware)
 
 What this does:
@@ -454,7 +455,7 @@ def backfill_instance_schedule_date(cur, instance_id, schedule_id, activity_date
 
 
 def normalize_instance_status_for_row(cur, instance_id):
-    """Repair lifecycle status from actual_end_at."""
+    """Repair lifecycle status from actual_end_at (skip write if already correct)."""
     if not instance_id:
         return
 
@@ -469,13 +470,17 @@ def normalize_instance_status_for_row(cur, instance_id):
                     ELSE 'ENDED'
                 END
             )::activity_status,
-            updated_at = %s
+            updated_at = NOW()
         WHERE id = %s
+          AND status IS DISTINCT FROM (
+            CASE
+                WHEN actual_end_at IS NULL
+                    THEN 'IN_PROGRESS'
+                ELSE 'ENDED'
+            END
+          )::activity_status
         """,
-        (
-            utc_now(),
-            instance_id,
-        ),
+        (instance_id,),
     )
 
 

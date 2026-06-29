@@ -36,16 +36,16 @@ StartLimitBurst=5
 Type=simple
 
 # Project root
-WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
+WorkingDirectory=/home/neopeak/Desktop/workforce/Edge2
 
 # Bootstrap config sync (MANDATORY)
-ExecStartPre=/home/neopeak/torch_env/bin/python /home/neopeak/Desktop/WF-project/WF/Workforce-Detection/jetson/edge_config_sync.py
+ExecStartPre=/home/neopeak/edge2/bin/python /home/neopeak/Desktop/workforce/Edge2/jetson/edge_config_sync.py
 
 # Precheck (CRITICAL)
-ExecStartPre=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/systemd/edge_precheck.sh
+ExecStartPre=/home/neopeak/Desktop/workforce/Edge2/systemd/edge_precheck.sh
 
 # Main process (NO activate)
-ExecStart=/home/neopeak/torch_env/bin/python jetson/edge_detector.py
+ExecStart=/home/neopeak/edge2/bin/python jetson/edge_detector.py
 
 # Restart policy
 Restart=always

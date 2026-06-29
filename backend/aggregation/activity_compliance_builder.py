@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Edge2 device
 STEP-6 — Activity Compliance Builder
 
 Builds one compliance row per (farm_id, activity_schedule_id, activity_date)
@@ -230,6 +231,15 @@ def build_activity_compliance():
                         first_activity_at = EXCLUDED.first_activity_at,
                         last_activity_at = EXCLUDED.last_activity_at,
                         updated_at = EXCLUDED.updated_at
+                    WHERE
+                        activity_compliance.final_status IS DISTINCT FROM EXCLUDED.final_status
+                        OR activity_compliance.primary_instance_id IS DISTINCT FROM EXCLUDED.primary_instance_id
+                        OR activity_compliance.total_sessions IS DISTINCT FROM EXCLUDED.total_sessions
+                        OR activity_compliance.early_sessions IS DISTINCT FROM EXCLUDED.early_sessions
+                        OR activity_compliance.on_time_sessions IS DISTINCT FROM EXCLUDED.on_time_sessions
+                        OR activity_compliance.late_sessions IS DISTINCT FROM EXCLUDED.late_sessions
+                        OR activity_compliance.first_activity_at IS DISTINCT FROM EXCLUDED.first_activity_at
+                        OR activity_compliance.last_activity_at IS DISTINCT FROM EXCLUDED.last_activity_at
                     """,
                     (
                         farm_id,

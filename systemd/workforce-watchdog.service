@@ -13,7 +13,7 @@
 # - Logs output via journalctl
 #
 #To enable (do it for first time)-
-# sudo cp /home/neopeak/Desktop/WF-project/WF/Workforce-Detection/systemd/workforce-watchdog.service /etc/systemd/system/workforce-watchdog.service
+# sudo cp /home/neopeak/Desktop/workforce/Edge2/systemd/workforce-watchdog.service /etc/systemd/system/workforce-watchdog.service
 # sudo systemctl daemon-reload
 # sudo systemctl enable workforce-watchdog
 #
@@ -30,8 +30,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection
-ExecStart=/home/neopeak/torch_env/bin/python jetson/edge_watchdog.py
+WorkingDirectory=/home/neopeak/Desktop/workforce/Edge2
+ExecStart=/home/neopeak/edge2/bin/python jetson/edge_watchdog.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

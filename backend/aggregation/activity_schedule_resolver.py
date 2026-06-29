@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+Edge2 device
 backend/aggregation/activity_schedule_resolver.py
 STEP-5A — ACTIVITY SCHEDULE RESOLVER (AUTHORITATIVE)
 
@@ -13,8 +14,11 @@ Selection:
 - Repair: any AI row with schedule + ended interval + min duration where session_classification or
   offset columns are still NULL (historical replay / partial writes), without requiring the stable
   cutoff on those rows.
-- Refresh: rows touched within `AGG_PHASE5_CLASSIFICATION_REFRESH_DAYS` (default 2) so replay-extended
-  intervals are reclassified even when offsets were previously populated.
+- Refresh: rows touched within `AGG_PHASE5_CLASSIFICATION_REFRESH_DAYS` (default 0; set to 1 if replay
+  extension reclassification is needed) so replay-extended intervals are reclassified even when offsets
+  were previously populated.
+- Lookback: only instances with `actual_end_at` within `AGG_PHASE5_RESOLVER_LOOKBACK_DAYS` (default 1)
+  are scanned, so historical rows are not revisited indefinitely.
 
 Rules:
 - Only instances with actual_end_at IS NOT NULL
@@ -50,7 +54,10 @@ STABLE_END_DELAY_SEC = int(
     )
 )
 # Re-resolve session_classification when row was touched recently (replay extends finalized rows).
-CLASSIFICATION_REFRESH_DAYS = int(os.getenv("AGG_PHASE5_CLASSIFICATION_REFRESH_DAYS", "2"))
+# Default 0 = disabled; set AGG_PHASE5_CLASSIFICATION_REFRESH_DAYS=1 if replay extension is needed.
+CLASSIFICATION_REFRESH_DAYS = int(os.getenv("AGG_PHASE5_CLASSIFICATION_REFRESH_DAYS", "0"))
+# Only resolve instances ended within this many days (avoids indefinite historical rescans).
+RESOLVER_LOOKBACK_DAYS = int(os.getenv("AGG_PHASE5_RESOLVER_LOOKBACK_DAYS", "1"))
 
 
 def ideal_window_utc_bounds(farm_tz, activity_date, ideal_start_time, ideal_end_time):
@@ -84,6 +91,7 @@ def resolve():
     now_utc = utc_now()
     stable_end_cutoff_utc = now_utc - timedelta(seconds=STABLE_END_DELAY_SEC)
     classification_refresh_cutoff_utc = now_utc - timedelta(days=CLASSIFICATION_REFRESH_DAYS)
+    resolver_lookback_cutoff_utc = now_utc - timedelta(days=RESOLVER_LOOKBACK_DAYS)
 
     with get_cursor() as cur:
         # --------------------------------------------------
@@ -107,6 +115,7 @@ def resolve():
             FROM activity_instance ai
             JOIN farm f ON f.id = ai.farm_id
             WHERE ai.actual_end_at IS NOT NULL
+              AND ai.actual_end_at >= %s
               AND ai.activity_schedule_id IS NOT NULL
               AND (
                     (ai.activity_type_id = 1 AND ai.actual_duration_sec >= 300)
@@ -150,6 +159,7 @@ def resolve():
                   )
             """,
             (
+                resolver_lookback_cutoff_utc,
                 stable_end_cutoff_utc,
                 stable_end_cutoff_utc,
                 classification_refresh_cutoff_utc,
@@ -219,6 +229,7 @@ def resolve():
                     SET session_classification = 'UNSCHEDULED',
                         updated_at = %s
                     WHERE id = %s
+                      AND session_classification IS DISTINCT FROM 'UNSCHEDULED'
                     """,
                     (now_utc, ai["id"]),
                 )
@@ -290,6 +301,12 @@ def resolve():
                     within_ideal_window = %s,
                     updated_at = %s
                 WHERE id = %s
+                  AND (
+                    started_offset_min IS DISTINCT FROM %s
+                    OR ended_offset_min IS DISTINCT FROM %s
+                    OR session_classification IS DISTINCT FROM %s
+                    OR within_ideal_window IS DISTINCT FROM %s
+                  )
                 """,
                 (
                     started_offset,
@@ -298,6 +315,10 @@ def resolve():
                     within_ideal_window,
                     now_utc,
                     ai["id"],
+                    started_offset,
+                    ended_offset,
+                    final_status,
+                    within_ideal_window,
                 ),
             )
 
@@ -310,15 +331,18 @@ def resolve():
             SET session_classification = 'UNSCHEDULED',
                 updated_at = %s
             WHERE actual_end_at IS NOT NULL
+              AND actual_end_at >= %s
               AND activity_schedule_id IS NULL
               AND status = 'ENDED'
               AND source = 'AI'
               AND last_seen_at IS NOT NULL
               AND last_seen_at < %s
               AND updated_at < %s
+              AND session_classification IS DISTINCT FROM 'UNSCHEDULED'
             """,
             (
                 now_utc,
+                resolver_lookback_cutoff_utc,
                 stable_end_cutoff_utc,
                 stable_end_cutoff_utc,
             ),

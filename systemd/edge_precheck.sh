@@ -8,9 +8,9 @@ set -euo pipefail
 
 echo "[PRECHECK] Starting prechecks..."
 
-PROJECT_ROOT="/home/neopeak/Desktop/WF-project/WF/Workforce-Detection"
+PROJECT_ROOT="/home/neopeak/Desktop/workforce/Edge2"
 ENV_FILE="$PROJECT_ROOT/backend/.env"
-MODEL_PATH="$PROJECT_ROOT/models/WF_V1.4.2_best.engine"
+MODEL_PATH="$PROJECT_ROOT/models/WF_V1.4.2_best.pt"
 
 # 1. Check env file
 if [ ! -f "$ENV_FILE" ]; then
@@ -87,23 +87,43 @@ if [ ! -f "$MODEL_PATH" ]; then
     exit 1
 fi
 
-# 4. GPU check
+# 4. GPU check (platform-aware: Edge1 Jetson vs Edge2 desktop NVIDIA)
 echo "[PRECHECK] Checking GPU..."
-if ! command -v tegrastats >/dev/null 2>&1; then
-    echo "[ERROR] tegrastats not found"
-    exit 1
+
+if [ -f /etc/nv_tegra_release ]; then
+	echo "[INFO] Platform: Jetson (Edge1)"
+
+	if ! command -v tegrastats >/dev/null 2>&1; then
+		echo "[ERROR] tegrastats not found"
+		exit 1
+	fi
+
+	# tegrastats is a long-running process; timeout confirms it can start.
+	set +e
+	timeout 2s tegrastats --interval 1000 > /dev/null 2>&1
+	tegrastats_status=$?
+	set -e
+
+	if [ "$tegrastats_status" -ne 0 ] && [ "$tegrastats_status" -ne 124 ]; then
+		echo "[ERROR] Jetson GPU not accessible (tegrastats exit: $tegrastats_status)"
+		exit 1
+	fi
+
+else
+	echo "[INFO] Platform: Desktop NVIDIA (Edge2)"
+
+	if ! command -v nvidia-smi >/dev/null 2>&1; then
+		echo "[ERROR] nvidia-smi not found"
+		exit 1
+	fi
+
+	if ! nvidia-smi > /dev/null 2>&1; then
+		echo "[ERROR] NVIDIA GPU not accessible"
+		exit 1
+	fi
 fi
 
-# tegrastats is a long-running process; timeout confirms it can start.
-set +e
-timeout 2s tegrastats --interval 1000 > /dev/null 2>&1
-tegrastats_status=$?
-set -e
-
-if [ "$tegrastats_status" -ne 0 ] && [ "$tegrastats_status" -ne 124 ]; then
-    echo "[ERROR] GPU not accessible (tegrastats exit: $tegrastats_status)"
-    exit 1
-fi
+echo "[OK] GPU accessible"
 
 echo "[PRECHECK] All checks passed"
 exit 0

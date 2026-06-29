@@ -17,8 +17,8 @@ Description=Workforce Backend API
 After=network.target
 
 [Service]
-WorkingDirectory=/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/backend
-ExecStart=/home/neopeak/torch_env/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+WorkingDirectory=/home/neopeak/Desktop/workforce/Edge2/backend
+ExecStart=/home/neopeak/edge2/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 Restart=always
 User=neopeak
 
