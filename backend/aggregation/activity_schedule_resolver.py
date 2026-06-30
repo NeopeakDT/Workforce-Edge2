@@ -137,24 +137,12 @@ def resolve():
                         OR ai.started_offset_min IS NULL
                         OR ai.ended_offset_min IS NULL
                       )
-                      AND ai.status IN (
-                        'ENDED',
-                        'ON_TIME',
-                        'LATE',
-                        'EARLY',
-                        'UNSCHEDULED'
-                      )
+                      AND ai.status = 'ENDED'
                     )
                     OR
                     (
                       ai.updated_at >= %s
-                      AND ai.status IN (
-                        'ENDED',
-                        'ON_TIME',
-                        'LATE',
-                        'EARLY',
-                        'UNSCHEDULED'
-                      )
+                      AND ai.status = 'ENDED'
                     )
                   )
             """,

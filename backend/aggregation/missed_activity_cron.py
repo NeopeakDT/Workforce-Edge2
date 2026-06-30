@@ -101,7 +101,8 @@ def detect_missed_activities():
     - No activity_instance exists for that (farm, schedule, activity_date)
     """
     # MISSED creation is enabled.
-    # Function is idempotent via INSERT ... ON CONFLICT DO NOTHING.
+    # Function is idempotent by checking for an existing MISSED row
+    # before inserting a new one.
     
     now_utc = utc_now()
     
@@ -132,75 +133,183 @@ def detect_missed_activities():
     
             farm_tz = pytz.timezone(s["timezone"])
             local_now = now_utc.astimezone(farm_tz)
-            activity_date = local_now.date()
-    
-            # -------------------------------------------------
-            # Compute late cutoff from IDEAL END (LOCAL → UTC)
-            # -------------------------------------------------
-            ideal_start_naive = datetime.combine(
-                activity_date,
-                s["ideal_start_time"],
-            )
-            ideal_end_naive = datetime.combine(
-                activity_date,
-                s["ideal_end_time"],
-            )
 
-            ideal_start_local = farm_tz.localize(ideal_start_naive)
-            ideal_end_local = farm_tz.localize(ideal_end_naive)
+            # Check today and yesterday.
+            for days_back in range(2):
+                activity_date = local_now.date() - timedelta(days=days_back)
 
-            # Cross-midnight handling
-            if ideal_end_local <= ideal_start_local:
-                ideal_end_local += timedelta(days=1)
-
-            # MISSED cutoff = ideal_end + late tolerance
-            late_cutoff_local = ideal_end_local + timedelta(
-                minutes=s["tolerance_late_min"]
-            )
-
-            late_cutoff_utc = late_cutoff_local.astimezone(timezone.utc)
-
-            # Wait until ideal_end + late_tolerance before marking MISSED.
-            if now_utc <= late_cutoff_utc:
-                continue
-
-            # Create pending-missed signal only when no AI instance exists for this schedule/day.
-            cur.execute(
-                """
-                SELECT 1
-                FROM activity_instance ai
-                WHERE ai.farm_id = %s
-                  AND ai.activity_schedule_id = %s
-                  AND ai.activity_date = %s
-                  AND ai.source = 'AI'
-                  AND (
-                        (ai.activity_type_id = 1 AND ai.actual_duration_sec >= 300)
-                     OR (ai.activity_type_id = 2 AND ai.actual_duration_sec >= 60)
-                     OR (ai.activity_type_id = 3 AND ai.actual_duration_sec >= 30)
-                  )
-                  AND (
-                        ai.status = 'IN_PROGRESS'
-                        OR (
-                            ai.status = 'ENDED'
-                            AND ai.session_classification IS NOT NULL
-                        )
-                      )
-                LIMIT 1
-                """,
-                (
-                    farm_id,
-                    schedule_id,
+                # -------------------------------------------------
+                # Compute late cutoff from IDEAL END (LOCAL → UTC)
+                # -------------------------------------------------
+                ideal_start_naive = datetime.combine(
                     activity_date,
-                ),
-            )
-            if cur.fetchone():
-                continue
+                    s["ideal_start_time"],
+                )
+                ideal_end_naive = datetime.combine(
+                    activity_date,
+                    s["ideal_end_time"],
+                )
 
-            print(
-                "[MISSED_PENDING] "
-                f"farm={farm_id} schedule={schedule_id} activity_type={activity_type_id} "
-                f"activity_date={activity_date} cutoff_utc={late_cutoff_utc.isoformat()}"
-            )
+                ideal_start_local = farm_tz.localize(ideal_start_naive)
+                ideal_end_local = farm_tz.localize(ideal_end_naive)
+
+                # Cross-midnight handling
+                if ideal_end_local <= ideal_start_local:
+                    ideal_end_local += timedelta(days=1)
+
+                # MISSED cutoff = ideal_end + late tolerance
+                late_cutoff_local = ideal_end_local + timedelta(
+                    minutes=s["tolerance_late_min"]
+                )
+
+                late_cutoff_utc = late_cutoff_local.astimezone(timezone.utc)
+
+                print(
+                    f"[MISSED_CHECK] "
+                    f"schedule={schedule_id} "
+                    f"date={activity_date} "
+                    f"cutoff={late_cutoff_utc} "
+                    f"now={now_utc}"
+                )
+
+                # Wait until ideal_end + late_tolerance before marking MISSED.
+                if now_utc <= late_cutoff_utc:
+                    continue
+
+                # Skip if MISSED row already exists for this schedule/day.
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM activity_instance
+                    WHERE farm_id = %s
+                      AND activity_schedule_id = %s
+                      AND activity_date = %s
+                      AND session_classification = 'MISSED'
+                    LIMIT 1
+                    """,
+                    (
+                        farm_id,
+                        schedule_id,
+                        activity_date,
+                    ),
+                )
+                already_missed = cur.fetchone()
+
+                print(
+                    f"[MISSED_EXISTS] "
+                    f"schedule={schedule_id} "
+                    f"date={activity_date} "
+                    f"already_missed={bool(already_missed)}"
+                )
+
+                if already_missed:
+                    continue
+
+                # Skip if a real AI activity exists for this schedule/day.
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM activity_instance
+                    WHERE farm_id = %s
+                      AND activity_schedule_id = %s
+                      AND activity_date = %s
+                      AND source = 'AI'
+                      AND status = 'ENDED'
+                      AND session_classification IN
+                      (
+                          'EARLY',
+                          'ON_TIME',
+                          'LATE'
+                      )
+                    LIMIT 1
+                    """,
+                    (
+                        farm_id,
+                        schedule_id,
+                        activity_date,
+                    ),
+                )
+                existing_ai = cur.fetchone()
+
+                print(
+                    f"[MISSED_AI_CHECK] "
+                    f"schedule={schedule_id} "
+                    f"date={activity_date} "
+                    f"existing_ai={bool(existing_ai)}"
+                )
+
+                if existing_ai:
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT INTO activity_instance
+                    (
+                        id,
+                        farm_id,
+                        activity_type_id,
+                        activity_schedule_id,
+                        activity_date,
+
+                        actual_start_at,
+                        actual_end_at,
+                        actual_duration_sec,
+
+                        started_offset_min,
+                        ended_offset_min,
+                        within_ideal_window,
+
+                        status,
+                        session_classification,
+
+                        source,
+
+                        created_at,
+                        updated_at
+                    )
+                    VALUES
+                    (
+                        gen_random_uuid(),
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+
+                        NULL,
+                        NULL,
+                        0,
+
+                        NULL,
+                        NULL,
+                        FALSE,
+
+                        'ENDED',
+                        'MISSED',
+
+                        'SYSTEM',
+
+                        %s,
+                        %s
+                    )
+                    """,
+                    (
+                        farm_id,
+                        activity_type_id,
+                        schedule_id,
+                        activity_date,
+                        now_utc,
+                        now_utc,
+                    ),
+                )
+
+                print(
+                    f"[MISSED_CREATED] "
+                    f"schedule={schedule_id} "
+                    f"activity_type={activity_type_id} "
+                    f"date={activity_date}"
+                )
+
+        cur.connection.commit()
 
 
 # -------------------------------------------------

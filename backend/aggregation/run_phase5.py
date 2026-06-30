@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
 Edge2 device
+
 PHASE-5 ORCHESTRATOR (AUTHORITATIVE)
 
-Order (MANDATORY):
-1. STEP-5A — Resolve schedules & session classification
-2. STEP-5B — Emit pending missed signals (no activity_instance insert)
-3. STEP-6 — Build per-schedule/day compliance snapshot
-------------------------------------------------------------------------------------------------------------
-run_phase5.py
-    ↓
-STEP-5A activity_schedule_resolver
-    - bind schedule
-    - compute offsets
-    - write session_classification (EARLY/ON_TIME/LATE/UNSCHEDULED)
-    ↓
-STEP-5B detect_missed_activities
-    - print MISSED_PENDING if none exists
-    ↓
-STEP-6 build_activity_compliance
-    - one decision row per (farm, schedule, date)
+Order (MANDATORY)
 
-------------------------------------------------------------------------------------------------------------
+1. STEP-5A
+    Resolve schedules
+    Compute offsets
+    Write session_classification
+        EARLY
+        ON_TIME
+        LATE
+        UNSCHEDULED
+
+2. STEP-5B
+    Create MISSED activity_instance rows
+    (status='ENDED', session_classification='MISSED')
+
+No STEP-6.
+
+activity_compliance has been removed.
+activity_instance is now the single source of truth.
 """
 
 from pathlib import Path
@@ -34,7 +35,6 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from aggregation.activity_schedule_resolver import resolve as step5a_resolver
 from aggregation.missed_activity_cron import detect_missed_activities
-from aggregation.activity_compliance_builder import build_activity_compliance
 
 
 def run(include_step4=False):
@@ -50,13 +50,10 @@ def run(include_step4=False):
     print("[PHASE-5] STEP-5B: detecting missed activities…")
     detect_missed_activities()
 
-    print("[PHASE-5] STEP-6: building compliance snapshots…")
-    build_activity_compliance()
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run Phase-5/6 batch jobs (resolver + missed-pending + compliance)."
+        description="Run Phase-5 batch jobs (resolver + missed activity creation)."
     )
     parser.add_argument(
         "--include-step4",

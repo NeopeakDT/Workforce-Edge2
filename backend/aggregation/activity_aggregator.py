@@ -88,10 +88,6 @@ MIN_VALID_DURATION_SEC = {
 # Lifecycle: finalized rows retain `actual_end_at`; FRAME/END may extend in attach paths.
 FINALIZED_LIFECYCLE_STATUSES = (
     "ENDED",
-    "ON_TIME",
-    "LATE",
-    "EARLY",
-    "UNSCHEDULED",
 )
 FINALIZED_ATTACH_STATUSES = frozenset(FINALIZED_LIFECYCLE_STATUSES)
 
@@ -155,7 +151,8 @@ def reopen_missed_activity_instance(
             session_classification = NULL,
             updated_at = %s
         WHERE id = %s
-          AND status = 'MISSED'
+          AND status = 'ENDED'
+          AND session_classification = 'MISSED'
         RETURNING id
         """,
         (
@@ -2415,7 +2412,10 @@ def run(max_loops=None):
                                   AND actual_end_at IS NOT NULL
                                   AND actual_end_at <= %s::timestamptz
                                   AND EXTRACT(EPOCH FROM (%s::timestamptz - actual_end_at)) <= %s
-                                  AND status <> 'MISSED'
+                                  AND NOT (
+                                    status = 'ENDED'
+                                    AND session_classification = 'MISSED'
+                                  )
                                   AND status <> 'IN_PROGRESS'
                                   AND (session_id IS NULL OR session_id = %s)
                                 ORDER BY
@@ -2693,7 +2693,8 @@ def run(max_loops=None):
                                         WHERE farm_id = %s
                                           AND activity_schedule_id = %s
                                           AND activity_date = %s
-                                          AND status = 'MISSED'
+                                          AND status = 'ENDED'
+                                          AND session_classification = 'MISSED'
                                         LIMIT 1
                                         """,
                                         (farm_id, schedule_id, activity_date),
@@ -2864,7 +2865,7 @@ def run(max_loops=None):
 
                                     cur.execute(
                                         """
-                                        SELECT id, status, source, activity_schedule_id
+                                        SELECT id, status, session_classification, source, activity_schedule_id
                                         FROM activity_instance
                                         WHERE farm_id = %s
                                           AND (zone_id = %s OR (zone_id IS NULL AND %s IS NULL))
@@ -2936,6 +2937,7 @@ def run(max_loops=None):
                                         continue
                                     instance_id = existing["id"]
                                     existing_status = existing["status"]
+                                    existing_classification = existing.get("session_classification")
 
                                     if existing_status == "IN_PROGRESS":
                                         cur.execute(
@@ -3003,7 +3005,10 @@ def run(max_loops=None):
                                                 f"[DEBUG] REUSED-EXISTING IN_PROGRESS (duplicate guard) "
                                                 f"→ instance_id={instance_id}"
                                             )
-                                    elif existing_status == "MISSED":
+                                    elif (
+                                        existing_status == "ENDED"
+                                        and existing_classification == "MISSED"
+                                    ):
                                         reopened_id = reopen_missed_activity_instance(
                                             cur,
                                             existing["id"],
