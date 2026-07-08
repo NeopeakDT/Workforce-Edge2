@@ -12,14 +12,29 @@ Key Features:
     - Supports CPU/GPU device selection
 
 Usage:
-    from runtime.model_loader import ModelRunner
-    
-    runner = ModelRunner("models/best.pt", device="cuda")
-    detections = runner.infer(frame)
+    from runtime.model_loader import ModelRunner, create_edge_runners, batch_size_for
+
+    runners = create_edge_runners(
+        "models/best.pt",
+        optional_models={"MILKING": "models/milking.pt"},
+    )
+    detections = runners["WORKFORCE"].infer(frame)
 """
 
 import os
 from ultralytics import YOLO
+
+# Static TensorRT batch profiles per pipeline runner key.
+MODEL_BATCH_SIZE = {
+    "WORKFORCE": 2,
+    "MILKING": 1,
+    "POSTURE": 1,
+}
+
+
+def batch_size_for(model_type: str) -> int:
+    """Return static TensorRT batch size for a pipeline runner key."""
+    return MODEL_BATCH_SIZE.get(model_type, 1)
 
 
 class ModelRunner:
@@ -146,17 +161,31 @@ class ModelRunner:
 
 
 def create_edge_runners(
-    wf_model_path: str,
+    workforce_model_path: str,
     *,
     device: str = "cuda",
-    milking_enabled: bool = True,
-    milking_model_path: str | None = None,
-):
+    optional_models: dict[str, str] | None = None,
+) -> dict[str, ModelRunner]:
     """
-    Load workforce + optional milking ModelRunner instances (dual-engine edge).
+    Load workforce + optional edge ModelRunner instances.
+
+    Returns a registry keyed by pipeline name, e.g.:
+        {"WORKFORCE": ModelRunner, "MILKING": ModelRunner, ...}
+
+    Example:
+        runners = create_edge_runners(
+            wf_model_path,
+            optional_models={
+                "MILKING": milking_path,
+                "POSTURE": posture_path,
+            },
+        )
     """
-    wf_runner = ModelRunner(wf_model_path, device=device)
-    milking_runner = None
-    if milking_enabled and milking_model_path and os.path.exists(milking_model_path):
-        milking_runner = ModelRunner(milking_model_path, device=device)
-    return wf_runner, milking_runner
+    runners: dict[str, ModelRunner] = {}
+    runners["WORKFORCE"] = ModelRunner(workforce_model_path, device=device)
+
+    for model_name, model_path in (optional_models or {}).items():
+        if model_path and os.path.exists(model_path):
+            runners[model_name] = ModelRunner(model_path, device=device)
+
+    return runners

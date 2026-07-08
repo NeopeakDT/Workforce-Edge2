@@ -41,9 +41,12 @@ from dotenv import load_dotenv
 from config.local_cache import load_config
 from config.model_classes import WF_CLASSES, MILKING_CLASSES
 from utils.camera_routing import is_milking_camera
-from runtime.model_loader import ModelRunner, create_edge_runners
+from runtime.model_loader import create_edge_runners, batch_size_for
 from runtime.temporal_smoother import TemporalSmoother
 from runtime.video_stream import open_stream, _validate_gstreamer
+from posture.posture_detector import PostureDetector
+from posture.posture_scheduler import PostureScheduler
+from posture.posture_db import PostureDB
 
 # GLOBAL RTSP START LOCK (prevents NVR overload)
 RTSP_START_LOCK = threading.Lock()
@@ -179,6 +182,8 @@ WATCHDOG_FILE_PATH = os.getenv("EDGE_WATCHDOG_FILE", "/tmp/workforce_edge_alive"
 PROCESS_STARTED_AT = time.time()
 MILKING_MODEL_ENABLED = True
 MILKING_MODEL_PATH = "models/WF_Milking_v1.1_best.pt"
+POSTURE_MODEL_ENABLED = True
+POSTURE_MODEL_PATH = "models/cow_posture_v1.1_best.pt"
 WF_MIN_OVERLAP_RATIO = 0.2
 MILKING_MIN_OVERLAP_RATIO = 0.01
 MILKING_CLUSTER_MEMORY_SEC = 20
@@ -409,13 +414,11 @@ def resend_failed_events():
 # ------------------------------------------------------------------
 # GPU Inference Worker — Dedicated Thread for TensorRT
 # ------------------------------------------------------------------
-def inference_worker(wf_runner, milking_runner):
+def inference_worker(runners: dict):
     """
     Batched GPU worker for better utilization.
-    WF TensorRT engine: batch=2. Milking TensorRT engine: batch=1.
+    Routes by model_type through the runners registry (WF→WORKFORCE, MILKING, …).
     """
-    BATCH_SIZE = 2  # WF exported engine batch (unchanged)
-
     deferred_items = deque()
     while True:
         batch = []
@@ -452,8 +455,8 @@ def inference_worker(wf_runner, milking_runner):
             callbacks.append(callback)
             processed_items_count += 1
 
-            # WF engine batch=2; milking engine batch=1 (static TensorRT profiles differ).
-            required_batch = 1 if model_type == "MILKING" else BATCH_SIZE
+            runner_key = "WORKFORCE" if model_type == "WF" else model_type
+            required_batch = batch_size_for(runner_key)
 
             # Allow micro-wait window to fill batch
             batch_deadline = time.time() + 0.003  # 3ms accumulation window
@@ -489,20 +492,19 @@ def inference_worker(wf_runner, milking_runner):
             actual_batch = len(batch)
 
             # TensorRT static batch handling (WF=2, milking=1).
-            required_batch = 1 if model_type == "MILKING" else BATCH_SIZE
+            runner_key = "WORKFORCE" if model_type == "WF" else model_type
+            required_batch = batch_size_for(runner_key)
             if actual_batch < required_batch:
                 while len(batch) < required_batch:
                     batch.append(batch[-1])
                     callbacks.append(None)
 
-            if model_type == "MILKING":
-                if milking_runner is None:
-                    raise RuntimeError("MILKING inference requested but milking runner not loaded")
-                results = milking_runner.infer(batch)
-            else:
-                if wf_runner is None:
-                    raise RuntimeError("WF inference requested but workforce runner not loaded")
-                results = wf_runner.infer(batch)
+            runner = runners.get(runner_key)
+            if runner is None:
+                raise RuntimeError(
+                    f"{model_type} inference requested but {runner_key} runner not loaded"
+                )
+            results = runner.infer(batch)
 
             for dets, cb in zip(results[:actual_batch], callbacks[:actual_batch]):
                 if cb:
@@ -538,6 +540,7 @@ def camera_supervisor(
     tractor_classes,
     max_dist,
     milking_model_enabled,
+    posture_scheduler=None,
 ):
     """Supervisor wrapper: restarts camera on crash (self-healing system)."""
     camera_code = camera.get("code", "UNKNOWN")
@@ -554,6 +557,7 @@ def camera_supervisor(
                 tractor_classes,
                 max_dist,
                 milking_model_enabled,
+                posture_scheduler,
             )
             # If process_camera returns normally (EOF reached), exit supervisor
             logger.info("[SUPERVISOR] Camera %s finished normally", camera_code)
@@ -810,6 +814,7 @@ def process_camera(
     tractor_classes,
     max_dist,
     milking_model_enabled,
+    posture_scheduler=None,
 ):
     # FIX 2: Wrap entire camera loop in crash guard (auto-restart safe)
     try:
@@ -821,6 +826,7 @@ def process_camera(
             tractor_classes,
             max_dist,
             milking_model_enabled,
+            posture_scheduler,
         )
     except Exception as e:
         logger.critical("[CAMERA %s] Critical error in camera thread: %s", camera['camera_id'], str(e)[:200])
@@ -838,6 +844,7 @@ def _process_camera_impl(
     tractor_classes,
     max_dist,
     milking_model_enabled,
+    posture_scheduler=None,
 ):
     camera_id = camera["camera_id"]
     camera_name = camera.get("code", camera_id)
@@ -1322,6 +1329,25 @@ def _process_camera_impl(
 
         frame_processing_time = time.time() - t0
         total_processing_time += frame_processing_time
+
+        # -------------------------------------------------
+        # POSTURE scheduling
+        # -------------------------------------------------
+
+        if (
+            posture_scheduler is not None
+            and "POSTURE" in camera.get("activity_zones", {})
+        ):
+            try:
+                posture_scheduler.process_frame(
+                    frame=frame,
+                    camera=camera,
+                )
+            except Exception:
+                logger.exception(
+                    "[CAMERA %s] Posture scheduler failed",
+                    camera_id,
+                )
         
         # Use appropriate timestamp based on stream type
         # Live streams: wall-clock time (critical for real-time motion detection)
@@ -1726,6 +1752,10 @@ def main():
 
     wf_model_path = os.path.join(PROJECT_ROOT, cfg["ml_model_version"]["model_path"])
     milking_model_path = os.path.join(PROJECT_ROOT, MILKING_MODEL_PATH)
+    posture_model_path = os.path.join(
+        PROJECT_ROOT,
+        POSTURE_MODEL_PATH,
+    )
     if not os.path.exists(wf_model_path):
         raise FileNotFoundError(
             f"Workforce model not found: {wf_model_path} "
@@ -1738,15 +1768,39 @@ def main():
             logger.info("Using fallback milking engine: %s", milking_model_path)
 
     milking_cameras = [c for c in cfg.get("cameras", []) if is_milking_camera(c)]
-    wf_runner, milking_runner = create_edge_runners(
+
+    posture_cameras = [
+        c
+        for c in cfg.get("cameras", [])
+        if "POSTURE" in c.get("activity_zones", {})
+    ]
+
+    optional_models = {}
+    if MILKING_MODEL_ENABLED and milking_cameras:
+        optional_models["MILKING"] = milking_model_path
+
+    if POSTURE_MODEL_ENABLED and posture_cameras:
+
+        if os.path.exists(posture_model_path):
+
+            optional_models["POSTURE"] = posture_model_path
+
+        else:
+
+            logger.warning(
+                "Posture model not found: %s",
+                posture_model_path,
+            )
+
+    runners = create_edge_runners(
         wf_model_path,
         device=device,
-        milking_enabled=MILKING_MODEL_ENABLED and bool(milking_cameras),
-        milking_model_path=milking_model_path,
+        optional_models=optional_models,
     )
     logger.info("Workforce model loaded: %s", wf_model_path)
+    logger.info("Edge runners loaded: %s", list(runners.keys()))
 
-    milking_model_enabled = milking_runner is not None
+    milking_model_enabled = "MILKING" in runners
     if MILKING_MODEL_ENABLED and milking_cameras and not milking_model_enabled:
         logger.warning(
             "MILKING model not found at %s; MILKING inference disabled",
@@ -1759,26 +1813,88 @@ def main():
             len(milking_cameras),
         )
 
+    posture_model_enabled = "POSTURE" in runners
+
+    if POSTURE_MODEL_ENABLED and posture_cameras:
+
+        if posture_model_enabled:
+
+            logger.info(
+                "Posture model loaded: %s (%d posture camera(s))",
+                posture_model_path,
+                len(posture_cameras),
+            )
+
+        else:
+
+            logger.warning(
+                "POSTURE model not loaded."
+            )
+
+    # -------------------------------------------------
+    # Posture detector
+    # -------------------------------------------------
+
+    posture_detector = None
+
+    if posture_model_enabled:
+
+        posture_detector = PostureDetector(
+            model_runner=runners["POSTURE"],
+            herd_size=33,          # TODO: load from farm config later
+        )
+
+    # -------------------------------------------------
+    # Posture scheduler
+    # -------------------------------------------------
+
+    posture_scheduler = None
+
+    if posture_detector:
+
+        posture_scheduler = PostureScheduler(
+            runtime_config=cfg,
+            detector=posture_detector,
+            db=PostureDB(),
+        )
+
+        logger.info(
+            "[POSTURE] Enabled (%d posture cameras, sample=%ds, flush=%dmin)",
+            len(posture_cameras),
+            posture_scheduler.SAMPLE_INTERVAL_SECONDS,
+            posture_scheduler.DB_WRITE_INTERVAL_SECONDS // 60,
+        )
+
     # Warmup TensorRT engine (avoids first-frame latency spike)
     logger.info("Warming up TensorRT engine...")
     dummy = np.zeros((512, 512, 3), dtype=np.uint8)
     for _ in range(5):
         try:
-            wf_runner.infer([dummy, dummy])
+            runners["WORKFORCE"].infer([dummy, dummy])
         except:
             pass
-    if milking_model_enabled and milking_runner is not None:
+    if milking_model_enabled:
         for _ in range(3):
             try:
-                milking_runner.infer([dummy, dummy])
+                runners["MILKING"].infer([dummy, dummy])
             except:
+                pass
+    if posture_model_enabled:
+
+        for _ in range(3):
+
+            try:
+
+                runners["POSTURE"].infer(dummy)
+
+            except Exception:
                 pass
     logger.info("TensorRT engine warmed up")
 
     # Start dedicated single GPU inference worker with multi-model routing
     Thread(
         target=inference_worker,
-        args=(wf_runner, milking_runner),
+        args=(runners,),
         daemon=True,
     ).start()
     logger.info("Started GPU inference worker (multi-model queue routing)")
@@ -1794,6 +1910,10 @@ def main():
     # Start performance monitoring thread
     Thread(target=performance_monitor, daemon=True).start()
     logger.info("Started performance monitor thread")
+
+    if posture_scheduler:
+
+        posture_scheduler.start()
 
     # Print input video information
     logger.info("=" * 80)
@@ -1832,6 +1952,7 @@ def main():
                 tractor_classes,
                 max_dist,
                 milking_model_enabled,
+                posture_scheduler,
             ),
             daemon=False,
         )
@@ -1843,6 +1964,10 @@ def main():
 
     for t in camera_threads:
         t.join()
+
+    if posture_scheduler:
+
+        posture_scheduler.stop()
 
 
 if __name__ == "__main__":

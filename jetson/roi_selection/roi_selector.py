@@ -49,22 +49,29 @@ rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1702
 
 GRP2-TMR_WAY        → 502
 GRP2-FRONT_RIGHT    → 1902
-GRP1-FRONT_LEFT     → 1802   
-GRP1-FRONT_RIGHT    → 1302
-GRP1-FRONT_CENTER   → 1702
+GRP1-FRONT_LEFT     → 1801   
+GRP1-FRONT_RIGHT    → 1301
+GRP1-FRONT_CENTER   → 1701
 
 """
 import cv2
 import json
 import numpy as np
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "jetson"))
+
+from runtime.video_stream import open_stream  # noqa: E402
 
 # -------- CONFIG --------
 # SOURCE = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/rahuri_video-7.mp4"
 # SOURCE = "jetson/roi_selection/GRP-1-front-right-2.png"
-SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2002"
+SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1801"
+DECODE_MODE = "GPU"  # GPU or CPU
 # OUTPUT_FILE where coordinates will be saved (absolute, cwd-independent)
 OUTPUT_FILE = Path(__file__).resolve().parent / "rtsp_roi_coordinates.txt"
 # ------------------------
@@ -72,19 +79,6 @@ OUTPUT_FILE = Path(__file__).resolve().parent / "rtsp_roi_coordinates.txt"
 points = []
 scale_factor = 1.0  # For downsampling large images
 polygon_closed = False
-
-def build_rtsp_pipeline(rtsp_url: str) -> str:
-    """
-    Jetson-safe RTSP pipeline for H.265 sources.
-    Uses GStreamer + nvv4l2decoder instead of OpenCV's default FFmpeg path.
-    """
-    return (
-        f"rtspsrc location={rtsp_url} latency=0 protocols=tcp ! "
-        "rtph265depay ! h265parse ! nvv4l2decoder ! "
-        "nvvidconv ! video/x-raw,format=BGRx ! "
-        "videoconvert ! video/x-raw,format=BGR ! "
-        "appsink drop=true max-buffers=1 sync=false"
-    )
 
 def mouse_callback(event, x, y, flags, param):
     global points, scale_factor
@@ -113,21 +107,33 @@ def load_frame(source):
         is_rtsp = source_lower.startswith("rtsp://")
 
         if is_rtsp:
-            pipeline = build_rtsp_pipeline(source)
-            print("[INFO] Using GStreamer RTSP pipeline (Jetson NVDEC)")
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            print("[INFO] Using production open_stream() (same as edge_detector)")
+            stream = open_stream(
+                {
+                    "code": "roi-selector",
+                    "stream_type": "RTSP",
+                    "rtsp_url": source,
+                    "decode_mode": DECODE_MODE,
+                }
+            )
+
+            for _ in range(5):
+                stream.read()
+
+            ret, frame = stream.read()
+            stream.release()
         else:
             cap = cv2.VideoCapture(source)
 
-        if not cap.isOpened():
-            raise Exception(f"Failed to open video/stream: {source}")
+            if not cap.isOpened():
+                raise Exception(f"Failed to open video/stream: {source}")
 
-        # Warmup to allow decoder/stream buffers to stabilize.
-        for _ in range(5):
-            cap.read()
+            for _ in range(5):
+                cap.read()
 
-        ret, frame = cap.read()
-        cap.release()
+            ret, frame = cap.read()
+            cap.release()
+
         if not ret or frame is None:
             raise Exception(f"Failed to read first frame from: {source}")
     
@@ -199,8 +205,6 @@ while True:
 
 cv2.destroyAllWindows()
 
-cv2.destroyAllWindows()
-
 # Remove duplicate closing point if exists
 if len(points) >= 3:
     if points[0] == points[-1]:
@@ -221,24 +225,57 @@ if len(points) >= 3:
     print("\nDB Ready ROI JSON:")
     print(json.dumps(normalized, indent=4))
 
-    # ---- Ask for zone name ----
+    # ---- Ask for activity and ROI type ----
     print("\n" + "="*60)
-    zone_name = input("Enter Zone Name (e.g., SCRAPPING, FEEDING, MILKING): ").strip()
-    if not zone_name:
-        zone_name = "UNNAMED_ZONE"
-        print(f"[WARNING] Using default name: {zone_name}")
+    print("\nSelect Activity:")
+    print("1. SCRAPPING")
+    print("2. FEEDING")
+    print("3. MILKING")
+    print("4. POSTURE")
+
+    activity_choice = input("Choice: ").strip()
+
+    activity_map = {
+        "1": "SCRAPPING",
+        "2": "FEEDING",
+        "3": "MILKING",
+        "4": "POSTURE",
+    }
+
+    activity = activity_map.get(activity_choice, "UNKNOWN")
+    if activity == "UNKNOWN":
+        print("[WARNING] Invalid choice — using UNKNOWN")
+
+    roi_type = ""
+
+    if activity == "POSTURE":
+        print("\nSelect ROI Type:")
+        print("1. Rest Zone")
+        print("2. Cow Feeding Zone")
+
+        roi_choice = input("Choice: ").strip()
+
+        roi_map = {
+            "1": "rest_zone",
+            "2": "cow_feeding_zone",
+        }
+
+        roi_type = roi_map.get(roi_choice, "rest_zone")
+        if roi_choice not in roi_map:
+            print(f"[WARNING] Invalid ROI type — defaulting to: {roi_type}")
 
     # ---- Get source filename ----
     source_filename = os.path.basename(SOURCE)
 
     # ---- Save to file ----
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+
     output_data = {
         "timestamp": timestamp,
         "source_file": source_filename,
         "full_source_path": SOURCE,
-        "zone_name": zone_name,
+        "activity": activity,
+        "roi_type": roi_type if activity == "POSTURE" else None,
         "resolution": f"{width}x{height}",
         "pixel_coordinates": points,
         "normalized_coordinates": normalized,
@@ -247,19 +284,21 @@ if len(points) >= 3:
     try:
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(OUTPUT_FILE, "a") as f:
-            f.write("\n" + "="*80 + "\n")
-            f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Source File: {source_filename}\n")
-            f.write(f"Source Path: {SOURCE}\n")
-            f.write(f"Zone Name: {zone_name}\n")
-            f.write(f"Resolution: {width}x{height}\n")
-            f.write(f"Pixel Coordinates: {points}\n")
-            f.write(f"Normalized Coordinates:\n")
+            f.write("\n" + "=" * 80 + "\n")
+            f.write(f"Timestamp: {timestamp}\n\n")
+            f.write(f"Activity: {activity}\n\n")
+            if activity == "POSTURE":
+                f.write(f"ROI Type: {roi_type}\n\n")
+            f.write(f"Source File: {source_filename}\n\n")
+            f.write(f"Resolution: {width}x{height}\n\n")
+            f.write("Normalized Coordinates:\n")
             f.write(json.dumps(normalized, indent=4) + "\n")
-            f.write("="*80 + "\n")
-        
+            f.write("=" * 80 + "\n")
+
         print(f"\n✅ ROI coordinates saved to: {OUTPUT_FILE}")
-        print(f"   Zone: {zone_name}")
+        print(f"   Activity: {activity}")
+        if activity == "POSTURE":
+            print(f"   ROI Type: {roi_type}")
         print(f"   Source: {source_filename}")
         print(f"   Points: {len(points)}")
     except Exception as e:

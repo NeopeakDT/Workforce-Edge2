@@ -144,10 +144,13 @@ def edge_runtime_config(request: Request):
                 caz.camera_id,
                 at.code AS activity_code,
                 caz.zone_id,
+                fz.name AS zone_name,
                 caz.roi
             FROM camera_activity_zone caz
             JOIN activity_type at
-              ON at.id = caz.activity_type_id
+                ON at.id = caz.activity_type_id
+            JOIN farm_zone fz
+                ON fz.id = caz.zone_id
             WHERE caz.farm_id = %s
               AND caz.is_active = true
             """,
@@ -162,10 +165,43 @@ def edge_runtime_config(request: Request):
                 continue
 
             activity_code = r["activity_code"].upper()
-            cam["activity_zones"][activity_code] = {
-                "zone_id": r["zone_id"],
-                "roi": r["roi"],  # optional override
-            }
+
+            zone_name = r["zone_name"]
+
+            zone_type = "DEFAULT"
+
+            if "rest" in zone_name.lower():
+                zone_type = "REST"
+
+            elif "feeding" in zone_name.lower():
+                zone_type = "FEEDING"
+
+            # -------------------------------------------------
+            # POSTURE supports multiple ROIs
+            # -------------------------------------------------
+            if activity_code == "POSTURE":
+
+                if activity_code not in cam["activity_zones"]:
+                    cam["activity_zones"][activity_code] = {
+                        "zones": []
+                    }
+
+                cam["activity_zones"][activity_code]["zones"].append({
+                    "zone_id": r["zone_id"],
+                    "zone_name": zone_name,
+                    "zone_type": zone_type,
+                    "roi": r["roi"],
+                })
+
+            # -------------------------------------------------
+            # Existing activities remain unchanged
+            # -------------------------------------------------
+            else:
+
+                cam["activity_zones"][activity_code] = {
+                    "zone_id": r["zone_id"],
+                    "roi": r["roi"],
+                }
 
         # -------------------------------------------------
         # Optional strict check: fail-fast if camera has no activity zones
