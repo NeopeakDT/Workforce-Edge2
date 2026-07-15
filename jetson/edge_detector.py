@@ -139,6 +139,13 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.addHandler(queue_handler)
 logger.propagate = False  # Prevent duplicate logging
 
+# Route posture package logs (posture.*) through the same handler so
+# [POSTURE], [POSTURE DETECTOR], [SCHEDULER] logs appear in the journal/terminal.
+posture_logger = logging.getLogger("posture")
+posture_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+posture_logger.addHandler(queue_handler)
+posture_logger.propagate = False
+
 # Start listener thread (daemon, non-blocking writes)
 log_listener = QueueListener(log_queue, console_handler, respect_handler_level=True)
 log_listener.start()
@@ -532,6 +539,27 @@ def inference_worker(runners: dict):
 # ------------------------------------------------------------------
 # FIX 3: Thread Supervisor with Auto-Restart (Production Grade)
 # ------------------------------------------------------------------
+def log_stream_resolution(camera, cap, frame, camera_name):
+    """Log configured vs OpenCV-decoded resolution; warn on mismatch."""
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if (frame_w <= 0 or frame_h <= 0) and frame is not None:
+        frame_h, frame_w = frame.shape[:2]
+    actual_resolution = f"{frame_w} x {frame_h}" if frame_w > 0 and frame_h > 0 else "Unknown"
+    config_resolution = camera.get("resolution", "N/A")
+    logger.info("  Configured resolution: %s", config_resolution)
+    logger.info("  Actual decoded resolution: %s", actual_resolution)
+    config_norm = str(config_resolution).lower().replace(" ", "").replace("×", "x")
+    actual_norm = f"{frame_w}x{frame_h}" if frame_w > 0 and frame_h > 0 else ""
+    if config_norm not in ("n/a", "") and actual_norm and config_norm != actual_norm:
+        logger.warning(
+            "[CAMERA %s] Resolution mismatch — configured=%s decoded=%s",
+            camera_name,
+            config_resolution,
+            actual_resolution,
+        )
+
+
 def camera_supervisor(
     camera,
     person_classes,
@@ -976,14 +1004,8 @@ def _process_camera_impl(
         logger.debug("  Stream Type: %s", stream_type)
         logger.debug("  Source: %s", video_source)
     
-    # Get actual frame resolution from video
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_resolution = f"{frame_w}x{frame_h}" if frame_w > 0 and frame_h > 0 else "Unknown"
-    config_resolution = camera.get("resolution", "N/A")
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("  Config Resolution: %s", config_resolution)
-        logger.debug("  Actual Resolution: %s", actual_resolution)
+    # Compare configured resolution (local_cache.json) vs OpenCV decoded frame size.
+    log_stream_resolution(camera, cap, frame, camera_name)
 
     # Determine if stream is live (RTSP/NVR) or recorded (FILE)
     # Smart detection: explicit stream_type OR infer from config
@@ -1131,8 +1153,13 @@ def _process_camera_impl(
 
                 with RTSP_START_LOCK:
                     stream = open_stream(camera)
+                cap = stream.cap
+                ret, reconnect_frame = stream.read()
+                if ret:
+                    log_stream_resolution(camera, cap, reconnect_frame, camera_name)
                 logger.info("[CAMERA %s] Stream reconnected successfully", camera_id)
                 reconnect_attempt = 0  # reset after success
+                first_frame = reconnect_frame if ret else None
                 continue
             except Exception as e:
                 logger.warning("[CAMERA %s] Reconnect failed: %s", camera_id, str(e)[:200])
@@ -1157,6 +1184,15 @@ def _process_camera_impl(
         if now_time - last_processed_time < frame_interval:
             continue
         last_processed_time = now_time
+
+        posture_frame = None
+        if (
+            posture_scheduler is not None
+            and "POSTURE" in camera.get("activity_zones", {})
+        ):
+            # Posture ROIs are calibrated on native stream resolution (e.g. 1280x720).
+            # Workforce activities use the 640x640 inference frame below.
+            posture_frame = frame
 
         frame = cv2.resize(frame, INFERENCE_FRAME_SIZE)
 
@@ -1340,7 +1376,7 @@ def _process_camera_impl(
         ):
             try:
                 posture_scheduler.process_frame(
-                    frame=frame,
+                    frame=posture_frame,
                     camera=camera,
                 )
             except Exception:
@@ -1930,7 +1966,7 @@ def main():
         logger.info("[CAMERA] %s", camera_code)
         # logger.debug("  ID: %s", camera_id)
         # logger.debug("  Stream Type: %s", stream_type)
-        logger.info("  Resolution: %s", resolution)
+        logger.info("  Configured resolution: %s", resolution)
         if stream_type == "FILE":
             logger.info("  Video File: %s", video_path)
         elif stream_type == "RTSP":

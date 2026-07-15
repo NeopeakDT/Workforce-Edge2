@@ -79,18 +79,53 @@ def point_inside_polygon(
     )
 
 
-def detection_inside_roi(
+def polygon_overlap_ratio(
     bbox,
     polygon,
 ):
     """
-    Uses bbox center as ROI check.
+    Returns the fraction of bbox area lying inside ROI.
     """
 
-    return point_inside_polygon(
-        bbox_center(bbox),
-        polygon,
+    x1, y1, x2, y2 = map(int, bbox)
+
+    bbox_mask = np.zeros(
+        (
+            max(y2 + 5, polygon[:, 1].max() + 5),
+            max(x2 + 5, polygon[:, 0].max() + 5),
+        ),
+        dtype=np.uint8,
     )
+
+    roi_mask = np.zeros_like(bbox_mask)
+
+    cv2.rectangle(
+        bbox_mask,
+        (x1, y1),
+        (x2, y2),
+        255,
+        -1,
+    )
+
+    cv2.fillPoly(
+        roi_mask,
+        [polygon.astype(np.int32)],
+        255,
+    )
+
+    intersection = cv2.bitwise_and(
+        bbox_mask,
+        roi_mask,
+    )
+
+    bbox_pixels = cv2.countNonZero(bbox_mask)
+
+    if bbox_pixels == 0:
+        return 0.0
+
+    overlap = cv2.countNonZero(intersection)
+
+    return overlap / bbox_pixels
 
 
 # ---------------------------------------------------------
@@ -129,49 +164,66 @@ def assign_detection_to_zone(
     detection,
     posture_zones,
     *,
-    frame_width: Optional[int] = None,
-    frame_height: Optional[int] = None,
-) -> Dict[str, Optional[str]]:
-    """
-    Map one detection to a posture zone.
-
-    posture_zones: POSTURE block from local_cache
-        {"zones": [{zone_id, zone_type, roi|polygon}, ...]}
-        or a plain list of zone dicts.
-
-    Returns:
-        {"zone_id": "...", "zone_type": "REST"|"FEEDING"|"DEFAULT"|None}
-
-    When a detection falls in multiple zones, FEEDING wins over REST.
-    """
+    frame_width=None,
+    frame_height=None,
+):
 
     bbox = detection["bbox"]
-    matches: List[Dict[str, Any]] = []
+
+    feeding_overlap = 0.0
+    rest_overlap = 0.0
+
+    feeding_zone = None
+    rest_zone = None
 
     for zone in _posture_zone_list(posture_zones):
-        pixel_polygon = _zone_polygon(zone, frame_width, frame_height)
-        if pixel_polygon is None:
+
+        polygon = _zone_polygon(
+            zone,
+            frame_width,
+            frame_height,
+        )
+
+        if polygon is None:
             continue
-        if detection_inside_roi(bbox, pixel_polygon):
-            matches.append(zone)
 
-    if not matches:
-        return {
-            "zone_id": None,
-            "zone_type": None,
-        }
+        overlap = polygon_overlap_ratio(
+            bbox,
+            np.asarray(polygon),
+        )
 
-    priority = {
-        "FEEDING": 0,
-        "REST": 1,
-        "DEFAULT": 2,
-    }
-    best = min(
-        matches,
-        key=lambda z: priority.get(str(z.get("zone_type", "DEFAULT")).upper(), 99),
-    )
+        zone_type = zone["zone_type"].upper()
+
+        if zone_type == "FEEDING":
+
+            if overlap > feeding_overlap:
+                feeding_overlap = overlap
+                feeding_zone = zone
+
+        elif zone_type == "REST":
+
+            if overlap > rest_overlap:
+                rest_overlap = overlap
+                rest_zone = zone
+
+    #
+    # Decision
+    #
+
+    final_zone = None
+    final_zone_id = None
+
+    if feeding_overlap >= 0.18:
+        final_zone = "FEEDING"
+        final_zone_id = feeding_zone["zone_id"]
+
+    elif rest_overlap >= 0.30:
+        final_zone = "REST"
+        final_zone_id = rest_zone["zone_id"]
 
     return {
-        "zone_id": best.get("zone_id"),
-        "zone_type": str(best.get("zone_type", "DEFAULT")).upper(),
+        "zone_id": final_zone_id,
+        "zone_type": final_zone,
+        "feeding_overlap": feeding_overlap,
+        "rest_overlap": rest_overlap,
     }

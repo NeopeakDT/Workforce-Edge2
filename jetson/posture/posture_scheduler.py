@@ -35,11 +35,11 @@ class PostureScheduler:
     Frame-driven posture sampling and periodic pen-wide DB flush.
     """
 
-    # Sample every minute
-    SAMPLE_INTERVAL_SECONDS = 120
+    # Sample every 15 seconds
+    SAMPLE_INTERVAL_SECONDS = 15
 
-    # Aggregate every 10 minutes
-    DB_WRITE_INTERVAL_SECONDS = 600
+    # Aggregate every 5 minutes (20 samples at 15s intervals)
+    DB_WRITE_INTERVAL_SECONDS = 300
 
     def __init__(
         self,
@@ -242,7 +242,7 @@ class PostureScheduler:
             self.last_flush = observed_at
 
         logger.info(
-            "[POSTURE][1MIN] %s | standing=%d feeding=%d | cameras=%d/%d | buffer=%d/10",
+            "[POSTURE][1MIN] %s | standing=%d feeding=%d | cameras=%d/%d | buffer=%d/20",
             observed_at.strftime("%H:%M"),
             standing,
             feeding,
@@ -305,6 +305,20 @@ class PostureScheduler:
 
             snapshots = list(self.pen_buffer.snapshots)
 
+        logger.info(
+            "[POSTURE] Aggregating %d snapshots",
+            len(snapshots),
+        )
+
+        for i, snapshot in enumerate(snapshots, start=1):
+            logger.info(
+                "[SNAPSHOT %02d] standing=%d feeding=%d cameras=%s",
+                i,
+                snapshot.standing_count,
+                snapshot.feeding_count,
+                snapshot.camera_breakdown,
+            )
+
         snapshot_count = len(snapshots)
 
         avg_standing = round(
@@ -315,6 +329,12 @@ class PostureScheduler:
         avg_feeding = round(
             sum(s.feeding_count for s in snapshots)
             / snapshot_count
+        )
+
+        logger.info(
+            "[POSTURE] Average standing=%d feeding=%d",
+            avg_standing,
+            avg_feeding,
         )
 
         herd_size = snapshots[0].herd_size

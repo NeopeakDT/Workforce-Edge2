@@ -43,9 +43,9 @@ This script:
 
 rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/502
 rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1902
-rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1802
-rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1302
-rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1702
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1801
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1301
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1701
 
 GRP2-TMR_WAY        → 502
 GRP2-FRONT_RIGHT    → 1902

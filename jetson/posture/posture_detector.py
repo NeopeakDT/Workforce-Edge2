@@ -79,8 +79,28 @@ class PostureDetector:
 
         detections = self.model.infer(frame)
 
+        logger.info(
+            "[POSTURE RAW] %s total_detections=%d",
+            camera["code"],
+            len(detections),
+        )
+
+        for det in detections:
+            logger.info(
+                "[RAW] class=%s conf=%.2f bbox=%s",
+                det["class"],
+                det["confidence"],
+                det["bbox"],
+            )
+
         standing_cows = self._filter_standing_detections(
             detections
+        )
+
+        logger.info(
+            "[POSTURE FILTER] %s standing=%d",
+            camera["code"],
+            len(standing_cows),
         )
 
         posture = camera["activity_zones"].get("POSTURE")
@@ -92,8 +112,7 @@ class PostureDetector:
 
         frame_height, frame_width = frame.shape[:2]
 
-        standing_count = 0
-        feeding_count = 0
+        classified_cows = []
 
         for cow in standing_cows:
 
@@ -106,16 +125,42 @@ class PostureDetector:
                 frame_height=frame_height,
             )
 
-            zone_type = zone.get("zone_type")
+            logger.info(
+                "[ROI] %s conf=%.2f rest=%.2f feeding=%.2f final=%s",
+                cow.bbox,
+                cow.confidence,
+                zone["rest_overlap"],
+                zone["feeding_overlap"],
+                zone["zone_type"],
+            )
 
-            if zone_type == "REST":
-                standing_count += 1
+            classified_cows.append(
+                {
+                    "bbox": cow.bbox,
+                    "confidence": cow.confidence,
+                    "zone": zone["zone_type"],
+                    "rest_overlap": zone["rest_overlap"],
+                    "feeding_overlap": zone["feeding_overlap"],
+                }
+            )
 
-            elif zone_type == "FEEDING":
-                feeding_count += 1
+        standing_count = sum(
+            1 for c in classified_cows if c["zone"] == "REST"
+        )
+
+        feeding_count = sum(
+            1 for c in classified_cows if c["zone"] == "FEEDING"
+        )
 
         logger.info(
             "[POSTURE] %s standing=%d feeding=%d",
+            camera["code"],
+            standing_count,
+            feeding_count,
+        )
+
+        logger.info(
+            "[POSTURE DETECTOR] %s -> standing=%d feeding=%d",
             camera["code"],
             standing_count,
             feeding_count,

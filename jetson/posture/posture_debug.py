@@ -8,11 +8,11 @@ Live Posture Debug Tool
 - Shows annotated live stream
 
 
-GRP2-TMR_WAY        → 502
-GRP2-FRONT_RIGHT    → 1902
-GRP1-FRONT_LEFT     → 1802   
-GRP1-FRONT_RIGHT    → 1302
-GRP1-FRONT_CENTER   → 1702
+GRP2-TMR_WAY        → 501 (main) / 502 (sub)
+GRP2-FRONT_RIGHT    → 1901 (main) / 1902 (sub)
+GRP1-FRONT_LEFT     → 1801 (main) / 1802 (sub)
+GRP1-FRONT_RIGHT    → 1301 (main) / 1302 (sub)
+GRP1-FRONT_CENTER   → 1701 (main) / 1702 (sub)
 """
 
 from __future__ import annotations
@@ -28,7 +28,10 @@ from ultralytics import YOLO
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "jetson"))
 
-from posture.posture_utils import assign_detection_to_zone  # noqa: E402
+from posture.posture_utils import (  # noqa: E402
+    assign_detection_to_zone,
+    polygon_overlap_ratio,
+)
 from runtime.video_stream import open_stream  # noqa: E402
 
 ##############################################################
@@ -48,8 +51,8 @@ CONF_THRES = 0.50
 
 IMG_SIZE = 640
 
-TARGET_WIDTH = 1138
-TARGET_HEIGHT = 640
+TARGET_WIDTH = 1280
+TARGET_HEIGHT = 720
 
 DECODE_MODE = "GPU"
 
@@ -309,27 +312,38 @@ def main():
                 if zone is not None:
                     zone_type = zone.get("zone_type")
 
+                feeding_overlap = polygon_overlap_ratio(
+                    (x1, y1, x2, y2),
+                    feeding_polygon,
+                )
+
+                rest_overlap = polygon_overlap_ratio(
+                    (x1, y1, x2, y2),
+                    rest_polygon,
+                )
+
                 color = (180, 180, 180)
-                label_lines = [f"{cls_name} ({conf:.2f})"]
 
                 if cls_name == "cow_standing":
                     if zone_type == "REST":
                         standing_rest += 1
                         color = (0, 255, 0)
-                        label_lines = [f"REST ({conf:.2f})"]
                     elif zone_type == "FEEDING":
                         standing_feeding += 1
                         color = (0, 255, 255)
-                        label_lines = [f"FEEDING ({conf:.2f})"]
                     else:
                         outside_roi += 1
                         color = (0, 0, 255)
-                        label_lines = [f"OUTSIDE ({conf:.2f})"]
 
                 elif cls_name == "cow_lying":
                     lying += 1
                     color = (255, 0, 0)
-                    label_lines = [f"LYING ({conf:.2f})"]
+
+                label_lines = [
+                    f"{zone_type}",
+                    f"F={feeding_overlap:.2f}",
+                    f"R={rest_overlap:.2f}",
+                ]
 
                 dx1 = int(x1 * sx)
                 dy1 = int(y1 * sy)
@@ -344,16 +358,20 @@ def main():
                     3 if zone_type is None else 2,
                 )
 
-                cv2.putText(
-                    display,
-                    label_lines[0],
-                    (dx1, dy1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42,
-                    color,
-                    1,
-                    cv2.LINE_AA,
-                )
+                for i, txt in enumerate(label_lines):
+                    cv2.putText(
+                        display,
+                        txt,
+                        (
+                            dx1,
+                            dy1 - 5 - i * 14,
+                        ),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42,
+                        color,
+                        1,
+                        cv2.LINE_AA,
+                    )
         draw_stats_panel(
             display,
             camera_code=camera_cfg["code"],
