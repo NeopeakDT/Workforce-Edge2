@@ -15,10 +15,17 @@ No scheduler logic.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Fraction of bbox area that must overlap the ROI polygon.
+FEEDING_OVERLAP_THRESHOLD = 0.18
+REST_OVERLAP_THRESHOLD = 0.30
 
 # ---------------------------------------------------------
 # ROI Helpers
@@ -206,6 +213,18 @@ def assign_detection_to_zone(
                 rest_overlap = overlap
                 rest_zone = zone
 
+    # Temporary debug: confirm whether FEEDING ROI ever intersects bboxes.
+    logger.info(
+        "[POSTURE][ROI_DEBUG] camera=%s "
+        "bbox=%s "
+        "feeding_zone=%s "
+        "feeding_overlap=%.3f",
+        detection.get("camera_code"),
+        bbox,
+        feeding_zone["zone_id"] if feeding_zone else None,
+        feeding_overlap,
+    )
+
     #
     # Decision
     #
@@ -213,13 +232,38 @@ def assign_detection_to_zone(
     final_zone = None
     final_zone_id = None
 
-    if feeding_overlap >= 0.18:
+    if (
+        feeding_zone is not None
+        and feeding_overlap >= FEEDING_OVERLAP_THRESHOLD
+    ):
         final_zone = "FEEDING"
         final_zone_id = feeding_zone["zone_id"]
 
-    elif rest_overlap >= 0.30:
+    elif (
+        rest_zone is not None
+        and rest_overlap >= REST_OVERLAP_THRESHOLD
+    ):
         final_zone = "REST"
         final_zone_id = rest_zone["zone_id"]
+
+    # Temporary debug: inspect real overlaps before changing thresholds.
+    logger.info(
+        "[POSTURE][ROI] "
+        "camera=%s "
+        "feeding_overlap=%.2f (threshold=%.2f) "
+        "rest_overlap=%.2f (threshold=%.2f) "
+        "assigned=%s "
+        "feeding_zone=%s "
+        "rest_zone=%s",
+        detection.get("camera_code"),
+        feeding_overlap,
+        FEEDING_OVERLAP_THRESHOLD,
+        rest_overlap,
+        REST_OVERLAP_THRESHOLD,
+        final_zone,
+        feeding_zone["zone_id"] if feeding_zone else None,
+        rest_zone["zone_id"] if rest_zone else None,
+    )
 
     return {
         "zone_id": final_zone_id,

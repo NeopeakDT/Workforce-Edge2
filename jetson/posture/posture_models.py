@@ -68,6 +68,7 @@ class PostureSample:
 
     standing_count: int
     feeding_count: int
+    detected_laying_count: int = 0
 
 
 # ---------------------------------------------------------
@@ -89,6 +90,7 @@ class MinuteAggregation:
     herd_size: int
 
     camera_breakdown: Dict[str, dict]
+    detected_laying_count: int = 0
 
 
 # ---------------------------------------------------------

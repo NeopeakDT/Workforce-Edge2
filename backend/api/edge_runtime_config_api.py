@@ -274,6 +274,48 @@ def edge_runtime_config(request: Request):
         if not model:
             raise HTTPException(status_code=500, detail="Model version not found")
 
+        # -------------------------------------------------
+        # 6. Activity schedules (milking / feeding / scrapping)
+        # -------------------------------------------------
+        cur.execute(
+            """
+            SELECT
+                id,
+                activity_type_id,
+                label,
+                ideal_start_time,
+                ideal_end_time,
+                tolerance_early_min,
+                tolerance_late_min
+            FROM activity_schedule
+            WHERE farm_id = %s
+              AND is_active = true
+            ORDER BY activity_type_id, ideal_start_time
+            """,
+            (farm_id,),
+        )
+        schedule_rows = cur.fetchall()
+
+        def _time_str(value):
+            if value is None:
+                return None
+            if hasattr(value, "strftime"):
+                return value.strftime("%H:%M:%S")
+            return str(value)
+
+        activity_schedules = [
+            {
+                "id": row["id"],
+                "activity_type_id": row["activity_type_id"],
+                "label": row["label"],
+                "ideal_start_time": _time_str(row["ideal_start_time"]),
+                "ideal_end_time": _time_str(row["ideal_end_time"]),
+                "tolerance_early_min": row["tolerance_early_min"],
+                "tolerance_late_min": row["tolerance_late_min"],
+            }
+            for row in schedule_rows
+        ]
+
     # -------------------------------------------------
     # METADATA VALIDATION
     # -------------------------------------------------
@@ -307,5 +349,7 @@ def edge_runtime_config(request: Request):
             "checksum": model["checksum"],
             "class_map": metadata["class_map"],
             "activity_thresholds": metadata.get("activity_thresholds", {}),
-        }
+        },
+
+        "activity_schedules": activity_schedules,
     }

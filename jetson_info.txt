@@ -765,6 +765,8 @@ sudo systemctl stop workforce-watchdog
 sudo systemctl --no-pager --full status workforce-backend workforce-aggregator workforce-phase5.timer workforce-edge workforce-heartbeat workforce-watchdog
 
 
+# TO update local_cache.json run this - python jetson/edge_config_sync.py 
+
 ===========================================================================================
 # FINAL SYSTEM :-
 EDGE (Jetson)
@@ -785,42 +787,6 @@ BACKEND
 TRUNCATE activity_detection_event RESTART IDENTITY CASCADE;
 TRUNCATE activity_instance RESTART IDENTITY CASCADE;
 TRUNCATE edge_device_heartbeat RESTART IDENTITY CASCADE;
-===================================================================================================
-Deployment audit done for tomorrow (April 5, 2026) setup.
-RTSP is supported in code, but current project state is not farm-live ready yet without a few fixes/config updates.
-    1. RTSP Compatibility Verdict
-    2. edge_detector + video_stream support RTSP, NVR_CHANNEL, and FILE streams (edge_detector.py, video_stream.py).
-    3. Current cached runtime config is in FILE mode (local mp4 paths), not live RTSP (local_cache.json).
-    4. Runtime config is DB-driven via /api/v1/edge/runtime-config (edge_runtime_config_api.py).
-    5. Critical Risks To Fix Before Farm Deployment
-    6. systemd/workforce-edge.service does not run config sync and has wrong precheck path (/home/neopeak/edge_precheck.sh) (workforce-edge.service, edge_precheck.sh).
-    7. Live-stream reconnect block is effectively bypassed by an early continue on frame read failure (in live mode) in camera loop (edge_detector.py).
-    8. Backend runtime-config does not provide decode_mode; code defaults AUTO -> CPU decode, so multi-camera live load may choke (edge_runtime_config_api.py, video_stream.py).
-    9. Env/doc naming mismatch: runtime uses EDGE_DEVICE_KEY, old docs still say EDGE_TOKEN (edge_detector.py, jetson_info.txt).
-    10. BACKEND_API_URL confusion: edge_config_sync appends /api/v1/...; if you set URL already ending /api/v1, it can duplicate path (edge_config_sync.py).
-    11. backend/metadata.json is incompatible with current runtime-config contract (class_map required) if reused directly (metadata.json, edge_runtime_config_api.py).
-    12. New Farm Onboarding Checklist (Code + DB + Jetson)
-    13. Add farm row in farm with correct timezone (used by resolver/aggregation).
-    14. Add cameras in farm_camera with stream_type, rtsp_url or nvr_rtsp_base+nvr_channel.
-    15. Add camera_stream_config rows (fps_target, resolution, optional roi/motion).
-    16. Add camera_activity_zone for each camera/activity (FEEDING, SCRAPPING) with ROI JSON.
-    17. Ensure activity_type codes in DB match edge payload names (SCRAPPING spelling matters).
-    18. Add activity schedules in activity_schedule for that farm/activity.
-    19. Provision device: run device_provisioning.py with new farm_id, save API key.
-    20. Assign model to device via model_registry_sync.py (or existing assignment flow).
-    21. Jetson env update (backend/.env): EDGE_API_BASE, EDGE_DEVICE_KEY, DEVICE_CODE, DATABASE_URL (backend host side), queue/fps knobs.
-    22. Jetson bootstrap update: bootstrap_config.json backend_api_url must be new backend IP/domain.
-    23. Run config sync once and verify new local_cache.json now contains RTSP/NVR camera config.
-    24. Start services in order and verify: backend -> edge detector -> heartbeat -> watchdog -> aggregator -> phase5 timer.
-    25. One-Time IP/WiFi Change Items
-    26. Update backend host IP/domain in Jetson bootstrap_config.json (backend_api_url).
-    27. Update EDGE_API_BASE in backend/.env on Jetson side to http://<new-backend-ip>:8000/api/v1.
-    28. If camera/NVR network changed, update farm_camera.rtsp_url or nvr_rtsp_base in DB.
-    29. Regenerate/replace device key only if provisioning new Jetson device.
-    30. Important Clarification
-    31. I could not run a real live RTSP stream test from this environment (no camera/network access), so this is a static code/config audit.
-    32. For new farm onboarding, mainly DB + env changes are needed; code changes are only needed to address the critical risks above.
-If you want, I can now make the exact code fixes for the 3 main blockers (service precheck path/startup flow, live reconnect bug, decode_mode/runtime-config improvement) so you can deploy with a safer build tomorrow.
 
 ====================================================================================================
 rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/502

@@ -99,10 +99,10 @@ def detect_missed_activities():
     Create MISSED activity_instance rows when:
     - Ideal end + late tolerance has passed (full window plus grace elapsed)
     - No activity_instance exists for that (farm, schedule, activity_date)
+
+    Idempotent against uq_missed_schedule_per_day: any existing row for the
+    same (farm, schedule, date) blocks MISSED insert (ON CONFLICT DO NOTHING).
     """
-    # MISSED creation is enabled.
-    # Function is idempotent by checking for an existing MISSED row
-    # before inserting a new one.
     
     now_utc = utc_now()
     
@@ -176,15 +176,17 @@ def detect_missed_activities():
                 if now_utc <= late_cutoff_utc:
                     continue
 
-                # Skip if MISSED row already exists for this schedule/day.
+                # Unique index uq_missed_schedule_per_day is on
+                # (farm_id, activity_schedule_id, activity_date) for ALL rows.
+                # Skip if ANY instance already covers this schedule/day
+                # (MISSED, AI with NULL classification, EARLY/ON_TIME/LATE, etc.).
                 cur.execute(
                     """
-                    SELECT id
+                    SELECT id, source, status, session_classification
                     FROM activity_instance
                     WHERE farm_id = %s
                       AND activity_schedule_id = %s
                       AND activity_date = %s
-                      AND session_classification = 'MISSED'
                     LIMIT 1
                     """,
                     (
@@ -193,52 +195,19 @@ def detect_missed_activities():
                         activity_date,
                     ),
                 )
-                already_missed = cur.fetchone()
+                existing = cur.fetchone()
 
                 print(
                     f"[MISSED_EXISTS] "
                     f"schedule={schedule_id} "
                     f"date={activity_date} "
-                    f"already_missed={bool(already_missed)}"
+                    f"already_exists={bool(existing)} "
+                    f"source={existing['source'] if existing else None} "
+                    f"status={existing['status'] if existing else None} "
+                    f"classification={existing['session_classification'] if existing else None}"
                 )
 
-                if already_missed:
-                    continue
-
-                # Skip if a real AI activity exists for this schedule/day.
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM activity_instance
-                    WHERE farm_id = %s
-                      AND activity_schedule_id = %s
-                      AND activity_date = %s
-                      AND source = 'AI'
-                      AND status = 'ENDED'
-                      AND session_classification IN
-                      (
-                          'EARLY',
-                          'ON_TIME',
-                          'LATE'
-                      )
-                    LIMIT 1
-                    """,
-                    (
-                        farm_id,
-                        schedule_id,
-                        activity_date,
-                    ),
-                )
-                existing_ai = cur.fetchone()
-
-                print(
-                    f"[MISSED_AI_CHECK] "
-                    f"schedule={schedule_id} "
-                    f"date={activity_date} "
-                    f"existing_ai={bool(existing_ai)}"
-                )
-
-                if existing_ai:
+                if existing:
                     continue
 
                 cur.execute(
@@ -291,6 +260,8 @@ def detect_missed_activities():
                         %s,
                         %s
                     )
+                    ON CONFLICT (farm_id, activity_schedule_id, activity_date)
+                    DO NOTHING
                     """,
                     (
                         farm_id,
@@ -302,12 +273,20 @@ def detect_missed_activities():
                     ),
                 )
 
-                print(
-                    f"[MISSED_CREATED] "
-                    f"schedule={schedule_id} "
-                    f"activity_type={activity_type_id} "
-                    f"date={activity_date}"
-                )
+                if cur.rowcount:
+                    print(
+                        f"[MISSED_CREATED] "
+                        f"schedule={schedule_id} "
+                        f"activity_type={activity_type_id} "
+                        f"date={activity_date}"
+                    )
+                else:
+                    print(
+                        f"[MISSED_SKIPPED] "
+                        f"schedule={schedule_id} "
+                        f"date={activity_date} "
+                        f"reason=conflict"
+                    )
 
         cur.connection.commit()
 

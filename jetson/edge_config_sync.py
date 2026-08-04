@@ -162,6 +162,43 @@ def main():
         if cam_stream_type == "FILE":
             cam["video_file_path"] = str(TEST_VIDEO_PATH)
 
+    # ----------------------------------------
+    # Milking schedule extraction
+    # ----------------------------------------
+    cfg["posture_runtime"] = {
+        "milking_schedules": [],
+    }
+
+    activity_schedules = cfg.get("activity_schedules", [])
+    if not isinstance(activity_schedules, list):
+        fatal("activity_schedules must be a list when present")
+
+    for schedule in activity_schedules:
+        # Milking = activity_type_id 1 (DB may send int or str)
+        if int(schedule.get("activity_type_id", -1)) != 1:
+            continue
+
+        cfg["posture_runtime"]["milking_schedules"].append({
+            "label": schedule["label"],
+            "start_time": schedule["ideal_start_time"],
+            "end_time": schedule["ideal_end_time"],
+            # Posture milking window is ±15 min around ideal times,
+            # independent of workforce activity_schedules tolerances.
+            "tolerance_early_min": 15,
+            "tolerance_late_min": 15,
+        })
+
+    print(
+        f"📅 activity_schedules from API: {len(activity_schedules)} | "
+        f"milking extracted: {len(cfg['posture_runtime']['milking_schedules'])}"
+    )
+    if not activity_schedules:
+        print(
+            "WARNING: Backend returned no activity_schedules. "
+            "Restart workforce-backend after API changes, then re-run sync.",
+            file=sys.stderr,
+        )
+
     # -------------------------------------------------
     # Atomic cache write
     # -------------------------------------------------

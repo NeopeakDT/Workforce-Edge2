@@ -38,6 +38,12 @@ STANDING_CLASSES = {
     "standing",
 }
 
+LAYING_CLASSES = {
+    "cow_laying",
+    "cow_lying",
+    "lying",
+}
+
 CONFIDENCE_THRESHOLD = 0.50
 
 
@@ -79,14 +85,23 @@ class PostureDetector:
 
         detections = self.model.infer(frame)
 
-        logger.info(
+        detected_laying_count = sum(
+            1
+            for det in detections
+            if (
+                str(det["class"]).lower() in LAYING_CLASSES
+                and float(det["confidence"]) >= self.confidence_threshold
+            )
+        )
+
+        logger.debug(
             "[POSTURE RAW] %s total_detections=%d",
             camera["code"],
             len(detections),
         )
 
         for det in detections:
-            logger.info(
+            logger.debug(
                 "[RAW] class=%s conf=%.2f bbox=%s",
                 det["class"],
                 det["confidence"],
@@ -97,7 +112,7 @@ class PostureDetector:
             detections
         )
 
-        logger.info(
+        logger.debug(
             "[POSTURE FILTER] %s standing=%d",
             camera["code"],
             len(standing_cows),
@@ -119,13 +134,14 @@ class PostureDetector:
             zone = assign_detection_to_zone(
                 {
                     "bbox": cow.bbox,
+                    "camera_code": camera["code"],
                 },
                 posture,
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
 
-            logger.info(
+            logger.debug(
                 "[ROI] %s conf=%.2f rest=%.2f feeding=%.2f final=%s",
                 cow.bbox,
                 cow.confidence,
@@ -152,15 +168,8 @@ class PostureDetector:
             1 for c in classified_cows if c["zone"] == "FEEDING"
         )
 
-        logger.info(
+        logger.debug(
             "[POSTURE] %s standing=%d feeding=%d",
-            camera["code"],
-            standing_count,
-            feeding_count,
-        )
-
-        logger.info(
-            "[POSTURE DETECTOR] %s -> standing=%d feeding=%d",
             camera["code"],
             standing_count,
             feeding_count,
@@ -175,6 +184,7 @@ class PostureDetector:
             herd_size=self.herd_size,
             standing_count=standing_count,
             feeding_count=feeding_count,
+            detected_laying_count=detected_laying_count,
         )
 
     def _filter_standing_detections(

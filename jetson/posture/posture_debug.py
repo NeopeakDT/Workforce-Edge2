@@ -10,9 +10,9 @@ Live Posture Debug Tool
 
 GRP2-TMR_WAY        → 501 (main) / 502 (sub)
 GRP2-FRONT_RIGHT    → 1901 (main) / 1902 (sub)
-GRP1-FRONT_LEFT     → 1801 (main) / 1802 (sub)
-GRP1-FRONT_RIGHT    → 1301 (main) / 1302 (sub)
-GRP1-FRONT_CENTER   → 1701 (main) / 1702 (sub)
+GRP1-FRONT_LEFT     → 2301 (main) / 1802 (sub)
+GRP1-FRONT_RIGHT    → 2201 (main) / 1302 (sub)
+GRP1-FRONT_CENTER   → 2401 (main) / 1702 (sub)
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from runtime.video_stream import open_stream  # noqa: E402
 # CONFIG
 ##############################################################
 
-VIDEO_SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1301"
+VIDEO_SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2201"
 CAMERA_CODE = "grp1-front-right"
 
 MODEL_PATH = REPO / "models" / "cow_posture_v1.1_best.pt"

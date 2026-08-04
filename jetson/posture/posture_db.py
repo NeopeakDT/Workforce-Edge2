@@ -87,7 +87,10 @@ class PostureDB:
                 )
 
             logger.info(
-                "[POSTURE][DB] Observation stored successfully at %s",
+                "[POSTURE FLUSH][DB] standing=%d feeding=%d laying=%d at %s",
+                observation.standing_count,
+                observation.feeding_count,
+                observation.laying_count,
                 observation.observed_at.isoformat(),
             )
         except Exception:

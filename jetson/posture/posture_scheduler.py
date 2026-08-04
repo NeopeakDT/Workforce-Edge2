@@ -9,7 +9,11 @@ Responsibilities
 - Buffer minute snapshots until DB flush
 - Persist aggregated pen observations
 
-No YOLO inference.
+Milking mode is schedule-only (± tolerance).
+No milking-detector dependency.
+No YOLO inference during scheduled milking windows.
+
+No YOLO inference in this module (delegated to detector).
 No ROI logic.
 """
 
@@ -17,8 +21,10 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, time as dt_time, timezone
+from threading import Lock
 from typing import Dict, Optional, Set
+from zoneinfo import ZoneInfo
 
 from .posture_models import (
     MinuteAggregation,
@@ -87,13 +93,73 @@ class PostureScheduler:
 
         self.last_flush: Optional[datetime] = None
 
+        # Serialize flush across concurrent posture camera threads.
+        self._flush_lock = Lock()
+
+        # True while inside a scheduled milking window (cleared once on enter).
+        self._in_milking_window = False
+
         # camera_id -> last sample monotonic time
         self.last_sample: Dict[str, float] = {}
+
+        posture_runtime = runtime_config.get("posture_runtime", {})
+        self.milking_schedules = posture_runtime.get(
+            "milking_schedules",
+            [],
+        )
 
     @property
     def total_samples(self) -> int:
         with self.pen_buffer.lock:
             return self.pen_buffer.size
+
+    def _parse_schedule_time(self, value) -> dt_time:
+        if isinstance(value, dt_time):
+            return value
+        return datetime.strptime(str(value), "%H:%M:%S").time()
+
+    def _active_milking_schedule(self, now: datetime) -> Optional[dict]:
+        """
+        Return the matching milking schedule dict if now is inside
+        ideal_start/end ± tolerance, else None.
+        """
+        if not self.milking_schedules:
+            return None
+
+        farm_tz_name = self.runtime_config.get("farm_timezone", "UTC")
+        farm_tz = ZoneInfo(farm_tz_name)
+
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        local_now = now.astimezone(farm_tz)
+        activity_date = local_now.date()
+
+        for schedule in self.milking_schedules:
+            ideal_start = datetime.combine(
+                activity_date,
+                self._parse_schedule_time(schedule["start_time"]),
+                tzinfo=farm_tz,
+            )
+            ideal_end = datetime.combine(
+                activity_date,
+                self._parse_schedule_time(schedule["end_time"]),
+                tzinfo=farm_tz,
+            )
+
+            if ideal_end <= ideal_start:
+                ideal_end += timedelta(days=1)
+
+            early_min = schedule.get("tolerance_early_min", 0) or 0
+            late_min = schedule.get("tolerance_late_min", 0) or 0
+
+            window_start = ideal_start - timedelta(minutes=early_min)
+            window_end = ideal_end + timedelta(minutes=late_min)
+
+            if window_start <= local_now <= window_end:
+                return schedule
+
+        return None
 
     def start(self):
         """
@@ -116,11 +182,38 @@ class PostureScheduler:
     ):
         """
         Sample posture from one camera frame when the interval has elapsed.
+
+        During scheduled milking windows, skips YOLO posture inference and
+        only writes synthetic MILKING observations on the flush interval.
         """
 
         camera_id = camera["camera_id"]
 
         now_mono = time.time()
+        observed_at = datetime.now(timezone.utc)
+
+        schedule = self._active_milking_schedule(observed_at)
+        if schedule is not None:
+            if not self._in_milking_window:
+                self._in_milking_window = True
+                self._clear_minute_window()
+                with self.pen_buffer.lock:
+                    self.pen_buffer.clear()
+                if self.last_flush is None:
+                    self.last_flush = observed_at
+                logger.info(
+                    "[POSTURE] Entered scheduled milking window: %s",
+                    schedule.get("label"),
+                )
+
+            self.flush_if_due()
+            return
+
+        if self._in_milking_window:
+            self._in_milking_window = False
+            logger.info(
+                "[POSTURE] Left scheduled milking window; resuming posture"
+            )
 
         self._maybe_finalize_minute(now_mono)
 
@@ -130,8 +223,6 @@ class PostureScheduler:
             return
 
         self.last_sample[camera_id] = now_mono
-
-        observed_at = datetime.now(timezone.utc)
 
         sample = self.detector.detect(
             frame,
@@ -144,7 +235,7 @@ class PostureScheduler:
         if not self.current_minute_samples:
             self.current_minute_started_at = now_mono
 
-        logger.info(
+        logger.debug(
             "[SCHEDULER] %s standing=%d feeding=%d",
             sample.camera_code,
             sample.standing_count,
@@ -192,12 +283,14 @@ class PostureScheduler:
 
         standing = 0
         feeding = 0
+        detected_laying = 0
         camera_breakdown: Dict[str, dict] = {}
 
         for sample in self.current_minute_samples.values():
 
             standing += sample.standing_count
             feeding += sample.feeding_count
+            detected_laying += sample.detected_laying_count
 
             camera_breakdown[sample.camera_code] = {
                 "camera_id": sample.camera_id,
@@ -230,6 +323,7 @@ class PostureScheduler:
             observed_at=observed_at,
             standing_count=standing,
             feeding_count=feeding,
+            detected_laying_count=detected_laying,
             herd_size=herd_size,
             camera_breakdown=camera_breakdown,
         )
@@ -255,43 +349,60 @@ class PostureScheduler:
         """
         Write aggregated pen observation every
         DB_WRITE_INTERVAL_SECONDS.
+
+        Locked so concurrent camera threads cannot insert duplicates.
         """
 
-        now = datetime.now(timezone.utc)
+        with self._flush_lock:
+            now = datetime.now(timezone.utc)
 
-        if self.last_flush is None:
-            return
+            if self.last_flush is None:
+                return
 
-        if (
-            now - self.last_flush
-        ).total_seconds() < self.DB_WRITE_INTERVAL_SECONDS:
-            return
+            if (
+                now - self.last_flush
+            ).total_seconds() < self.DB_WRITE_INTERVAL_SECONDS:
+                return
 
-        try:
+            try:
 
-            self.aggregate_pen()
+                self.aggregate_pen()
 
-        except Exception:
+            except Exception:
 
-            logger.exception(
-                "Failed flushing posture pen buffer"
-            )
+                logger.exception(
+                    "Failed flushing posture pen buffer"
+                )
 
-            return
+                return
 
-        self.last_flush = now
+            self.last_flush = now
 
     def flush_all(self):
         """
         Flush pen buffer (e.g. on shutdown).
         """
 
-        self.aggregate_pen()
+        with self._flush_lock:
+            self.aggregate_pen()
+            self.last_flush = datetime.now(timezone.utc)
 
     def aggregate_pen(self):
         """
         Aggregate pen buffer into one DB observation.
+
+        During scheduled milking: write zeros with mode=MILKING.
+        Otherwise: normal standing/feeding/laying aggregation.
         """
+
+        now = datetime.now(timezone.utc)
+        schedule = self._active_milking_schedule(now)
+
+        if schedule is not None:
+            self._write_scheduled_milking_observation(now, schedule)
+            with self.pen_buffer.lock:
+                self.pen_buffer.clear()
+            return
 
         with self.pen_buffer.lock:
 
@@ -305,13 +416,13 @@ class PostureScheduler:
 
             snapshots = list(self.pen_buffer.snapshots)
 
-        logger.info(
+        logger.debug(
             "[POSTURE] Aggregating %d snapshots",
             len(snapshots),
         )
 
         for i, snapshot in enumerate(snapshots, start=1):
-            logger.info(
+            logger.debug(
                 "[SNAPSHOT %02d] standing=%d feeding=%d cameras=%s",
                 i,
                 snapshot.standing_count,
@@ -329,12 +440,6 @@ class PostureScheduler:
         avg_feeding = round(
             sum(s.feeding_count for s in snapshots)
             / snapshot_count
-        )
-
-        logger.info(
-            "[POSTURE] Average standing=%d feeding=%d",
-            avg_standing,
-            avg_feeding,
         )
 
         herd_size = snapshots[0].herd_size
@@ -405,6 +510,7 @@ class PostureScheduler:
             standing_percentage=standing_percentage,
             laying_percentage=laying_percentage,
             metadata={
+                "mode": "NORMAL",
                 "herd_size": herd_size,
                 "expected_cameras": expected_cameras,
                 "received_cameras": received_cameras,
@@ -414,9 +520,13 @@ class PostureScheduler:
         )
 
         logger.info(
+            "[POSTURE][MODE] inside_schedule=False mode=NORMAL"
+        )
+
+        logger.info(
             "[POSTURE][10MIN] Writing observation -> "
             "standing=%d feeding=%d laying=%d "
-            "standing%%=%.1f laying%%=%.1f",
+            "standing%%=%.1f laying%%=%.1f mode=NORMAL",
             avg_standing,
             avg_feeding,
             laying_count,
@@ -424,9 +534,61 @@ class PostureScheduler:
             laying_percentage,
         )
 
-        self.db.insert_observation(
-            observation
+        logger.info(
+            "[POSTURE FLUSH] standing=%d feeding=%d laying=%d",
+            avg_standing,
+            avg_feeding,
+            laying_count,
         )
+
+        self.db.insert_observation(observation)
 
         with self.pen_buffer.lock:
             self.pen_buffer.clear()
+
+    def _write_scheduled_milking_observation(
+        self,
+        observed_at: datetime,
+        schedule: dict,
+    ) -> None:
+        """
+        Write a synthetic MILKING posture row (all counts zero).
+        """
+
+        label = schedule.get("label", "Milking")
+
+        observation = PostureObservation(
+            farm_id=self.runtime_config["farm_id"],
+            zone_id=self.pen_rest_zone_id,
+            device_id=self.runtime_config["device_id"],
+            observed_at=observed_at,
+            standing_count=0,
+            feeding_count=0,
+            laying_count=0,
+            standing_percentage=0.0,
+            laying_percentage=0.0,
+            metadata={
+                "mode": "MILKING",
+                "reason": "scheduled_milking",
+                "inside_schedule": True,
+                "schedule_label": label,
+            },
+        )
+
+        logger.info(
+            "[POSTURE][MODE] inside_schedule=True "
+            "schedule_label=%s mode=MILKING reason=scheduled_milking",
+            label,
+        )
+
+        logger.info(
+            "[POSTURE][10MIN] Writing observation -> "
+            "standing=0 feeding=0 laying=0 "
+            "standing%%=0.0 laying%%=0.0 mode=MILKING"
+        )
+
+        logger.info(
+            "[POSTURE FLUSH] standing=0 feeding=0 laying=0"
+        )
+
+        self.db.insert_observation(observation)

@@ -46,6 +46,7 @@ from runtime.temporal_smoother import TemporalSmoother
 from runtime.video_stream import open_stream, _validate_gstreamer
 from posture.posture_detector import PostureDetector
 from posture.posture_scheduler import PostureScheduler
+from posture.milking_activity import set_milking_camera_active
 from posture.posture_db import PostureDB
 
 # GLOBAL RTSP START LOCK (prevents NVR overload)
@@ -139,8 +140,9 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.addHandler(queue_handler)
 logger.propagate = False  # Prevent duplicate logging
 
-# Route posture package logs (posture.*) through the same handler so
-# [POSTURE], [POSTURE DETECTOR], [SCHEDULER] logs appear in the journal/terminal.
+# Route posture package logs (posture.*) through the same handler.
+# INFO keeps only [POSTURE][1MIN], [POSTURE][10MIN], [POSTURE][DB];
+# per-detection ROI/RAW/SCHEDULER/SNAPSHOT stay at DEBUG.
 posture_logger = logging.getLogger("posture")
 posture_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 posture_logger.addHandler(queue_handler)
@@ -1606,6 +1608,7 @@ def _process_camera_impl(
 
             if zone_milking and sig == "START" and state["state"] == "INACTIVE":
                 state["state"] = "ACTIVE"
+                set_milking_camera_active(camera_id, True)
                 activity_start_ts = ts
                 state["activity_start_ts"] = activity_start_ts
                 state["session_id"] = bucket_session_id(
@@ -1645,11 +1648,13 @@ def _process_camera_impl(
                 except Exception as e:
                     logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
                 state["state"] = "INACTIVE"
+                set_milking_camera_active(camera_id, False)
                 state["session_id"] = None
                 state["last_frame_emit"] = 0.0
 
             elif state["state"] == "ACTIVE":
                 if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
+                    set_milking_camera_active(camera_id, True)
                     payload = build_event_payload(
                         "MILKING",
                         "FRAME_AGGREGATE",
