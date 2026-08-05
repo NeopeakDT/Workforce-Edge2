@@ -22,6 +22,7 @@ Operational notes:
 - Every event link runs `backfill_instance_schedule_date` + `normalize_instance_status_for_row`;
   each loop calls `normalize_null_instance_statuses` before commit (repairs historical NULL `status`).
 - Env `AGG_MAX_EVENT_AGE_SEC` (>0): skip stale events with `merge_processed` set so they are not retried forever.
+  Default `86400` (1 day). Set `0` to disable. This bounds the main fetch path (oldest-first).
 - Env `AGG_DISABLE_FALLBACK_INSTANCE_CREATE`: when truthy, skip synthetic INSERT in `resolve_fallback_instance_or_skip`.
 - Env `AGG_ENDED_RECOVERY_WINDOW_SEC`: optional override for late FRAME/END stitch into `ENDED` rows
   (see `ended_recovery_window_sec` for activity-type defaults; separate from live attach guard).
@@ -31,8 +32,8 @@ Operational notes:
   (`AGG_HISTORICAL_REPLAY_GAP_SEC`, default 1800s). When `event_age_sec > live_attach_guard_sec`,
   resolver skips live paths and uses replay mode only.
 - Periodic reconciliation: `AGG_RECONCILE_EVERY_LOOPS` (default 5) pulls NULL-linked events via
-  `retry_unlinked_events`; lookback `AGG_RECONCILE_LOOKBACK_DAYS` (default 7); batch `AGG_RECONCILE_BATCH_SIZE`.
-  Orphans stay retriable (`merge_processed` unchanged).
+  `retry_unlinked_events`; lookback `AGG_RECONCILE_LOOKBACK_DAYS` (default 1, float OK e.g. 0.5);
+  batch `AGG_RECONCILE_BATCH_SIZE`. Orphans stay retriable (`merge_processed` unchanged).
 - A MISSED row at `(farm_id, activity_schedule_id, activity_date)` blocks INSERT via unique index;
   START converts that row back to `IN_PROGRESS` instead of inserting another row.
 
@@ -175,8 +176,9 @@ SCHEDULE_BIND_GRACE_SEC = int(os.getenv("AGG_SCHEDULE_BIND_GRACE_SEC", "40"))
 UNSCHEDULED_CREATE_DELAY_SEC = int(os.getenv("AGG_UNSCHEDULED_CREATE_DELAY_SEC", "60"))
 STALE_START_SESSION_EVENT_MIN = int(os.getenv("AGG_STALE_START_SESSION_EVENT_MIN", "3"))
 SOFT_DEDUPE_WINDOW_SEC = int(os.getenv("AGG_SOFT_DEDUPE_WINDOW_SEC", "30"))
-# When > 0, skip processing events older than this many seconds (debug / backlog isolation).
-MAX_EVENT_AGE_SEC = int(os.getenv("AGG_MAX_EVENT_AGE_SEC", "0"))
+# When > 0, skip processing events older than this many seconds (marks merge_processed).
+# Default 1 day — matches AGG_RECONCILE_LOOKBACK_DAYS. Set 0 to disable age gate.
+MAX_EVENT_AGE_SEC = int(os.getenv("AGG_MAX_EVENT_AGE_SEC", "86400"))
 
 
 def historical_replay_gap_sec(activity_type_id: int) -> int:
@@ -1628,6 +1630,13 @@ def resolve_attachable_instance(
     return None
 
 
+def _reconcile_lookback_days(value=None) -> float:
+    """AGG_RECONCILE_LOOKBACK_DAYS: days of NULL-event requeue window (float, e.g. 0.5)."""
+    if value is not None:
+        return float(value)
+    return float(os.getenv("AGG_RECONCILE_LOOKBACK_DAYS", "1"))
+
+
 def retry_unlinked_events(cur, event_columns, limit=500, lookback_days=None):
     """
     Periodic reconciliation: NULL-linked events in lookback window get another attempt.
@@ -1637,8 +1646,7 @@ def retry_unlinked_events(cur, event_columns, limit=500, lookback_days=None):
     if "merge_processed" in event_columns:
         merge_clause = " AND COALESCE(e.merge_processed, FALSE) = FALSE"
 
-    if lookback_days is None:
-        lookback_days = int(os.getenv("AGG_RECONCILE_LOOKBACK_DAYS", "7"))
+    lookback_days = _reconcile_lookback_days(lookback_days)
 
     cur.execute(
         f"""
@@ -1863,10 +1871,14 @@ def run(max_loops=None):
     BATCH_SIZE = int(os.getenv("AGG_BATCH_SIZE", "500"))
     RECONCILE_EVERY_LOOPS = int(os.getenv("AGG_RECONCILE_EVERY_LOOPS", "5"))
     RECONCILE_BATCH_SIZE = int(os.getenv("AGG_RECONCILE_BATCH_SIZE", "500"))
-    RECONCILE_LOOKBACK_DAYS = int(os.getenv("AGG_RECONCILE_LOOKBACK_DAYS", "7"))
+    RECONCILE_LOOKBACK_DAYS = _reconcile_lookback_days()
     MAX_SESSION_AGE_SEC = int(os.getenv("AGG_MAX_SESSION_AGE_SEC", "3600"))
     PENDING_LOG_EVERY_LOOPS = int(os.getenv("AGG_PENDING_LOG_EVERY_LOOPS", "10"))
     loops = 0
+    print(
+        f"[AGGREGATOR] lookback_days={RECONCILE_LOOKBACK_DAYS} "
+        f"max_event_age_sec={MAX_EVENT_AGE_SEC}"
+    )
 
     # In-memory caching for performance
     # zone_cache: farm_id -> {(camera_id, activity_type_id): zone_id}
