@@ -84,11 +84,14 @@ load_dotenv(DOTENV_PATH)
 # Edge-side constants (standalone, no backend dependency)
 # ------------------------------------------------------------------
 FRAME_AGGREGATE_INTERVAL_SEC = 10  # seconds
-SCRAP_ACTIVE_BUFFER_SEC = float(os.getenv("SCRAP_ACTIVE_BUFFER_SEC", "20"))
+
+# Scrapping uses its own lightweight state machine.
+# YOLO confidence remains controlled by the model/inference configuration (0.65).
+SCRAP_START_CONFIRM_SEC = 5.0
+SCRAP_START_GAP_TOLERANCE_SEC = 2.0
+SCRAP_END_GRACE_SEC = 5.0
+
 FEED_ACTIVE_BUFFER_SEC = float(os.getenv("FEED_ACTIVE_BUFFER_SEC", "25"))
-# For long tools, use the lower segment as proxy for the tool head.
-# 0.85 means "point at 85% bbox height from top" (near bottom tip).
-SCRAP_TOOL_HEAD_Y_RATIO = float(os.getenv("SCRAP_TOOL_HEAD_Y_RATIO", "0.7"))
 
 API_BASE = os.getenv("EDGE_API_BASE")
 DEVICE_KEY = os.getenv("EDGE_DEVICE_KEY")
@@ -304,16 +307,6 @@ def get_fps_ffprobe(path):
 def build_event_payload(activity, event_type, camera_id, zone_id, detections, session_id):
     """
     Build event payload with mandatory event_id and session_id.
-    
-    Args:
-        activity: Activity type (SCRAPPING, FEEDING, MILKING)
-        event_type: Event type (START_CANDIDATE, FRAME_AGGREGATE, END_CANDIDATE)
-        camera_id: Camera identifier
-        detections: List of detections
-        session_id: UUID session identifier (must be provided)
-    
-    Returns:
-        Event payload dictionary
     """
     objects_dict = {}
     confidences = []
@@ -324,33 +317,29 @@ def build_event_payload(activity, event_type, camera_id, zone_id, detections, se
         confidences.append(conf)
         objects_dict.setdefault(cls, []).append({"id": f"{cls}_{idx}"})
 
-    # SCRAPPING sessions often have empty ROI-filtered detections while still ACTIVE; avoid
-    # all-empty `objects` on FRAME ticks so ingest/analytics keep continuity with the session.
-    metadata = None
-    if (
-        activity == "SCRAPPING"
-        and event_type == "FRAME_AGGREGATE"
-        and not objects_dict
-    ):
-        metadata = {"scrapping_sparse_frame": True}
-        objects_dict["edge_continuity_tick"] = [{"id": "scrapping_active_sparse"}]
-
     if event_type == "FRAME_AGGREGATE":
-        confidence = sum(confidences) / len(confidences) if confidences else 0.5
+        confidence = (
+            sum(confidences) / len(confidences)
+            if confidences
+            else 0.5
+        )
     elif event_type == "END_CANDIDATE":
         confidence = 0.7
     elif event_type == "START_CANDIDATE":
-        confidence = sum(confidences) / len(confidences) if confidences else 0.8
+        confidence = (
+            sum(confidences) / len(confidences)
+            if confidences
+            else 0.8
+        )
     else:
         confidence = 0.7
 
     now_utc = datetime.now(timezone.utc)
     event_time = now_utc.isoformat().replace("+00:00", "Z")
 
-    # Generate unique event_id and use it as idempotency_key
     event_id = str(uuid4())
 
-    out = {
+    return {
         "event_id": event_id,
         "session_id": session_id,
         "camera_id": str(camera_id),
@@ -364,9 +353,6 @@ def build_event_payload(activity, event_type, camera_id, zone_id, detections, se
         } if zone_id else None,
         "idempotency_key": event_id,
     }
-    if metadata is not None:
-        out["metadata"] = metadata
-    return out
 
 
 # ------------------------------------------------------------------
@@ -800,15 +786,59 @@ def resolve_zone_id(camera_cfg: dict, activity: str):
 # Activity logic
 # ------------------------------------------------------------------
 def detect_scrapping(detections, person_classes, tool_classes, max_dist):
-    persons = [d for d in detections if d["class"].lower() in person_classes]
-    tools = [d for d in detections if d["class"].lower() in tool_classes]
+    """
+    Detect real scrapping evidence.
 
-    for p in persons:
-        pc = bbox_center(p["bbox"])
-        for t in tools:
-            if euclidean(pc, bbox_center(t["bbox"])) <= max_dist:
-                return True
-    return False
+    A raw scrapping hit requires:
+      1. A person detection
+      2. A scrapping_tool / shovel detection
+      3. Person center within max_dist pixels of tool center
+
+    Confidence is intentionally NOT checked here.
+    YOLO/model inference already filters detections at the configured
+    confidence threshold (currently 0.65).
+
+    Returns:
+        (detected, evidence_detections)
+
+        detected:
+            True when a valid person+tool relationship exists.
+
+        evidence_detections:
+            The actual person + tool detections that caused the hit.
+    """
+    persons = [
+        d for d in (detections or [])
+        if str(d.get("class", "")).lower() in person_classes
+    ]
+
+    tools = [
+        d for d in (detections or [])
+        if str(d.get("class", "")).lower() in tool_classes
+    ]
+
+    for person in persons:
+        person_center = bbox_center(person["bbox"])
+
+        for tool in tools:
+            tool_center = bbox_center(tool["bbox"])
+
+            distance = euclidean(person_center, tool_center)
+
+            if distance <= max_dist:
+                logger.debug(
+                    "[SCRAP RAW HIT] person_conf=%.2f tool_conf=%.2f distance=%.1fpx "
+                    "person_bbox=%s tool_bbox=%s",
+                    float(person.get("confidence", 0.0)),
+                    float(tool.get("confidence", 0.0)),
+                    distance,
+                    person.get("bbox"),
+                    tool.get("bbox"),
+                )
+
+                return True, [person, tool]
+
+    return False, []
 
 
 def detect_cluster_udder_intersection(detections):
@@ -886,7 +916,6 @@ def _process_camera_impl(
         "tractor": None,
         "tmr_machine": None,
     }
-    last_seen_scrap_ts = None
     last_seen_feed_ts = None
 
     milking_camera = is_milking_camera(camera)
@@ -919,7 +948,6 @@ def _process_camera_impl(
             )
     else:
         wf_smoothers = {
-            "SCRAPPING": TemporalSmoother(start_sec=10, end_sec=30),
             "FEEDING": TemporalSmoother(start_sec=10, end_sec=30),
         }
         smoothers = wf_smoothers
@@ -928,6 +956,11 @@ def _process_camera_impl(
                 "state": "INACTIVE",
                 "session_id": None,
                 "last_frame_emit": 0.0,
+                "candidate_since": None,
+                "candidate_last_detected": None,
+                "last_real_detection": None,
+                "end_candidate_since": None,
+                "last_evidence_detections": [],
             },
             "FEEDING": {
                 "state": "INACTIVE",
@@ -1398,84 +1431,268 @@ def _process_camera_impl(
         now = time.time()
 
         # ------------------------------------------------------------------
-        # SCRAPPING / FEEDING — workforce pipeline only (isolated from milking)
+        # SCRAPPING — dedicated lightweight state machine
+        #
+        # Raw evidence:
+        #   person + scrapping_tool/shovel within max_dist
+        #
+        # Start:
+        #   real evidence confirmed for 5 seconds
+        #
+        # Tolerance:
+        #   during start confirmation, a detection gap <= 2 seconds
+        #   does not cancel the candidate
+        #
+        # End:
+        #   real evidence absent for 5 seconds
+        #
+        # No generic TemporalSmoother.
+        # No 20-second active buffer.
+        # No synthetic scrapping_active_sparse event.
         # ------------------------------------------------------------------
         if run_wf_pipeline:
-            scrapping_detected = detect_scrapping(
-                detections_scrap, person_classes, tool_classes, max_dist
-            )
-            if scrapping_detected:
-                last_seen_scrap_ts = ts
-            scrapping = (
-                last_seen_scrap_ts is not None
-                and (ts - last_seen_scrap_ts) < SCRAP_ACTIVE_BUFFER_SEC
-            )
-            sig = smoothers["SCRAPPING"].update(scrapping, ts)
+
             state = activity_state["SCRAPPING"]
 
-            # 1. START transition: INACTIVE -> ACTIVE
-            if zone_scrapping and sig == "START" and state["state"] == "INACTIVE":
-                state["state"] = "ACTIVE"
-                activity_start_ts = ts
-                state["activity_start_ts"] = activity_start_ts
-                state["session_id"] = bucket_session_id(
-                    "wf", camera_id, "SCRAPPING", activity_start_ts
-                )
-                state["last_frame_emit"] = 0.0
+            scrapping_detected, scrapping_evidence = detect_scrapping(
+                detections_scrap,
+                person_classes,
+                tool_classes,
+                max_dist,
+            )
 
-                payload = build_event_payload("SCRAPPING", "START_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
-                try:
-                    if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
+            # --------------------------------------------------------------
+            # REAL SCRAPPING DETECTION
+            # --------------------------------------------------------------
+            if scrapping_detected:
+                state["last_real_detection"] = ts
+                state["candidate_last_detected"] = ts
+
+                # Keep the actual evidence for START_CANDIDATE.
+                state["last_evidence_detections"] = scrapping_evidence
+
+            # --------------------------------------------------------------
+            # INACTIVE -> CANDIDATE
+            # --------------------------------------------------------------
+            if state["state"] == "INACTIVE":
+
+                if scrapping_detected:
+
+                    if state["candidate_since"] is None:
+                        state["candidate_since"] = ts
+
+                    state["end_candidate_since"] = None
+
+                    candidate_duration = (
+                        ts - state["candidate_since"]
+                    )
+
+                    if (
+                        zone_scrapping
+                        and candidate_duration >= SCRAP_START_CONFIRM_SEC
+                    ):
+
                         logger.info(
-                            "[EVENT] %s | %s | cam=%s | conf=%.2f",
-                            payload["activity_type"],
-                            payload["event_type"],
-                            payload["camera_id"],
-                            payload["confidence"],
+                            "[SCRAP START CONFIRMED] cam=%s duration=%.1fs",
+                            camera_id,
+                            candidate_duration,
                         )
-                    if EVENT_QUEUE.full():
-                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                    else:
-                        EVENT_QUEUE.put(payload, block=False)
-                except Exception as e:
-                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
 
-            # 2. END transition: ACTIVE -> INACTIVE
-            elif zone_scrapping and sig == "END" and state["state"] == "ACTIVE":
-                payload = build_event_payload("SCRAPPING", "END_CANDIDATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
-                try:
-                    if payload["event_type"] in ("START_CANDIDATE", "END_CANDIDATE"):
-                        logger.info(
-                            "[EVENT] %s | %s | cam=%s | conf=%.2f",
-                            payload["activity_type"],
-                            payload["event_type"],
-                            payload["camera_id"],
-                            payload["confidence"],
+                        state["state"] = "ACTIVE"
+
+                        activity_start_ts = ts
+                        state["activity_start_ts"] = activity_start_ts
+
+                        state["session_id"] = bucket_session_id(
+                            "wf",
+                            camera_id,
+                            "SCRAPPING",
+                            activity_start_ts,
                         )
-                    if EVENT_QUEUE.full():
-                        logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
-                    else:
-                        EVENT_QUEUE.put(payload, block=False)
-                except Exception as e:
-                    logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
 
-                state["state"] = "INACTIVE"
-                state["session_id"] = None
-                state["last_frame_emit"] = 0.0
+                        # Avoid FRAME_AGGREGATE on the same loop as START.
+                        state["last_frame_emit"] = now
 
-            # 3. FRAME_AGGREGATE
-            elif state["state"] == "ACTIVE":
-                if now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC:
-                    if zone_scrapping:
-                        payload = build_event_payload("SCRAPPING", "FRAME_AGGREGATE", camera_id, zone_scrapping, detections_scrap, state["session_id"])
+                        # Use the actual person + tool evidence that
+                        # established the activity.
+                        start_detections = (
+                            state["last_evidence_detections"]
+                            or detections_scrap
+                        )
+
+                        payload = build_event_payload(
+                            "SCRAPPING",
+                            "START_CANDIDATE",
+                            camera_id,
+                            zone_scrapping,
+                            start_detections,
+                            state["session_id"],
+                        )
+
                         try:
+                            logger.info(
+                                "[EVENT] %s | %s | cam=%s | conf=%.2f",
+                                payload["activity_type"],
+                                payload["event_type"],
+                                payload["camera_id"],
+                                payload["confidence"],
+                            )
+
                             if EVENT_QUEUE.full():
-                                logger.warning("[EDGE] EVENT_QUEUE FULL — dropping event")
+                                logger.warning(
+                                    "[EDGE] EVENT_QUEUE FULL — dropping event"
+                                )
                             else:
-                                EVENT_QUEUE.put(payload, block=False)
-                                state["last_frame_emit"] = now
+                                EVENT_QUEUE.put(
+                                    payload,
+                                    block=False,
+                                )
+
                         except Exception as e:
-                            logger.warning("[EDGE] Event queue full. Event dropped: %s", str(e)[:100])
+                            logger.warning(
+                                "[EDGE] Event queue full. Event dropped: %s",
+                                str(e)[:100],
+                            )
+
+                        # Candidate state no longer needed.
+                        state["candidate_since"] = None
+                        state["candidate_last_detected"] = None
+
+                else:
+                    # No current evidence.
+                    #
+                    # If a candidate existed very recently, allow a short
+                    # detection gap so a real scrape is not rejected because
+                    # YOLO missed a couple of frames.
+                    if (
+                        state["candidate_since"] is not None
+                        and state["candidate_last_detected"] is not None
+                    ):
+                        gap = ts - state["candidate_last_detected"]
+
+                        if gap > SCRAP_START_GAP_TOLERANCE_SEC:
+                            # Candidate was not confirmed.
+                            state["candidate_since"] = None
+                            state["candidate_last_detected"] = None
+                            state["last_evidence_detections"] = []
+
+            # --------------------------------------------------------------
+            # ACTIVE -> END CANDIDATE -> END
+            # --------------------------------------------------------------
+            elif state["state"] == "ACTIVE":
+
+                if scrapping_detected:
+
+                    # Real detection returned.
+                    state["end_candidate_since"] = None
+
+                else:
+
+                    if state["end_candidate_since"] is None:
+                        state["end_candidate_since"] = ts
+
+                    absence_duration = (
+                        ts - state["end_candidate_since"]
+                    )
+
+                    if (
+                        zone_scrapping
+                        and absence_duration >= SCRAP_END_GRACE_SEC
+                    ):
+
+                        logger.info(
+                            "[SCRAP END CONFIRMED] cam=%s absence=%.1fs",
+                            camera_id,
+                            absence_duration,
+                        )
+
+                        payload = build_event_payload(
+                            "SCRAPPING",
+                            "END_CANDIDATE",
+                            camera_id,
+                            zone_scrapping,
+                            detections_scrap,
+                            state["session_id"],
+                        )
+
+                        try:
+                            logger.info(
+                                "[EVENT] %s | %s | cam=%s | conf=%.2f",
+                                payload["activity_type"],
+                                payload["event_type"],
+                                payload["camera_id"],
+                                payload["confidence"],
+                            )
+
+                            if EVENT_QUEUE.full():
+                                logger.warning(
+                                    "[EDGE] EVENT_QUEUE FULL — dropping event"
+                                )
+                            else:
+                                EVENT_QUEUE.put(
+                                    payload,
+                                    block=False,
+                                )
+
+                        except Exception as e:
+                            logger.warning(
+                                "[EDGE] Event queue full. Event dropped: %s",
+                                str(e)[:100],
+                            )
+
+                        # Reset complete scrapping state.
+                        state["state"] = "INACTIVE"
+                        state["session_id"] = None
+                        state["last_frame_emit"] = 0.0
+                        state["candidate_since"] = None
+                        state["candidate_last_detected"] = None
+                        state["last_real_detection"] = None
+                        state["end_candidate_since"] = None
+                        state["last_evidence_detections"] = []
+
+            # --------------------------------------------------------------
+            # FRAME_AGGREGATE — telemetry only
+            # --------------------------------------------------------------
+            if state["state"] == "ACTIVE":
+
+                if (
+                    now - state["last_frame_emit"]
+                    >= FRAME_AGGREGATE_INTERVAL_SEC
+                ):
+
+                    if zone_scrapping:
+
+                        # Send only actual current detections.
+                        # If the current ROI is empty, objects will simply
+                        # be {}. No fake scrapping_active_sparse object.
+                        payload = build_event_payload(
+                            "SCRAPPING",
+                            "FRAME_AGGREGATE",
+                            camera_id,
+                            zone_scrapping,
+                            detections_scrap,
+                            state["session_id"],
+                        )
+
+                        try:
+
+                            if EVENT_QUEUE.full():
+                                logger.warning(
+                                    "[EDGE] EVENT_QUEUE FULL — dropping event"
+                                )
+                            else:
+                                EVENT_QUEUE.put(
+                                    payload,
+                                    block=False,
+                                )
+                                state["last_frame_emit"] = now
+
+                        except Exception as e:
+                            logger.warning(
+                                "[EDGE] Event queue full. Event dropped: %s",
+                                str(e)[:100],
+                            )
+
                     else:
                         state["last_frame_emit"] = now
 
