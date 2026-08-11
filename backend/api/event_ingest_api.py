@@ -23,7 +23,6 @@ from uuid import UUID
 from datetime import datetime, timedelta
 
 from psycopg2.extras import Json
-from psycopg2 import IntegrityError
 
 from common.db import get_cursor
 from common.time_utils import utc_now
@@ -137,45 +136,53 @@ def ingest_event(
         zone_id = payload.zones["primary"]
 
     with get_cursor() as cur:
-        try:
-            cur.execute(
-                """
-                INSERT INTO activity_detection_event (
-                    event_id,
-                    session_id,
-                    farm_id,
-                    device_id,
-                    camera_id,
-                    activity_type_id,
-                    event_type,
-                    event_time,
-                    ai_confidence,
-                    zone_id,
-                    payload,
-                    created_at
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    str(payload.event_id),
-                    str(payload.session_id),
-                    device_ctx["farm_id"],
-                    device_ctx["device_id"],
-                    str(payload.camera_id),
-                    activity_type_id,
-                    event_type_for_insert,
-                    payload.event_time,
-                    payload.confidence,
-                    zone_id,
-                    Json({
-                        "objects": payload.objects,
-                        "zones": payload.zones,
-                        "metadata": payload.metadata,
-                    }),
-                    utc_now(),
-                ),
+        # ON CONFLICT DO NOTHING instead of catching IntegrityError: the Jetson
+        # retry queue resubmits the same event_id verbatim after a request
+        # timeout (timeout-after-commit race), so duplicates here are expected.
+        # A caught exception still gets logged by Postgres as a raw 23505 even
+        # though the app handles it; ON CONFLICT never raises in the first place.
+        cur.execute(
+            """
+            INSERT INTO activity_detection_event (
+                event_id,
+                session_id,
+                farm_id,
+                device_id,
+                camera_id,
+                activity_type_id,
+                event_type,
+                event_time,
+                ai_confidence,
+                zone_id,
+                payload,
+                created_at
             )
-        except IntegrityError:
-            return {"status": "duplicate_ignored"}
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id
+            """,
+            (
+                str(payload.event_id),
+                str(payload.session_id),
+                device_ctx["farm_id"],
+                device_ctx["device_id"],
+                str(payload.camera_id),
+                activity_type_id,
+                event_type_for_insert,
+                payload.event_time,
+                payload.confidence,
+                zone_id,
+                Json({
+                    "objects": payload.objects,
+                    "zones": payload.zones,
+                    "metadata": payload.metadata,
+                }),
+                utc_now(),
+            ),
+        )
+        inserted = cur.fetchone()
+
+    if not inserted:
+        return {"status": "duplicate_ignored"}
 
     return {"status": "ok"}

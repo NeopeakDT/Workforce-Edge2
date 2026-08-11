@@ -57,7 +57,6 @@ import os
 import time
 from datetime import timedelta, datetime, timezone
 import pytz
-from psycopg2 import errors as pg_errors
 from psycopg2.extras import execute_values
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -569,6 +568,7 @@ def resolve_fallback_instance_or_skip(
             f"[ORPHAN_EVENT] skipped (fallback disabled) "
             f"event_row_id={event_row_id} type={fatal_label}"
         )
+        mark_event_skipped(cur, event_row_id, event_columns)
         return None
 
     within_ideal_window = False
@@ -585,78 +585,65 @@ def resolve_fallback_instance_or_skip(
             ideal_end_utc,
         )
 
-    cur.execute("SAVEPOINT fallback_instance_sp")
-    try:
-        cur.execute(
-            """
-            INSERT INTO activity_instance (
-                farm_id,
-                zone_id,
-                activity_type_id,
-                activity_schedule_id,
-                activity_date,
-                session_id,
-                status,
-                actual_start_at,
-                last_seen_at,
-                source,
-                within_ideal_window,
-                created_at,
-                updated_at
-            )
-            VALUES (%s,%s,%s,%s,%s,
-                    %s,
-                    'IN_PROGRESS',
-                    %s,%s,
-                    'AI',
-                    %s,
-                    %s,%s)
-            RETURNING id
-            """,
-            (
-                farm_id,
-                zone_id,
-                activity_type_id,
-                schedule_id,
-                activity_date,
-                session_id,
-                event_time,
-                event_time,
-                within_ideal_window,
-                utc_now(),
-                utc_now(),
-            ),
+    cur.execute(
+        """
+        INSERT INTO activity_instance (
+            farm_id,
+            zone_id,
+            activity_type_id,
+            activity_schedule_id,
+            activity_date,
+            session_id,
+            status,
+            actual_start_at,
+            last_seen_at,
+            source,
+            within_ideal_window,
+            created_at,
+            updated_at
         )
-        row = cur.fetchone()
-        cur.execute("RELEASE SAVEPOINT fallback_instance_sp")
+        VALUES (%s,%s,%s,%s,%s,
+                %s,
+                'IN_PROGRESS',
+                %s,%s,
+                'AI',
+                %s,
+                %s,%s)
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        """,
+        (
+            farm_id,
+            zone_id,
+            activity_type_id,
+            schedule_id,
+            activity_date,
+            session_id,
+            event_time,
+            event_time,
+            within_ideal_window,
+            utc_now(),
+            utc_now(),
+        ),
+    )
+    row = cur.fetchone()
+    if row:
         iid = row["id"]
         print(
             f"[FALLBACK_INSTANCE] created instance_id={iid} event_row_id={event_row_id} "
             f"reason={fatal_label}"
         )
         return iid
-    except pg_errors.UniqueViolation:
-        cur.execute("ROLLBACK TO SAVEPOINT fallback_instance_sp")
-        cur.execute("RELEASE SAVEPOINT fallback_instance_sp")
-        replay = is_historical_replay_event(event_time, activity_type_id)
-        if not replay:
-            alt = find_in_progress_bucket_attach(
-                cur,
-                farm_id,
-                zone_id,
-                activity_type_id,
-                activity_date,
-                schedule_id,
-                event_time,
-                event_row_id=event_row_id,
-            )
-            if alt:
-                print(
-                    f"[FALLBACK_INSTANCE] uniq race → reuse instance_id={alt} "
-                    f"event_row_id={event_row_id}"
-                )
-                return alt
-        hist_row = recover_historical_instance_attach(
+
+    # INSERT was skipped by ON CONFLICT -- any of the 4 unique indexes on
+    # activity_instance (uniq_active_instance, uq_missed_schedule_per_day,
+    # uniq_active_unscheduled_activity_per_zone, uq_activity_instance_session_id)
+    # could be the one that blocked it; which one doesn't change the recovery here.
+    # Fall through to the same reattach cascade as before, just without raising
+    # (and Postgres logging) a raw UniqueViolation to get here.
+    replay = is_historical_replay_event(event_time, activity_type_id)
+    if not replay:
+        alt = find_in_progress_bucket_attach(
             cur,
             farm_id,
             zone_id,
@@ -666,29 +653,46 @@ def resolve_fallback_instance_or_skip(
             event_time,
             event_row_id=event_row_id,
         )
-        if hist_row:
-            alt_hist = _attach_from_historical_row(
-                cur,
-                hist_row,
-                session_id,
-                farm_id,
-                activity_date,
-                zone_id,
-                activity_type_id,
-                schedule_id,
-                event_time,
+        if alt:
+            print(
+                f"[FALLBACK_INSTANCE] uniq race → reuse instance_id={alt} "
+                f"event_row_id={event_row_id}"
             )
-            if alt_hist:
-                print(
-                    f"[FALLBACK_INSTANCE] historical → reuse instance_id={alt_hist} "
-                    f"event_row_id={event_row_id}"
-                )
-                return alt_hist
-        print(
-            f"[ORPHAN_EVENT] event_row_id={event_row_id} type={fatal_label} "
-            "(UniqueViolation; no attach row)"
+            return alt
+    hist_row = recover_historical_instance_attach(
+        cur,
+        farm_id,
+        zone_id,
+        activity_type_id,
+        activity_date,
+        schedule_id,
+        event_time,
+        event_row_id=event_row_id,
+    )
+    if hist_row:
+        alt_hist = _attach_from_historical_row(
+            cur,
+            hist_row,
+            session_id,
+            farm_id,
+            activity_date,
+            zone_id,
+            activity_type_id,
+            schedule_id,
+            event_time,
         )
-        return None
+        if alt_hist:
+            print(
+                f"[FALLBACK_INSTANCE] historical → reuse instance_id={alt_hist} "
+                f"event_row_id={event_row_id}"
+            )
+            return alt_hist
+    print(
+        f"[ORPHAN_EVENT] event_row_id={event_row_id} type={fatal_label} "
+        "(insert conflicted; no attach row)"
+    )
+    mark_event_skipped(cur, event_row_id, event_columns)
+    return None
 
 
 # Timeout-driven closure control. END_CANDIDATE does not close sessions immediately.
@@ -2731,60 +2735,65 @@ def run(max_loops=None):
                                             queue_event_link(cur, e["event_row_id"], instance_id, event_links, schedule_id=schedule_id, activity_date=activity_date)
                                             continue
 
-                                cur.execute("SAVEPOINT ai_insert_sp")
-                                try:
-                                    cur.execute(
-                                        """
-                                        INSERT INTO activity_instance (
-                                            farm_id,
-                                            zone_id,
-                                            activity_type_id,
-                                            activity_schedule_id,
-                                            activity_date,
-                                            session_id,
-                                            status,
-                                            actual_start_at,
-                                            last_seen_at,
-                                            source,
-                                            within_ideal_window,
-                                            created_at,
-                                            updated_at
-                                        )
-                                        VALUES (%s,%s,%s,%s,%s,
-                                                %s,
-                                                'IN_PROGRESS',
-                                                %s,%s,
-                                                'AI',
-                                                %s,
-                                                %s,%s)
-                                        RETURNING id
-                                        """,
-                                        (
-                                            farm_id,
-                                            zone_id,
-                                            activity_type_id,
-                                            schedule_id,
-                                            activity_date,
-                                            session_id,
-                                            event_time,
-                                            event_time,
-                                            within_ideal_window,
-                                            utc_now(),
-                                            utc_now(),
-                                        ),
+                                cur.execute(
+                                    """
+                                    INSERT INTO activity_instance (
+                                        farm_id,
+                                        zone_id,
+                                        activity_type_id,
+                                        activity_schedule_id,
+                                        activity_date,
+                                        session_id,
+                                        status,
+                                        actual_start_at,
+                                        last_seen_at,
+                                        source,
+                                        within_ideal_window,
+                                        created_at,
+                                        updated_at
                                     )
-                                    instance_id = cur.fetchone()["id"]
-                                    cur.execute("RELEASE SAVEPOINT ai_insert_sp")
+                                    VALUES (%s,%s,%s,%s,%s,
+                                            %s,
+                                            'IN_PROGRESS',
+                                            %s,%s,
+                                            'AI',
+                                            %s,
+                                            %s,%s)
+                                    ON CONFLICT DO NOTHING
+                                    RETURNING id
+                                    """,
+                                    (
+                                        farm_id,
+                                        zone_id,
+                                        activity_type_id,
+                                        schedule_id,
+                                        activity_date,
+                                        session_id,
+                                        event_time,
+                                        event_time,
+                                        within_ideal_window,
+                                        utc_now(),
+                                        utc_now(),
+                                    ),
+                                )
+                                _new_row = cur.fetchone()
+                                if _new_row:
+                                    instance_id = _new_row["id"]
                                     print(
                                         f"[DEBUG] CREATED-NEW → instance_id={instance_id} "
                                         f"schedule_id={schedule_id}"
                                     )
-                                except pg_errors.UniqueViolation as ex:
-                                    cur.execute("ROLLBACK TO SAVEPOINT ai_insert_sp")
-                                    cur.execute("RELEASE SAVEPOINT ai_insert_sp")
+                                else:
+                                    # INSERT was skipped by ON CONFLICT -- any of the 4 unique
+                                    # indexes on activity_instance could be the one that blocked
+                                    # it (uniq_active_instance, uq_missed_schedule_per_day,
+                                    # uniq_active_unscheduled_activity_per_zone,
+                                    # uq_activity_instance_session_id). Fall through to the same
+                                    # reattach cascade as before, without raising (and Postgres
+                                    # logging) a raw UniqueViolation to get here.
                                     print(
-                                        f"[RECOVERY] uniq_active_instance hit "
-                                        f"session={session_id}: {ex}"
+                                        f"[RECOVERY] insert conflicted "
+                                        f"session={session_id}"
                                     )
 
                                     replay_uv = is_historical_replay_event(
@@ -2873,7 +2882,7 @@ def run(max_loops=None):
                                         )
                                         continue
 
-                                    print(f"[WARN] UniqueViolation — no bucket IN_PROGRESS row: {ex}")
+                                    print("[WARN] insert conflicted — no bucket IN_PROGRESS row")
 
                                     cur.execute(
                                         """
@@ -3283,6 +3292,7 @@ def run(max_loops=None):
                                     f"event_id={e['event_row_id']} "
                                     f"event_type={etype}"
                                 )
+                                mark_event_skipped(cur, e["event_row_id"], event_columns)
                                 continue
 
                         cur.execute(
@@ -3462,6 +3472,7 @@ def run(max_loops=None):
                                 f"event_id={e['event_row_id']} "
                                 f"event_type={etype}"
                             )
+                            mark_event_skipped(cur, e["event_row_id"], event_columns)
                             continue
                         actual_start_at = row["actual_start_at"]
 
