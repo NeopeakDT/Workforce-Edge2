@@ -170,7 +170,7 @@ def reopen_missed_activity_instance(
     return row["id"] if row else None
 
 
-MAX_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(90 * 60)))
+MAX_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(120 * 60)))
 MAX_EVENT_DELAY_SEC = int(os.getenv("AGG_MAX_EVENT_DELAY_SEC", "300"))
 SCHEDULE_BIND_GRACE_SEC = int(os.getenv("AGG_SCHEDULE_BIND_GRACE_SEC", "40"))
 UNSCHEDULED_CREATE_DELAY_SEC = int(os.getenv("AGG_UNSCHEDULED_CREATE_DELAY_SEC", "60"))

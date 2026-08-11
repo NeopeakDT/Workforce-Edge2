@@ -45,7 +45,7 @@ from common.time_utils import utc_now
 # CONFIG
 # --------------------------------------------------
 
-MAX_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(90 * 60)))
+MAX_ACTIVITY_DURATION_SEC = int(os.getenv("AGG_MAX_ACTIVITY_DURATION_SEC", str(120 * 60)))
 MIN_ON_TIME_OVERLAP_SEC = int(os.getenv("AGG_MIN_ON_TIME_OVERLAP_SEC", "60"))
 STABLE_END_DELAY_SEC = int(
     os.getenv(
