@@ -80,7 +80,7 @@ Config comes from `jetson/config/local_cache.json` (gitignored, fetched at boot 
 
 Cross-cutting pieces live in `common/`: `db.py` (lazy-initialized `psycopg2` connection pool over `DATABASE_URL`, `get_cursor()` context manager returning dict rows), `auth.py` (Supabase ES256 JWT verification via JWKS, for human/dashboard auth), `device_auth.py` (separate **machine** auth — `X-DEVICE-KEY` header hashed with SHA-256 and matched against `edge_device.api_key_hash`; this is distinct from `auth.py`'s user JWT flow), `time_utils.py`, `constants.py` (frozen timing parameters — don't casually retune), `audit_logger.py`, `idempotency.py`.
 
-Database schema evolves via sequential `backend/STEP{N}_*.sql` migration files, applied by hand/ops process — there's no migration tool/ORM. Read the relevant `STEP*.sql` before assuming a column/table exists.
+Database schema evolves via sequential `backend/STEP{N}_*.sql` migration files, applied by hand/ops process — there's no migration tool/ORM. `STEP1_DATABASE_BASELINE.sql` is a full non-incremental snapshot of the live schema (reconstructed via `pg_dump --schema-only` in Aug 2026, since the original incremental history predating it was never committed); later STEP files are additive `ALTER TABLE` migrations on top of it. Read the relevant `STEP*.sql` before assuming a column/table exists.
 
 ### Jetson: capture → detect → emit, no lifecycle decisions on-device
 
