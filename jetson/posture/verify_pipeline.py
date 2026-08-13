@@ -103,8 +103,9 @@ def verify_scheduler_to_db(cfg: dict):
       )
       scheduler.current_minute_samples[sample.camera_id] = sample
 
-    scheduler.build_minute_snapshot()
-    scheduler._clear_minute_window()
+    samples = scheduler._take_minute_window()
+    assert samples is not None
+    scheduler.build_minute_snapshot(samples)
 
   assert scheduler.total_samples == 10, (
     f"expected 10 minute snapshots, got {scheduler.total_samples}"
@@ -177,7 +178,7 @@ def verify_process_frame_wiring(cfg: dict):
     )
   }
   scheduler.current_minute_started_at = 0.0
-  scheduler._maybe_finalize_minute(time.time())
+  scheduler._maybe_finalize_minute(time.monotonic())
 
   assert scheduler.total_samples == 2
   print("  OK partial minute snapshot (1/3 cameras, fault-tolerant)")

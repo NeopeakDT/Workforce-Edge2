@@ -93,7 +93,13 @@ class PostureScheduler:
 
         self.last_flush: Optional[datetime] = None
 
-        # Serialize flush across concurrent posture camera threads.
+        # Serialize access to the current per-camera snapshot window.
+        self._minute_lock = Lock()
+
+        # Serialize scheduled milking state transitions.
+        self._milking_state_lock = Lock()
+
+        # Serialize pen-buffer flush / DB writes.
         self._flush_lock = Lock()
 
         # True while inside a scheduled milking window (cleared once on enter).
@@ -189,18 +195,29 @@ class PostureScheduler:
 
         camera_id = camera["camera_id"]
 
-        now_mono = time.time()
+        # Monotonic clock is used only for interval/duration calculations.
+        now_mono = time.monotonic()
+
         observed_at = datetime.now(timezone.utc)
 
         schedule = self._active_milking_schedule(observed_at)
+
         if schedule is not None:
-            if not self._in_milking_window:
-                self._in_milking_window = True
+            with self._milking_state_lock:
+                entering_milking = not self._in_milking_window
+
+                if entering_milking:
+                    self._in_milking_window = True
+
+            if entering_milking:
                 self._clear_minute_window()
+
                 with self.pen_buffer.lock:
                     self.pen_buffer.clear()
+
                 if self.last_flush is None:
                     self.last_flush = observed_at
+
                 logger.info(
                     "[POSTURE] Entered scheduled milking window: %s",
                     schedule.get("label"),
@@ -209,12 +226,18 @@ class PostureScheduler:
             self.flush_if_due()
             return
 
-        if self._in_milking_window:
-            self._in_milking_window = False
+        with self._milking_state_lock:
+            leaving_milking = self._in_milking_window
+
+            if leaving_milking:
+                self._in_milking_window = False
+
+        if leaving_milking:
             logger.info(
                 "[POSTURE] Left scheduled milking window; resuming posture"
             )
 
+        # Finalize an expired partial snapshot before collecting this frame.
         self._maybe_finalize_minute(now_mono)
 
         last = self.last_sample.get(camera_id, 0.0)
@@ -224,6 +247,7 @@ class PostureScheduler:
 
         self.last_sample[camera_id] = now_mono
 
+        # YOLO inference happens OUTSIDE _minute_lock.
         sample = self.detector.detect(
             frame,
             camera,
@@ -232,53 +256,117 @@ class PostureScheduler:
             observed_at,
         )
 
-        if not self.current_minute_samples:
-            self.current_minute_started_at = now_mono
+        snapshot_to_build = None
 
-        logger.debug(
-            "[SCHEDULER] %s standing=%d feeding=%d",
-            sample.camera_code,
-            sample.standing_count,
-            sample.feeding_count,
-        )
+        with self._minute_lock:
+            if not self.current_minute_samples:
+                self.current_minute_started_at = now_mono
 
-        self.current_minute_samples[sample.camera_id] = sample
+            logger.debug(
+                "[SCHEDULER] %s standing=%d feeding=%d",
+                sample.camera_code,
+                sample.standing_count,
+                sample.feeding_count,
+            )
 
-        if len(self.current_minute_samples) == len(self.posture_camera_ids):
+            self.current_minute_samples[sample.camera_id] = sample
 
-            self.build_minute_snapshot()
+            if len(self.current_minute_samples) == len(
+                self.posture_camera_ids
+            ):
+                snapshot_to_build = self._take_minute_window_locked()
 
-            self._clear_minute_window()
+        # Build snapshot OUTSIDE _minute_lock.
+        if snapshot_to_build is not None:
+            self.build_minute_snapshot(snapshot_to_build)
 
         self.flush_if_due()
 
     def _maybe_finalize_minute(self, now_mono: float):
         """
-        Finalize a partial minute when the window expires.
+        Finalize a partial snapshot when the window expires.
+
+        The current snapshot state is detached atomically under _minute_lock.
+        Snapshot construction happens after releasing the lock.
+        """
+
+        snapshot_to_build = None
+
+        with self._minute_lock:
+            if not self.current_minute_samples:
+                return
+
+            if self.current_minute_started_at is None:
+                return
+
+            if (
+                now_mono - self.current_minute_started_at
+            ) < self.SAMPLE_INTERVAL_SECONDS:
+                return
+
+            snapshot_to_build = self._take_minute_window_locked()
+
+        if snapshot_to_build is not None:
+            self.build_minute_snapshot(snapshot_to_build)
+
+    def _take_minute_window(self) -> Optional[Dict[str, PostureSample]]:
+        """
+        Atomically detach the current snapshot window.
+
+        The shared minute-window state is copied and cleared while holding
+        _minute_lock. Snapshot construction happens after the lock is released.
+        """
+
+        with self._minute_lock:
+            if not self.current_minute_samples:
+                return None
+
+            samples = dict(self.current_minute_samples)
+
+            self.current_minute_samples.clear()
+            self.current_minute_started_at = None
+
+            return samples
+
+    def _take_minute_window_locked(
+        self,
+    ) -> Optional[Dict[str, PostureSample]]:
+        """
+        Detach the current snapshot window.
+
+        Caller MUST already hold _minute_lock.
         """
 
         if not self.current_minute_samples:
-            return
+            return None
 
-        if self.current_minute_started_at is None:
-            return
+        samples = dict(self.current_minute_samples)
 
-        if (
-            now_mono - self.current_minute_started_at
-        ) < self.SAMPLE_INTERVAL_SECONDS:
-            return
-
-        self.build_minute_snapshot()
-
-        self._clear_minute_window()
-
-    def _clear_minute_window(self):
         self.current_minute_samples.clear()
         self.current_minute_started_at = None
 
-    def build_minute_snapshot(self):
+        return samples
+
+    def _clear_minute_window(self):
+        """
+        Safely discard the current snapshot window.
+
+        This is retained for state-reset paths such as scheduled milking.
+        """
+
+        with self._minute_lock:
+            self.current_minute_samples.clear()
+            self.current_minute_started_at = None
+
+    def build_minute_snapshot(
+        self,
+        samples: Dict[str, PostureSample],
+    ):
         """
         Merge all camera samples for this minute into one snapshot.
+
+        `samples` is an immutable snapshot of the shared minute-window state.
+        The caller must not modify it while this method is running.
         """
 
         standing = 0
@@ -286,7 +374,7 @@ class PostureScheduler:
         detected_laying = 0
         camera_breakdown: Dict[str, dict] = {}
 
-        for sample in self.current_minute_samples.values():
+        for sample in samples.values():
 
             standing += sample.standing_count
             feeding += sample.feeding_count
@@ -299,7 +387,7 @@ class PostureScheduler:
             }
 
         expected = len(self.posture_camera_ids)
-        received = len(self.current_minute_samples)
+        received = len(samples)
 
         if received < expected:
 
@@ -311,12 +399,12 @@ class PostureScheduler:
 
         herd_size = max(
             s.herd_size
-            for s in self.current_minute_samples.values()
+            for s in samples.values()
         )
 
         observed_at = max(
             s.observed_at
-            for s in self.current_minute_samples.values()
+            for s in samples.values()
         )
 
         snapshot = MinuteAggregation(
