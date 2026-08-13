@@ -87,9 +87,9 @@ FRAME_AGGREGATE_INTERVAL_SEC = 10  # seconds
 
 # Scrapping uses its own lightweight state machine.
 # YOLO confidence remains controlled by the model/inference configuration (0.65).
-SCRAP_START_CONFIRM_SEC = 5.0
+SCRAP_START_CONFIRM_SEC = 3.0
 SCRAP_START_GAP_TOLERANCE_SEC = 2.0
-SCRAP_END_GRACE_SEC = 5.0
+SCRAP_END_GRACE_SEC = 30.0
 
 FEED_ACTIVE_BUFFER_SEC = float(os.getenv("FEED_ACTIVE_BUFFER_SEC", "25"))
 
@@ -1577,28 +1577,88 @@ def _process_camera_impl(
                             state["last_evidence_detections"] = []
 
             # --------------------------------------------------------------
-            # ACTIVE -> END CANDIDATE -> END
+            # ACTIVE -> FRAME_AGGREGATE -> END CANDIDATE -> END
             # --------------------------------------------------------------
             elif state["state"] == "ACTIVE":
 
+                # ----------------------------------------------------------
+                # 1. REAL SCRAPPING DETECTION
+                # ----------------------------------------------------------
                 if scrapping_detected:
 
-                    # Real detection returned.
+                    # Detection returned.
+                    # Cancel any pending END candidate.
                     state["end_candidate_since"] = None
 
                 else:
 
+                    # No current scrapping evidence.
+                    # Start / continue the END grace timer.
                     if state["end_candidate_since"] is None:
                         state["end_candidate_since"] = ts
+
+                # ----------------------------------------------------------
+                # 2. FRAME_AGGREGATE
+                #
+                # IMPORTANT:
+                # Check FRAME before finalizing END.
+                #
+                # This guarantees that if a FRAME interval is reached on
+                # the same processing iteration as END confirmation, the
+                # FRAME is emitted first while the session is still ACTIVE.
+                # ----------------------------------------------------------
+                if (
+                    state["state"] == "ACTIVE"
+                    and zone_scrapping
+                    and now - state["last_frame_emit"] >= FRAME_AGGREGATE_INTERVAL_SEC
+                ):
+
+                    payload = build_event_payload(
+                        "SCRAPPING",
+                        "FRAME_AGGREGATE",
+                        camera_id,
+                        zone_scrapping,
+                        detections_scrap,
+                        state["session_id"],
+                    )
+
+                    try:
+
+                        if EVENT_QUEUE.full():
+                            logger.warning(
+                                "[EDGE] EVENT_QUEUE FULL — dropping FRAME_AGGREGATE"
+                            )
+                        else:
+                            EVENT_QUEUE.put(
+                                payload,
+                                block=False,
+                            )
+
+                            state["last_frame_emit"] = now
+
+                    except Exception as e:
+                        logger.warning(
+                            "[EDGE] FRAME_AGGREGATE queue error: %s",
+                            str(e)[:100],
+                        )
+
+                # ----------------------------------------------------------
+                # 3. END CONFIRMATION
+                #
+                # Only end the activity after 30 seconds of continuous
+                # absence of valid scrapping evidence.
+                # ----------------------------------------------------------
+                if (
+                    state["state"] == "ACTIVE"
+                    and zone_scrapping
+                    and state["end_candidate_since"] is not None
+                ):
 
                     absence_duration = (
                         ts - state["end_candidate_since"]
                     )
 
-                    if (
-                        zone_scrapping
-                        and absence_duration >= SCRAP_END_GRACE_SEC
-                    ):
+                    if absence_duration >= SCRAP_END_GRACE_SEC:
 
                         logger.info(
                             "[SCRAP END CONFIRMED] cam=%s absence=%.1fs",
@@ -1616,6 +1676,7 @@ def _process_camera_impl(
                         )
 
                         try:
+
                             logger.info(
                                 "[EVENT] %s | %s | cam=%s | conf=%.2f",
                                 payload["activity_type"],
@@ -1626,7 +1687,7 @@ def _process_camera_impl(
 
                             if EVENT_QUEUE.full():
                                 logger.warning(
-                                    "[EDGE] EVENT_QUEUE FULL — dropping event"
+                                    "[EDGE] EVENT_QUEUE FULL — dropping END_CANDIDATE"
                                 )
                             else:
                                 EVENT_QUEUE.put(
@@ -1636,11 +1697,13 @@ def _process_camera_impl(
 
                         except Exception as e:
                             logger.warning(
-                                "[EDGE] Event queue full. Event dropped: %s",
+                                "[EDGE] END_CANDIDATE queue error: %s",
                                 str(e)[:100],
                             )
 
+                        # --------------------------------------------------
                         # Reset complete scrapping state.
+                        # --------------------------------------------------
                         state["state"] = "INACTIVE"
                         state["session_id"] = None
                         state["last_frame_emit"] = 0.0
@@ -1649,52 +1712,6 @@ def _process_camera_impl(
                         state["last_real_detection"] = None
                         state["end_candidate_since"] = None
                         state["last_evidence_detections"] = []
-
-            # --------------------------------------------------------------
-            # FRAME_AGGREGATE — telemetry only
-            # --------------------------------------------------------------
-            if state["state"] == "ACTIVE":
-
-                if (
-                    now - state["last_frame_emit"]
-                    >= FRAME_AGGREGATE_INTERVAL_SEC
-                ):
-
-                    if zone_scrapping:
-
-                        # Send only actual current detections.
-                        # If the current ROI is empty, objects will simply
-                        # be {}. No fake scrapping_active_sparse object.
-                        payload = build_event_payload(
-                            "SCRAPPING",
-                            "FRAME_AGGREGATE",
-                            camera_id,
-                            zone_scrapping,
-                            detections_scrap,
-                            state["session_id"],
-                        )
-
-                        try:
-
-                            if EVENT_QUEUE.full():
-                                logger.warning(
-                                    "[EDGE] EVENT_QUEUE FULL — dropping event"
-                                )
-                            else:
-                                EVENT_QUEUE.put(
-                                    payload,
-                                    block=False,
-                                )
-                                state["last_frame_emit"] = now
-
-                        except Exception as e:
-                            logger.warning(
-                                "[EDGE] Event queue full. Event dropped: %s",
-                                str(e)[:100],
-                            )
-
-                    else:
-                        state["last_frame_emit"] = now
 
             # FEEDING — motion-based detection
             feeding_detected = False

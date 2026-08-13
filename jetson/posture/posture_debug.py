@@ -38,8 +38,8 @@ from runtime.video_stream import open_stream  # noqa: E402
 # CONFIG
 ##############################################################
 
-VIDEO_SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2201"
-CAMERA_CODE = "grp1-front-right"
+VIDEO_SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2301"
+CAMERA_CODE = "grp1-front-left"
 
 MODEL_PATH = REPO / "models" / "cow_posture_v1.1_best.pt"
 

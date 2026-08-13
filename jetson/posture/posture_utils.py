@@ -213,8 +213,8 @@ def assign_detection_to_zone(
                 rest_overlap = overlap
                 rest_zone = zone
 
-    # Temporary debug: confirm whether FEEDING ROI ever intersects bboxes.
-    logger.info(
+    # Per-detection ROI detail — DEBUG only (too chatty for INFO/journal).
+    logger.debug(
         "[POSTURE][ROI_DEBUG] camera=%s "
         "bbox=%s "
         "feeding_zone=%s "
@@ -246,8 +246,8 @@ def assign_detection_to_zone(
         final_zone = "REST"
         final_zone_id = rest_zone["zone_id"]
 
-    # Temporary debug: inspect real overlaps before changing thresholds.
-    logger.info(
+    # Per-detection ROI assignment — DEBUG only (use [POSTURE][1MIN] at INFO).
+    logger.debug(
         "[POSTURE][ROI] "
         "camera=%s "
         "feeding_overlap=%.2f (threshold=%.2f) "
