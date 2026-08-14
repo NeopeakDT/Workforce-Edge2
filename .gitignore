@@ -67,3 +67,5 @@ jetson/config/local_cache(OLD).json
 
 #Default Mac file
 .DS_Store
+
+.vscode/settings.json

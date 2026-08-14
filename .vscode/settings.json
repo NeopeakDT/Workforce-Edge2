@@ -1,3 +1,4 @@
 {
-    "workbench.colorTheme": "Light Modern"
+    "workbench.colorTheme": "Light Modern",
+    "claudeCode.useTerminal": true
 }
