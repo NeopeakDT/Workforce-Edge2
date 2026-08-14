@@ -1,9 +1,17 @@
 """
 Farm-level milking activity registry.
 
-Updated by the milking camera pipeline in edge_detector via heartbeats
-(START + FRAME_AGGREGATE while ACTIVE). Read by PostureScheduler to decide
-whether posture observations should enter MILKING mode.
+
+Updated by the milking camera pipeline via START and FRAME_AGGREGATE
+heartbeats while milking activity is active.
+
+
+Provides live milking activity state for consumers that explicitly
+need it.
+
+
+PostureScheduler currently uses configured milking schedules as the
+authoritative MILKING mode boundary and does not depend on this registry.
 """
 
 from __future__ import annotations
