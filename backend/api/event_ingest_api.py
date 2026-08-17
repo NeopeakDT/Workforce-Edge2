@@ -74,6 +74,47 @@ def resolve_activity_type_id(code: str) -> int:
     return row["id"]
 
 
+_camera_farm_cache: dict = {}
+
+
+def resolve_camera_farm_id(camera_id: str) -> Optional[str]:
+    """Look up which farm owns this camera, so a device's payload-supplied
+    camera_id can be checked against its server-derived farm_id (device_ctx)
+    before insert. Cached like _activity_type_cache — cameras are rarely
+    reassigned across farms."""
+    if camera_id in _camera_farm_cache:
+        return _camera_farm_cache[camera_id]
+
+    with get_cursor() as cur:
+        cur.execute("SELECT farm_id FROM farm_camera WHERE id = %s", (camera_id,))
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    _camera_farm_cache[camera_id] = str(row["farm_id"])
+    return _camera_farm_cache[camera_id]
+
+
+_zone_farm_cache: dict = {}
+
+
+def resolve_zone_farm_id(zone_id: str) -> Optional[str]:
+    """Same check as resolve_camera_farm_id, for the optional zone_id."""
+    if zone_id in _zone_farm_cache:
+        return _zone_farm_cache[zone_id]
+
+    with get_cursor() as cur:
+        cur.execute("SELECT farm_id FROM farm_zone WHERE id = %s", (zone_id,))
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    _zone_farm_cache[zone_id] = str(row["farm_id"])
+    return _zone_farm_cache[zone_id]
+
+
 def rate_exceeded(camera_id: str):
     if MAX_EVENTS_PER_CAMERA_PER_MIN <= 0:
         return False, None
@@ -107,7 +148,19 @@ def ingest_event(
 
     validate_utc(payload.event_time)
     activity_type_id = resolve_activity_type_id(payload.activity_type)
-    
+
+    # Camera identity is client-supplied; farm/device identity is not. Confirm
+    # this camera actually belongs to the authenticated device's farm before
+    # inserting — otherwise a misconfigured/compromised device key for one
+    # farm could write events tagged with another farm's camera_id.
+    camera_farm_id = resolve_camera_farm_id(str(payload.camera_id))
+    if camera_farm_id is None:
+        raise HTTPException(400, f"Unknown camera_id {payload.camera_id}")
+    if camera_farm_id != str(device_ctx["farm_id"]):
+        raise HTTPException(
+            400, "camera_id does not belong to the authenticated device's farm"
+        )
+
     # Normalize lifecycle so aggregation always begins from START_CANDIDATE.
     incoming_event_type = (payload.event_type or "").strip().upper()
     event_type_for_insert = (
@@ -134,6 +187,15 @@ def ingest_event(
     zone_id = None
     if payload.zones and "primary" in payload.zones:
         zone_id = payload.zones["primary"]
+
+    if zone_id is not None:
+        zone_farm_id = resolve_zone_farm_id(str(zone_id))
+        if zone_farm_id is None:
+            raise HTTPException(400, f"Unknown zone_id {zone_id}")
+        if zone_farm_id != str(device_ctx["farm_id"]):
+            raise HTTPException(
+                400, "zone_id does not belong to the authenticated device's farm"
+            )
 
     with get_cursor() as cur:
         # ON CONFLICT DO NOTHING instead of catching IntegrityError: the Jetson

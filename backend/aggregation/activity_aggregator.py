@@ -31,6 +31,13 @@ Operational notes:
   Historical replay uses nearest-neighbor on `activity_date` then bounded contiguity
   (`AGG_HISTORICAL_REPLAY_GAP_SEC`, default 1800s). When `event_age_sec > live_attach_guard_sec`,
   resolver skips live paths and uses replay mode only.
+- Env `AGG_PER_FARM_BATCH_CAP` (default 150): caps how many rows a single farm can contribute to one
+  fetched batch (main fetch and `retry_unlinked_events`), via a `ROW_NUMBER() OVER (PARTITION BY farm_id ...)`
+  filter. Prevents one farm's backlog from starving another farm's events out of every batch
+  (head-of-line blocking) when multiple farms are unlinked-event-eligible at once. The cap only
+  activates once 2+ distinct farms have eligible rows in the fetch (via a `COUNT(DISTINCT farm_id)`
+  check) — with a single farm, or when a farm's pending count is below the cap, it's a no-op and the
+  full `AGG_BATCH_SIZE` is available to that farm.
 - Periodic reconciliation: `AGG_RECONCILE_EVERY_LOOPS` (default 5) pulls NULL-linked events via
   `retry_unlinked_events`; lookback `AGG_RECONCILE_LOOKBACK_DAYS` (default 1, float OK e.g. 0.5);
   batch `AGG_RECONCILE_BATCH_SIZE`. Orphans stay retriable (`merge_processed` unchanged).
@@ -1641,40 +1648,72 @@ def _reconcile_lookback_days(value=None) -> float:
     return float(os.getenv("AGG_RECONCILE_LOOKBACK_DAYS", "1"))
 
 
+def _per_farm_batch_cap() -> int:
+    """AGG_PER_FARM_BATCH_CAP: max rows one farm can contribute to a single
+    fetched batch, so a backlogged farm can't starve other farms' events out
+    of every loop iteration (head-of-line blocking)."""
+    return int(os.getenv("AGG_PER_FARM_BATCH_CAP", "150"))
+
+
 def retry_unlinked_events(cur, event_columns, limit=500, lookback_days=None):
     """
     Periodic reconciliation: NULL-linked events in lookback window get another attempt.
     Does not set merge_processed on failure so retries remain possible.
+    Fair across farms: once 2+ farms have eligible rows in this window, each farm
+    contributes at most AGG_PER_FARM_BATCH_CAP rows (see _per_farm_batch_cap) before
+    the overall `limit` is applied. No-op (full `limit` available) when only one
+    farm has eligible rows.
     """
     merge_clause = ""
     if "merge_processed" in event_columns:
         merge_clause = " AND COALESCE(e.merge_processed, FALSE) = FALSE"
 
     lookback_days = _reconcile_lookback_days(lookback_days)
+    per_farm_cap = _per_farm_batch_cap()
 
     cur.execute(
         f"""
+        WITH eligible AS (
+            SELECT
+                e.event_id,
+                e.id AS event_row_id,
+                e.event_type,
+                e.event_time,
+                e.farm_id,
+                e.device_id,
+                e.camera_id,
+                e.activity_type_id,
+                e.session_id,
+                e.zone_id,
+                e.ai_confidence,
+                e.payload
+            FROM activity_detection_event e
+            WHERE e.activity_instance_id IS NULL
+              AND e.event_time >= NOW() - (%s * INTERVAL '1 day')
+              {merge_clause}
+        ),
+        farm_count AS (
+            SELECT COUNT(DISTINCT farm_id) AS n_farms FROM eligible
+        ),
+        ranked AS (
+            SELECT
+                eligible.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY farm_id
+                    ORDER BY event_time, event_row_id
+                ) AS farm_rn
+            FROM eligible
+        )
         SELECT
-            e.event_id,
-            e.id AS event_row_id,
-            e.event_type,
-            e.event_time,
-            e.farm_id,
-            e.device_id,
-            e.camera_id,
-            e.activity_type_id,
-            e.session_id,
-            e.zone_id,
-            e.ai_confidence,
-            e.payload
-        FROM activity_detection_event e
-        WHERE e.activity_instance_id IS NULL
-          AND e.event_time >= NOW() - (%s * INTERVAL '1 day')
-          {merge_clause}
-        ORDER BY e.event_time
+            ranked.event_id, ranked.event_row_id, ranked.event_type, ranked.event_time,
+            ranked.farm_id, ranked.device_id, ranked.camera_id, ranked.activity_type_id,
+            ranked.session_id, ranked.zone_id, ranked.ai_confidence, ranked.payload
+        FROM ranked, farm_count
+        WHERE ranked.farm_rn <= CASE WHEN farm_count.n_farms <= 1 THEN %s ELSE %s END
+        ORDER BY ranked.event_time
         LIMIT %s
         """,
-        (lookback_days, limit),
+        (lookback_days, limit, per_farm_cap, limit),
     )
     return cur.fetchall()
 
@@ -1873,6 +1912,7 @@ def run(max_loops=None):
     print("[AGGREGATOR] Starting continuous worker (SCHEDULE-AWARE)")
 
     BATCH_SIZE = int(os.getenv("AGG_BATCH_SIZE", "500"))
+    PER_FARM_BATCH_CAP = _per_farm_batch_cap()
     RECONCILE_EVERY_LOOPS = int(os.getenv("AGG_RECONCILE_EVERY_LOOPS", "5"))
     RECONCILE_BATCH_SIZE = int(os.getenv("AGG_RECONCILE_BATCH_SIZE", "500"))
     RECONCILE_LOOKBACK_DAYS = _reconcile_lookback_days()
@@ -1938,63 +1978,117 @@ def run(max_loops=None):
             if "merge_processed" in event_columns:
                 cur.execute(
                     """
+                    WITH eligible AS (
+                        SELECT
+                            e.event_id,
+                            e.id AS event_row_id,
+                            e.event_type,
+                            e.event_time,
+                            e.farm_id,
+                            e.device_id,
+                            e.camera_id,
+                            e.activity_type_id,
+                            e.session_id,
+                            e.zone_id,
+                            e.ai_confidence,
+                            e.payload
+                        FROM activity_detection_event e
+                        WHERE e.activity_instance_id IS NULL
+                          AND COALESCE(e.merge_processed, FALSE) = FALSE
+                    ),
+                    farm_count AS (
+                        SELECT COUNT(DISTINCT farm_id) AS n_farms FROM eligible
+                    ),
+                    ranked AS (
+                        SELECT
+                            eligible.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY farm_id
+                                ORDER BY event_time,
+                                         CASE event_type::text
+                                           WHEN 'START_CANDIDATE' THEN 0
+                                           WHEN 'FRAME_AGGREGATE' THEN 1
+                                           WHEN 'END_CANDIDATE' THEN 2
+                                           ELSE 3
+                                         END,
+                                         event_row_id
+                            ) AS farm_rn
+                        FROM eligible
+                    )
                     SELECT
-                        e.event_id,
-                        e.id AS event_row_id,
-                        e.event_type,
-                        e.event_time,
-                        e.farm_id,
-                        e.device_id,
-                        e.camera_id,
-                        e.activity_type_id,
-                        e.session_id,
-                        e.zone_id,
-                        e.ai_confidence,
-                        e.payload
-                    FROM activity_detection_event e
-                    WHERE e.activity_instance_id IS NULL
-                      AND COALESCE(e.merge_processed, FALSE) = FALSE
-                    ORDER BY e.event_time,
-                             CASE e.event_type::text
+                        ranked.event_id, ranked.event_row_id, ranked.event_type, ranked.event_time,
+                        ranked.farm_id, ranked.device_id, ranked.camera_id, ranked.activity_type_id,
+                        ranked.session_id, ranked.zone_id, ranked.ai_confidence, ranked.payload
+                    FROM ranked, farm_count
+                    WHERE ranked.farm_rn <= CASE WHEN farm_count.n_farms <= 1 THEN %s ELSE %s END
+                    ORDER BY ranked.event_time,
+                             CASE ranked.event_type::text
                                WHEN 'START_CANDIDATE' THEN 0
                                WHEN 'FRAME_AGGREGATE' THEN 1
                                WHEN 'END_CANDIDATE' THEN 2
                                ELSE 3
                              END,
-                             e.id
+                             ranked.event_row_id
                     LIMIT %s
                     """,
-                    (BATCH_SIZE,),
+                    (BATCH_SIZE, PER_FARM_BATCH_CAP, BATCH_SIZE),
                 )
             else:
                 cur.execute(
                     """
+                    WITH eligible AS (
+                        SELECT
+                            e.event_id,
+                            e.id AS event_row_id,
+                            e.event_type,
+                            e.event_time,
+                            e.farm_id,
+                            e.device_id,
+                            e.camera_id,
+                            e.activity_type_id,
+                            e.session_id,
+                            e.zone_id,
+                            e.ai_confidence,
+                            e.payload
+                        FROM activity_detection_event e
+                        WHERE e.activity_instance_id IS NULL
+                    ),
+                    farm_count AS (
+                        SELECT COUNT(DISTINCT farm_id) AS n_farms FROM eligible
+                    ),
+                    ranked AS (
+                        SELECT
+                            eligible.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY farm_id
+                                ORDER BY event_time,
+                                         CASE event_type::text
+                                           WHEN 'START_CANDIDATE' THEN 0
+                                           WHEN 'FRAME_AGGREGATE' THEN 1
+                                           WHEN 'END_CANDIDATE' THEN 2
+                                           ELSE 3
+                                         END,
+                                         event_row_id
+                            ) AS farm_rn
+                        FROM eligible
+                    )
                     SELECT
-                        e.event_id,
-                        e.id AS event_row_id,
-                        e.event_type,
-                        e.event_time,
-                        e.farm_id,
-                        e.device_id,
-                        e.camera_id,
-                        e.activity_type_id,
-                        e.session_id,
-                        e.zone_id,
-                        e.ai_confidence,
-                        e.payload
-                    FROM activity_detection_event e
-                    WHERE e.activity_instance_id IS NULL
-                    ORDER BY e.event_time,
-                             CASE e.event_type::text
+                        ranked.event_id, ranked.event_row_id, ranked.event_type, ranked.event_time,
+                        ranked.farm_id, ranked.device_id, ranked.camera_id, ranked.activity_type_id,
+                        ranked.session_id, ranked.zone_id, ranked.ai_confidence, ranked.payload
+                    FROM ranked, farm_count
+                    WHERE ranked.farm_rn <= CASE WHEN farm_count.n_farms <= 1 THEN %s ELSE %s END
+                    ORDER BY ranked.event_time,
+                             CASE ranked.event_type::text
                                WHEN 'START_CANDIDATE' THEN 0
                                WHEN 'FRAME_AGGREGATE' THEN 1
                                WHEN 'END_CANDIDATE' THEN 2
                                ELSE 3
                              END,
-                             e.id
+                             ranked.event_row_id
                     LIMIT %s
                     """,
-                    (BATCH_SIZE,),
+                    (BATCH_SIZE, PER_FARM_BATCH_CAP, BATCH_SIZE),
                 )
 
             events = cur.fetchall()
