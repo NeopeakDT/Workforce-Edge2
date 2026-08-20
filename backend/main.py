@@ -28,7 +28,7 @@ from fastapi import FastAPI
 # -------------------------------------------------
 ENABLE_EDGE_BOOTSTRAP_APIS = True   # Phase 3 (MANDATORY)
 ENABLE_INGEST_APIS = True          # Phase 4
-ENABLE_DASHBOARD_APIS = False      # Phase 6 (read-only)
+ENABLE_DASHBOARD_APIS = True       # Phase 6 (read-only)
 ENABLE_ADMIN_APIS = False          # Optional
 
 # -------------------------------------------------
@@ -108,7 +108,6 @@ NEVER exposed via HTTP.
 if ENABLE_DASHBOARD_APIS:
     # NOTE:
     # dashboard_query_service.py is NOT a router.
-    # Only enable this if you create dashboard_api.py
     from dashboard.dashboard_api import router as dashboard_router
 
     app.include_router(

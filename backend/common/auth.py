@@ -10,6 +10,8 @@ from functools import lru_cache
 from jwt import ExpiredSignatureError, InvalidTokenError
 from jwt.algorithms import ECAlgorithm
 
+from common.db import get_cursor
+
 SUPABASE_PROJECT_URL = "https://cxvoidjhkbrsjxpipbdg.supabase.co"
 JWKS_URL = f"{SUPABASE_PROJECT_URL}/auth/v1/.well-known/jwks.json"
 
@@ -66,3 +68,36 @@ def parse_auth_header(auth_header: str) -> AuthContext:
         user_id=user_id,
         role=payload.get("role", "authenticated"),
     )
+
+
+def user_can_access_farm(user_id: str, farm_id: str) -> bool:
+    """
+    Farm-level authorization check for FastAPI routes.
+
+    Mirrors the authorization semantics already used by the
+    get_posture_trend() Postgres RPC (STEP1_DATABASE_BASELINE.sql):
+    a global ADMIN, or the OWNER of the farm, or any user with a
+    user_farm_access row for that farm, is allowed.
+
+    The RPC itself relies on auth.uid() inside Postgres RLS, which is
+    only populated when Supabase/PostgREST runs the query as the caller.
+    Our backend connects via a service-role pooled connection with no
+    auth.uid() context, so this is a Python-side re-check against the
+    same tables (user_profile, user_farm_access) instead of calling the
+    RLS-bound RPC.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM public.user_profile
+            WHERE id = %s AND role = 'ADMIN'
+            UNION ALL
+            SELECT 1
+            FROM public.user_farm_access
+            WHERE user_id = %s AND farm_id = %s
+            LIMIT 1
+            """,
+            (user_id, user_id, farm_id),
+        )
+        return cur.fetchone() is not None
