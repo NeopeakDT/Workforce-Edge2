@@ -401,6 +401,369 @@ def get_posture_7d_buckets(farm_id: str, zone_id: str, window_start_utc, window_
         return {row["bucket_index"]: row for row in cur.fetchall()}
 
 
+def get_camera_names(farm_id: str, zone_id: str):
+    """
+    Cameras configured for POSTURE (activity_type_id=4) at this zone.
+
+    Returns dict[camera_code -> {"camera_id": ..., "camera_name": ...}].
+    camera_name is farm_camera.name verbatim -- no reformatting/cleanup.
+    The DB value is authoritative; the frontend decides how to display it.
+
+    This is the authoritative "expected camera" set for this zone (used
+    for expected_camera_count in the summary endpoint), independent of
+    what any single observation's metadata happened to report.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT fc.code AS camera_code, fc.id AS camera_id, fc.name AS camera_name
+            FROM public.camera_activity_zone caz
+            JOIN public.farm_camera fc ON fc.id = caz.camera_id
+            WHERE caz.farm_id = %s
+              AND caz.zone_id = %s
+              AND caz.activity_type_id = 4
+              AND caz.is_active = true
+            """,
+            (farm_id, zone_id),
+        )
+        return {
+            row["camera_code"]: {"camera_id": row["camera_id"], "camera_name": row["camera_name"]}
+            for row in cur.fetchall()
+        }
+
+
+def get_camera_trend_buckets(farm_id: str, zone_id: str, window_start_utc, window_end_utc):
+    """
+    Daily-bucketed per-camera feeding/standing averages for a farm-local
+    window, unnesting metadata.cameras (a JSONB object keyed by camera
+    code) via jsonb_each() + LATERAL -- one row per camera per
+    observation, computed in Postgres. One query, no N+1, no per-camera
+    round trips.
+
+    Only feeding/standing -- no per-camera resting figure exists
+    anywhere in this pipeline (see Step 8A audit), so none is computed
+    here.
+
+    Returns dict[(bucket_index, camera_code) -> row]. A missing key
+    means that camera had zero observations in that bucket -- NO_DATA
+    for that camera on that day, independent of the zone-wide status
+    Step 6/7 would report for the same day.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                floor(extract(epoch FROM (observed_at - %(start)s)) / 86400)::int AS bucket_index,
+                cam.key AS camera_code,
+                avg((cam.value ->> 'feeding')::numeric) AS avg_feeding,
+                avg((cam.value ->> 'standing')::numeric) AS avg_standing,
+                count(*) AS observation_count
+            FROM public.posture_observation_normal,
+                 LATERAL jsonb_each(metadata -> 'cameras') AS cam(key, value)
+            WHERE farm_id = %(farm_id)s
+              AND zone_id = %(zone_id)s
+              AND observed_at >= %(start)s
+              AND observed_at < %(end)s
+            GROUP BY bucket_index, cam.key
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": window_start_utc, "end": window_end_utc},
+        )
+        return {(row["bucket_index"], row["camera_code"]): row for row in cur.fetchall()}
+
+
+def get_camera_summary(farm_id: str, zone_id: str, window_start_utc, window_end_utc):
+    """
+    Window-averaged per-camera feeding/standing stats, for ranking and
+    presence-quality reporting.
+
+    Two queries, one round trip: total_observations (the same
+    NORMAL-only row count pattern as Steps 4/6/7 -- the denominator for
+    presence_percentage), and the per-camera jsonb_each aggregate (same
+    unnesting technique as get_camera_trend_buckets, just grouped by
+    camera only, no day bucketing).
+
+    total_observations = count of NORMAL posture_observation rows for
+    this farm/zone/window (i.e. count(*) from posture_observation_normal
+    -- NOT a sum of per-camera counts, since a camera can be missing
+    from some rows).
+
+    Returns (total_observations: int, per_camera: dict[camera_code -> row]).
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*) AS total_observations
+            FROM public.posture_observation_normal
+            WHERE farm_id = %(farm_id)s
+              AND zone_id = %(zone_id)s
+              AND observed_at >= %(start)s
+              AND observed_at < %(end)s
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": window_start_utc, "end": window_end_utc},
+        )
+        total_observations = cur.fetchone()["total_observations"]
+
+        cur.execute(
+            """
+            SELECT
+                cam.key AS camera_code,
+                avg((cam.value ->> 'feeding')::numeric) AS avg_feeding,
+                avg((cam.value ->> 'standing')::numeric) AS avg_standing,
+                count(*) AS observation_count
+            FROM public.posture_observation_normal,
+                 LATERAL jsonb_each(metadata -> 'cameras') AS cam(key, value)
+            WHERE farm_id = %(farm_id)s
+              AND zone_id = %(zone_id)s
+              AND observed_at >= %(start)s
+              AND observed_at < %(end)s
+            GROUP BY cam.key
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": window_start_utc, "end": window_end_utc},
+        )
+        per_camera = {row["camera_code"]: row for row in cur.fetchall()}
+
+    return total_observations, per_camera
+
+
+# Empirically confirmed in the Step 9 audit: NORMAL-observation cadence
+# is ~5.03 min median, matching posture_scheduler.py's
+# DB_WRITE_INTERVAL_SECONDS=300 flush interval exactly. Used as the
+# grounding constant for two first-pass classification heuristics below
+# (gap classification's "not really a gap" floor, and device freshness) --
+# both are deliberately derived from this already-established, code-level
+# constant rather than an invented number, but are still heuristics, not
+# a business threshold decision. Revisit once real GOOD/WARNING/CRITICAL
+# bands are defined (see Step 9 audit, section 14).
+_NORMAL_CADENCE_MINUTES = 5.0
+
+
+def get_data_quality_period(farm_id: str, zone_id: str, period_start_utc, period_end_utc):
+    """
+    Coverage / cadence / completeness / mode-distribution metrics for one
+    farm-local period (a single calendar day in the current caller).
+
+    Several small, bounded queries (period-scoped, not "load all
+    history"): a coverage aggregate over posture_observation_normal, the
+    NORMAL observed_at list for that period (cadence + gap detection),
+    and the raw posture_observation (observed_at, mode) rows for that
+    period (mode distribution + gap-classification evidence). None scan
+    beyond the requested period.
+
+    completeness/coverage/mode_distribution counts stay strictly
+    period-scoped (a day's completeness must only count that day's own
+    rows). Gap DETECTION, however, also fetches the single NORMAL row
+    immediately before period_start and immediately after period_end
+    (two tiny indexed LIMIT-1 queries) as boundary context -- discovered
+    necessary while validating against real data: a genuine ~20h
+    anomalous gap (Aug 3->4 in the Step 9 audit) straddles a farm-local
+    midnight, so day-scoped-only gap detection would silently split it
+    into two ordinary-looking smaller in-day gaps and never surface the
+    real anomaly on either day's report. These boundary rows are used
+    ONLY for gap/cadence detection in the API layer, never counted
+    toward observation_count/completeness.
+
+    Returns a dict with keys: observation_count, partial_camera_observations,
+    coverage_percentage, typical_received_cameras, normal_timestamps
+    (list, period-scoped only), boundary_before/boundary_after
+    (single timestamp or None, just outside the period), milking_timestamps
+    (period-scoped, widened to the boundary rows' span so a
+    boundary-crossing gap's MILKING evidence isn't missed), normal_count,
+    milking_count, legacy_unknown_count.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                count(*) AS observation_count,
+                count(*) FILTER (WHERE {_RECEIVED_CAMERAS_SQL} < {_EXPECTED_CAMERAS_SQL})
+                    AS partial_camera_observations,
+                avg({_RECEIVED_CAMERAS_SQL}::numeric / NULLIF({_EXPECTED_CAMERAS_SQL}, 0) * 100)
+                    AS coverage_percentage,
+                mode() WITHIN GROUP (ORDER BY {_RECEIVED_CAMERAS_SQL}) AS typical_received_cameras
+            FROM {POSTURE_NORMAL_RELATION}
+            WHERE farm_id = %(farm_id)s
+              AND zone_id = %(zone_id)s
+              AND observed_at >= %(start)s
+              AND observed_at < %(end)s
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": period_start_utc, "end": period_end_utc},
+        )
+        coverage = cur.fetchone()
+
+        cur.execute(
+            f"""
+            SELECT observed_at
+            FROM {POSTURE_NORMAL_RELATION}
+            WHERE farm_id = %(farm_id)s
+              AND zone_id = %(zone_id)s
+              AND observed_at >= %(start)s
+              AND observed_at < %(end)s
+            ORDER BY observed_at
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": period_start_utc, "end": period_end_utc},
+        )
+        normal_timestamps = [row["observed_at"] for row in cur.fetchall()]
+
+        cur.execute(
+            f"""
+            SELECT observed_at FROM {POSTURE_NORMAL_RELATION}
+            WHERE farm_id = %(farm_id)s AND zone_id = %(zone_id)s AND observed_at < %(start)s
+            ORDER BY observed_at DESC LIMIT 1
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": period_start_utc},
+        )
+        row = cur.fetchone()
+        boundary_before = row["observed_at"] if row else None
+
+        cur.execute(
+            f"""
+            SELECT observed_at FROM {POSTURE_NORMAL_RELATION}
+            WHERE farm_id = %(farm_id)s AND zone_id = %(zone_id)s AND observed_at >= %(end)s
+            ORDER BY observed_at ASC LIMIT 1
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "end": period_end_utc},
+        )
+        row = cur.fetchone()
+        boundary_after = row["observed_at"] if row else None
+
+        cur.execute(
+            """
+            SELECT observed_at, metadata ->> 'mode' AS mode
+            FROM public.posture_observation
+            WHERE farm_id = %(farm_id)s
+              AND zone_id = %(zone_id)s
+              AND observed_at >= %(start)s
+              AND observed_at < %(end)s
+            ORDER BY observed_at
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": period_start_utc, "end": period_end_utc},
+        )
+        raw_rows = [(row["observed_at"], row["mode"]) for row in cur.fetchall()]
+
+        # Widen the MILKING-evidence fetch to the boundary rows' span, so
+        # a gap crossing the period edge can still see MILKING rows that
+        # fall just outside [period_start, period_end).
+        milking_span_start = boundary_before if boundary_before is not None else period_start_utc
+        milking_span_end = boundary_after if boundary_after is not None else period_end_utc
+        cur.execute(
+            """
+            SELECT observed_at FROM public.posture_observation
+            WHERE farm_id = %(farm_id)s AND zone_id = %(zone_id)s
+              AND observed_at >= %(start)s AND observed_at <= %(end)s
+              AND metadata ->> 'mode' = 'MILKING'
+            ORDER BY observed_at
+            """,
+            {"farm_id": farm_id, "zone_id": zone_id, "start": milking_span_start, "end": milking_span_end},
+        )
+        milking_timestamps = [row["observed_at"] for row in cur.fetchall()]
+
+    normal_count = sum(1 for _, m in raw_rows if m == "NORMAL")
+    milking_count = sum(1 for _, m in raw_rows if m == "MILKING")
+    legacy_unknown_count = sum(1 for _, m in raw_rows if m is None)
+
+    return {
+        "observation_count": coverage["observation_count"],
+        "partial_camera_observations": coverage["partial_camera_observations"],
+        "coverage_percentage": coverage["coverage_percentage"],
+        "typical_received_cameras": coverage["typical_received_cameras"],
+        "normal_timestamps": normal_timestamps,
+        "boundary_before": boundary_before,
+        "boundary_after": boundary_after,
+        "milking_timestamps": milking_timestamps,
+        "normal_count": normal_count,
+        "milking_count": milking_count,
+        "legacy_unknown_count": legacy_unknown_count,
+    }
+
+
+def get_max_configured_milking_gap_minutes(farm_id: str):
+    """
+    Largest plausible MILKING-related gap duration, derived from the
+    farm's OWN configured milking schedules (activity_schedule,
+    activity_type_id=1) rather than an invented constant: for each
+    active milking schedule, ideal_end - ideal_start + both tolerances.
+    Returns None if no active milking schedule is configured (gap
+    classification then falls back to MILKING_ADJACENT_ANOMALY whenever
+    any MILKING evidence exists, since there's no configured expectation
+    to compare against).
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT ideal_start_time, ideal_end_time, tolerance_early_min, tolerance_late_min
+            FROM public.activity_schedule
+            WHERE farm_id = %s AND activity_type_id = 1 AND is_active = true
+            """,
+            (farm_id,),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        return None
+
+    max_span = None
+    for row in rows:
+        if row["ideal_end_time"] is None:
+            continue
+        start_min = row["ideal_start_time"].hour * 60 + row["ideal_start_time"].minute
+        end_min = row["ideal_end_time"].hour * 60 + row["ideal_end_time"].minute
+        if end_min <= start_min:
+            end_min += 24 * 60  # window crosses midnight
+        span = (
+            (end_min - start_min)
+            + (row["tolerance_early_min"] or 0)
+            + (row["tolerance_late_min"] or 0)
+        )
+        max_span = span if max_span is None else max(max_span, span)
+
+    return max_span
+
+
+def get_latest_observation_and_heartbeat(farm_id: str, zone_id: str):
+    """
+    Global (not period-scoped) freshness anchor: freshness answers "is
+    the pipeline healthy right now", independent of which historical
+    period the caller is otherwise inspecting.
+
+    Two small queries: the most recent posture_observation row of ANY
+    mode (so a heavy MILKING window doesn't look "stale" just because no
+    NORMAL row has landed recently -- the pipeline is still alive and
+    writing), which also gives device_id; then that device's most recent
+    heartbeat.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT observed_at, device_id
+            FROM public.posture_observation
+            WHERE farm_id = %s AND zone_id = %s
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            (farm_id, zone_id),
+        )
+        latest_obs = cur.fetchone()
+
+        latest_heartbeat = None
+        if latest_obs and latest_obs["device_id"]:
+            cur.execute(
+                """
+                SELECT heartbeat_time
+                FROM public.edge_device_heartbeat
+                WHERE device_id = %s
+                ORDER BY heartbeat_time DESC
+                LIMIT 1
+                """,
+                (latest_obs["device_id"],),
+            )
+            latest_heartbeat = cur.fetchone()
+
+    return (
+        latest_obs["observed_at"] if latest_obs else None,
+        latest_heartbeat["heartbeat_time"] if latest_heartbeat else None,
+    )
+
+
 # -------------------------------------------------
 # Alerts
 # -------------------------------------------------
