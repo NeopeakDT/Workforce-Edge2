@@ -71,6 +71,18 @@ except ImportError:
         """Fallback: return all detections if ROI not available"""
         return detections
 
+# SCRAPPING false-positive fix (Aug 2026, `scrapping-detection-alerts` branch):
+# detect_scrapping() moved to scrapping_logic.py so it can be unit-tested in
+# isolation (jetson/test_scrapping_logic.py) and exercised against real video
+# (jetson/test_scrapping_video_ab.py) without pulling in GStreamer/CUDA/queue
+# deps. Behavior is otherwise identical to the previous inline version, plus
+# a per-class confidence floor on scrapping_tool (SCRAP_TOOL_MIN_CONFIDENCE) -
+# both confirmed production false positives sat at 0.68/0.70, right on the
+# generic 0.65 model floor. Same call signature as before, so callers are
+# unaffected. To revert: restore the old inline detect_scrapping() from git
+# history (pre-`scrapping-detection-alerts` branch) and drop this import.
+from scrapping_logic import detect_scrapping, SCRAP_TOOL_MIN_CONFIDENCE, SCRAP_START_MIN_HITS
+
 
 # ------------------------------------------------------------------
 # Env
@@ -785,60 +797,8 @@ def resolve_zone_id(camera_cfg: dict, activity: str):
 # ------------------------------------------------------------------
 # Activity logic
 # ------------------------------------------------------------------
-def detect_scrapping(detections, person_classes, tool_classes, max_dist):
-    """
-    Detect real scrapping evidence.
-
-    A raw scrapping hit requires:
-      1. A person detection
-      2. A scrapping_tool / shovel detection
-      3. Person center within max_dist pixels of tool center
-
-    Confidence is intentionally NOT checked here.
-    YOLO/model inference already filters detections at the configured
-    confidence threshold (currently 0.65).
-
-    Returns:
-        (detected, evidence_detections)
-
-        detected:
-            True when a valid person+tool relationship exists.
-
-        evidence_detections:
-            The actual person + tool detections that caused the hit.
-    """
-    persons = [
-        d for d in (detections or [])
-        if str(d.get("class", "")).lower() in person_classes
-    ]
-
-    tools = [
-        d for d in (detections or [])
-        if str(d.get("class", "")).lower() in tool_classes
-    ]
-
-    for person in persons:
-        person_center = bbox_center(person["bbox"])
-
-        for tool in tools:
-            tool_center = bbox_center(tool["bbox"])
-
-            distance = euclidean(person_center, tool_center)
-
-            if distance <= max_dist:
-                logger.debug(
-                    "[SCRAP RAW HIT] person_conf=%.2f tool_conf=%.2f distance=%.1fpx "
-                    "person_bbox=%s tool_bbox=%s",
-                    float(person.get("confidence", 0.0)),
-                    float(tool.get("confidence", 0.0)),
-                    distance,
-                    person.get("bbox"),
-                    tool.get("bbox"),
-                )
-
-                return True, [person, tool]
-
-    return False, []
+# detect_scrapping() now lives in scrapping_logic.py (imported above) -
+# see the false-positive-fix comment near that import.
 
 
 def detect_cluster_udder_intersection(detections):
@@ -958,6 +918,7 @@ def _process_camera_impl(
                 "last_frame_emit": 0.0,
                 "candidate_since": None,
                 "candidate_last_detected": None,
+                "candidate_hit_count": 0,  # false-positive fix: see SCRAP_START_MIN_HITS
                 "last_real_detection": None,
                 "end_candidate_since": None,
                 "last_evidence_detections": [],
@@ -1433,18 +1394,27 @@ def _process_camera_impl(
         # ------------------------------------------------------------------
         # SCRAPPING — dedicated lightweight state machine
         #
-        # Raw evidence:
-        #   person + scrapping_tool/shovel within max_dist
+        # Raw evidence (detect_scrapping(), in scrapping_logic.py):
+        #   person + scrapping_tool/shovel within max_dist, tool detection
+        #   confidence >= SCRAP_TOOL_MIN_CONFIDENCE (0.75)
         #
         # Start:
-        #   real evidence confirmed for 5 seconds
+        #   real evidence confirmed for SCRAP_START_CONFIRM_SEC (3s) AND
+        #   seen on at least SCRAP_START_MIN_HITS (3) separate polls -
+        #   false-positive fix (Aug 2026): elapsed time alone let one or two
+        #   isolated flickers ride SCRAP_START_GAP_TOLERANCE_SEC to a confirm.
+        #   See scrapping-detection-alerts branch for the incident writeup;
+        #   to revert, restore the pre-fix version of this block + the old
+        #   inline detect_scrapping() from git history.
         #
         # Tolerance:
         #   during start confirmation, a detection gap <= 2 seconds
         #   does not cancel the candidate
         #
         # End:
-        #   real evidence absent for 5 seconds
+        #   real evidence absent for SCRAP_END_GRACE_SEC (30s) - unchanged,
+        #   raised intentionally in commit c12db3f to avoid fragmenting real
+        #   multi-camera scrapes.
         #
         # No generic TemporalSmoother.
         # No 20-second active buffer.
@@ -1480,7 +1450,9 @@ def _process_camera_impl(
 
                     if state["candidate_since"] is None:
                         state["candidate_since"] = ts
+                        state["candidate_hit_count"] = 0
 
+                    state["candidate_hit_count"] += 1
                     state["end_candidate_since"] = None
 
                     candidate_duration = (
@@ -1490,6 +1462,7 @@ def _process_camera_impl(
                     if (
                         zone_scrapping
                         and candidate_duration >= SCRAP_START_CONFIRM_SEC
+                        and state["candidate_hit_count"] >= SCRAP_START_MIN_HITS
                     ):
 
                         logger.info(
@@ -1557,6 +1530,7 @@ def _process_camera_impl(
                         # Candidate state no longer needed.
                         state["candidate_since"] = None
                         state["candidate_last_detected"] = None
+                        state["candidate_hit_count"] = 0
 
                 else:
                     # No current evidence.
@@ -1574,6 +1548,7 @@ def _process_camera_impl(
                             # Candidate was not confirmed.
                             state["candidate_since"] = None
                             state["candidate_last_detected"] = None
+                            state["candidate_hit_count"] = 0
                             state["last_evidence_detections"] = []
 
             # --------------------------------------------------------------
@@ -1709,6 +1684,7 @@ def _process_camera_impl(
                         state["last_frame_emit"] = 0.0
                         state["candidate_since"] = None
                         state["candidate_last_detected"] = None
+                        state["candidate_hit_count"] = 0
                         state["last_real_detection"] = None
                         state["end_candidate_since"] = None
                         state["last_evidence_detections"] = []
