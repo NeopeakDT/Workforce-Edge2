@@ -49,8 +49,16 @@ from posture.posture_scheduler import PostureScheduler
 from posture.milking_activity import set_milking_camera_active
 from posture.posture_db import PostureDB
 
-# GLOBAL RTSP START LOCK (prevents NVR overload)
-RTSP_START_LOCK = threading.Lock()
+# GLOBAL RTSP START GATE (prevents NVR overload).
+# Was a single Lock (1 camera opening/reconnecting at a time) -- during the
+# 2026-08-27/28 outage, one camera stuck mid-open/reconnect for up to ~30s
+# (retry_delay = min(30, 2**attempt)) held this and froze every other
+# camera's reconnect behind it, which lines up with all 7 cameras going
+# quiet together instead of failing independently. Raised to a Semaphore(5)
+# to match runtime/video_stream.py's own rtsp_semaphore (same "avoid NVR
+# burst" intent, just not serialized down to 1) -- still bounds concurrent
+# RTSP handshakes, just no longer to a single camera at a time.
+RTSP_START_LOCK = threading.Semaphore(5)
 
 # Thermal protection
 try:

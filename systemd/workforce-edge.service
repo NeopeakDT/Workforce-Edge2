@@ -28,9 +28,15 @@ Description=Workforce Edge Detector (Jetson)
 After=network-online.target
 Wants=network-online.target
 
-# Prevent rapid crash loops
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# Prevent rapid crash loops, but don't let transient RTSP/camera flakiness
+# permanently park the unit in a failed state that only reset-failed can
+# clear (see the 2026-08-27/28 ~27h outage: 5 restarts in 60s was easy for
+# a flapping camera stream to burn through in well under a minute).
+# workforce-watchdog.service now calls reset-failed as a safety net (see
+# jetson/edge_watchdog.py), but the goal here is for systemd's own fast
+# Restart=always path to absorb this instead of ever needing that net.
+StartLimitIntervalSec=600
+StartLimitBurst=20
 
 [Service]
 Type=simple

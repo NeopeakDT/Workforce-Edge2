@@ -72,10 +72,10 @@ def tool(x=110, y=100, conf=0.68):
 
 def test_low_confidence_tool_rejected():
     detected, evidence = detect_scrapping(
-        [person(), tool(conf=0.68)], PERSON_CLASSES, TOOL_CLASSES, MAX_DIST
+        [person(), tool(conf=0.60)], PERSON_CLASSES, TOOL_CLASSES, MAX_DIST
     )
     check(
-        "low-confidence tool (0.68) rejected below floor",
+        "low-confidence tool (0.60) rejected below floor",
         detected is False,
         f"got detected={detected}",
     )
@@ -120,9 +120,9 @@ def run_ticks(ticks):
 
 
 def test_false_positive_1_single_flicker_no_start():
-    # 41ea2edb: person+tool seen once (below confidence floor at 0.68 -> would
-    # already be rejected by detect_scrapping, but even ignoring confidence,
-    # a single isolated hit must not satisfy the hit-count requirement).
+    # 41ea2edb: person+tool seen once at conf 0.68 (above the 0.65 floor, so
+    # detect_scrapping() itself doesn't reject it) - the hit-count/duration
+    # requirement is what must reject a single isolated hit.
     ticks = [
         (0.0, True, [person(), tool(conf=0.68)]),
         (0.5, False, None),

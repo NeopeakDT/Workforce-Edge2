@@ -46,6 +46,10 @@ rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1902
 rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2301
 rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2201
 rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2401
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1002
+rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2002
+
+
 
 GRP2-TMR_WAY        → 502
 GRP2-FRONT_RIGHT    → 1902
@@ -70,7 +74,7 @@ from runtime.video_stream import open_stream  # noqa: E402
 # -------- CONFIG --------
 # SOURCE = "/home/neopeak/Desktop/WF-project/WF/Workforce-Detection/test_data/rahuri_video-7.mp4"
 # SOURCE = "jetson/roi_selection/GRP-1-front-right-2.png"
-SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/2301"
+SOURCE = "rtsp://admin:OMSAI%2312@192.168.31.157:554/Streaming/Channels/1002"
 DECODE_MODE = "GPU"  # GPU or CPU
 # OUTPUT_FILE where coordinates will be saved (absolute, cwd-independent)
 OUTPUT_FILE = Path(__file__).resolve().parent / "rtsp_roi_coordinates_new.txt"

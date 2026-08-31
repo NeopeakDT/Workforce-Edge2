@@ -18,8 +18,16 @@ Fix for the recurring false-positive UNSCHEDULED scrapping activity
     person+tool bbox proximity alone, gated only by the generic YOLO
     inference confidence floor (~0.65). Both confirmed false positives in
     production sat at 0.68/0.70 confidence - directly on top of that floor.
-    A per-class confidence floor for `scrapping_tool` (SCRAP_TOOL_MIN_CONFIDENCE)
-    is now enforced here, tighter than the generic model threshold.
+    A per-class confidence floor of 0.75 for `scrapping_tool` was tried here
+    (2026-08-24) but caused a total false-negative regression: zero SCRAPPING
+    events of any kind were recorded in the 22+ hours after deploy, on every
+    scrapping camera, while MILKING/FEEDING kept firing normally on the same
+    process (confirmed against production activity_detection_event rows on
+    2026-08-25). The 0.75 number was never validated against real
+    scrapping_tool confidence output - unit tests used a synthetic 0.85 for
+    "high confidence" cases, and real detections apparently also cluster
+    below 0.75. SCRAP_TOOL_MIN_CONFIDENCE is reverted to the generic model
+    inference floor (see runtime/model_loader.py) - no per-class tightening.
 
     Separately, the state machine's start confirmation
     (SCRAP_START_CONFIRM_SEC + SCRAP_START_GAP_TOLERANCE_SEC) could be
@@ -45,8 +53,11 @@ SCRAP_START_CONFIRM_SEC = 3.0
 SCRAP_START_GAP_TOLERANCE_SEC = 2.0
 SCRAP_END_GRACE_SEC = 30.0
 
-# New in the Aug 2026 false-positive fix.
-SCRAP_TOOL_MIN_CONFIDENCE = 0.75
+# Matches the generic YOLO inference confidence floor (runtime/model_loader.py
+# "conf": 0.65). A tighter per-class 0.75 floor was tried on 2026-08-24 and
+# caused a 22+ hour total false-negative regression (zero SCRAPPING events on
+# any camera) - reverted 2026-08-25. See module docstring above.
+SCRAP_TOOL_MIN_CONFIDENCE = 0.65
 SCRAP_START_MIN_HITS = 3
 
 

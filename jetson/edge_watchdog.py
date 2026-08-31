@@ -101,10 +101,38 @@ def is_system_stuck(payload):
 
 
 def restart_detector():
-    subprocess.run(
+    # If the unit already hit its StartLimitBurst/StartLimitIntervalSec
+    # window (crash-looped too many times, e.g. from persistent RTSP
+    # flakiness), systemd parks it in a "failed" state and refuses ANY
+    # further start/restart -- including this one -- until reset-failed
+    # is called. Without this, `systemctl restart` here silently no-ops
+    # forever: the watchdog keeps "detecting stuck" and "restarting" on
+    # every cycle but the detector never actually comes back until a
+    # human runs `systemctl reset-failed` by hand (this is what happened
+    # in the 2026-08-27/28 ~27h outage -- restart attempts were logged
+    # but none of them could have succeeded once the unit was parked).
+    reset = subprocess.run(
+        ["systemctl", "reset-failed", DETECTOR_SERVICE_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if reset.returncode != 0:
+        print(f"[WATCHDOG] reset-failed exited {reset.returncode}: {reset.stderr.strip()}")
+
+    result = subprocess.run(
         ["systemctl", "restart", DETECTOR_SERVICE_NAME],
         check=False,
+        capture_output=True,
+        text=True,
     )
+    if result.returncode == 0:
+        print(f"[WATCHDOG] restart of {DETECTOR_SERVICE_NAME} succeeded")
+    else:
+        print(
+            f"[WATCHDOG] restart of {DETECTOR_SERVICE_NAME} FAILED "
+            f"(exit {result.returncode}): {result.stderr.strip()}"
+        )
 
 
 def main():
