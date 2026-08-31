@@ -662,38 +662,82 @@ git commit -m "Add ACTIVITY_LATE sweep and ACTIVITY_EARLY evaluators (Step C)"
 **Interfaces:**
 - Consumes: `alerts.matchers.activity_matcher.evaluate_finalized_instance()` (existing, unchanged), `alerts.alert_conditions.resolve_active_occurrence()` (existing).
 
-- [ ] **Step 1: Locate the MISSED-row creation point**
+**Pre-implementation finding (already verified against the real file, not assumed):**
+`detect_missed_activities()` ([missed_activity_cron.py:97-291](../../../backend/aggregation/missed_activity_cron.py#L97-L291)) runs its entire nested `for s in schedules: for days_back in range(2):` loop — including every `INSERT INTO activity_instance` — inside **one `with get_cursor() as cur:` block**, and calls `cur.connection.commit()` only **once, at line 291, after the loop exits**. The `INSERT` itself (lines 213-274) also has no `RETURNING id` — the new row's id is generated inline via `gen_random_uuid()` in SQL and never comes back to Python.
 
-Find where `missed_activity_cron.py` inserts the `status='ENDED', session_classification='MISSED'` row (the STEP-5B logic referenced in its module docstring). It already knows `farm_id`, `activity_schedule_id`, `activity_date` at that point.
+This means the alert evaluator **cannot** be called inline right after each `INSERT`, the way it was originally sketched: `evaluate_finalized_instance()` opens its own `get_cursor()` (a separate connection from the pool) and would try to `SELECT` a row that this transaction hasn't committed yet — invisible across connections under Postgres's default isolation. Calling it inline would either silently no-op (`instance_found: False`) or intermittently fail depending on pool connection reuse. **Corrected approach below: collect the newly-created MISSED instance ids during the loop, and only evaluate them after the outer commit.**
 
-- [ ] **Step 2: Add the two calls immediately after the INSERT, inside the same function, guarded so a matcher failure never blocks missed-activity detection**
+- [ ] **Step 1: Add `RETURNING id` to the existing INSERT and capture it**
 
+At [missed_activity_cron.py:263-265](../../../backend/aggregation/missed_activity_cron.py#L263-L265), change:
 ```python
-    # STEP C: resolve any still-ACTIVE ACTIVITY_LATE for this schedule/date
-    # (MISSED supersedes it -- see spec section 2), then let the finalized-
-    # instance matcher fire ACTIVITY_MISSED itself on the row we just made.
-    # Never let an alert-layer failure block missed-activity detection.
-    try:
+                    ON CONFLICT (farm_id, activity_schedule_id, activity_date)
+                    DO NOTHING
+                    """,
+```
+to:
+```python
+                    ON CONFLICT (farm_id, activity_schedule_id, activity_date)
+                    DO NOTHING
+                    RETURNING id
+                    """,
+```
+and immediately after the existing `if cur.rowcount:` block ([lines 276-289](../../../backend/aggregation/missed_activity_cron.py#L276-L289)), inside the `if cur.rowcount:` branch, capture the id:
+```python
+                if cur.rowcount:
+                    new_row = cur.fetchone()
+                    print(
+                        f"[MISSED_CREATED] "
+                        f"schedule={schedule_id} "
+                        f"activity_type={activity_type_id} "
+                        f"date={activity_date}"
+                    )
+                    newly_missed.append((new_row["id"], schedule_id, activity_date))
+                else:
+                    print(
+                        f"[MISSED_SKIPPED] "
+                        f"schedule={schedule_id} "
+                        f"date={activity_date} "
+                        f"reason=conflict"
+                    )
+```
+(leave the existing `else` branch's print exactly as-is — only the `if` branch changes).
+
+- [ ] **Step 2: Initialize the collector before the loop and evaluate alerts after the commit**
+
+Before the `with get_cursor() as cur:` block ([missed_activity_cron.py:109](../../../backend/aggregation/missed_activity_cron.py#L109)), add:
+```python
+    newly_missed = []  # (instance_id, schedule_id, activity_date) for STEP C alert evaluation, after commit
+```
+After the `with get_cursor() as cur:` block exits (i.e. after line 291's `cur.connection.commit()`, now outside the `with`, at the end of `detect_missed_activities()`), add:
+```python
+    # STEP C: now that the MISSED rows are committed and visible to other
+    # connections, resolve any still-ACTIVE ACTIVITY_LATE for the same
+    # (schedule, date) -- MISSED supersedes it -- and let the finalized-
+    # instance matcher fire ACTIVITY_MISSED on each new row. Never let an
+    # alert-layer failure block missed-activity detection itself, which has
+    # already fully committed by this point regardless of what happens below.
+    if newly_missed:
         from alerts.alert_conditions import resolve_active_occurrence
         from alerts.matchers import activity_matcher as _activity_matcher
 
-        late_dedup_key = f"{schedule_id}:{activity_date.isoformat()}"
-        with get_cursor() as cur:
-            cur.execute(
-                "SELECT id FROM alert_rule WHERE farm_id = %s AND activity_schedule_id = %s "
-                "AND alert_type = 'ACTIVITY' AND condition ->> 'metric' = 'minutes_since_ideal_start'",
-                (farm_id, schedule_id),
-            )
-            late_rules = cur.fetchall()
-        for rule in late_rules:
-            resolve_active_occurrence(rule_id=rule["id"], dedup_key=late_dedup_key)
+        for instance_id, schedule_id, activity_date in newly_missed:
+            try:
+                late_dedup_key = f"{schedule_id}:{activity_date.isoformat()}"
+                with get_cursor() as late_cur:
+                    late_cur.execute(
+                        "SELECT id FROM alert_rule WHERE activity_schedule_id = %s "
+                        "AND alert_type = 'ACTIVITY' AND condition ->> 'metric' = 'minutes_since_ideal_start'",
+                        (schedule_id,),
+                    )
+                    late_rules = late_cur.fetchall()
+                for rule in late_rules:
+                    resolve_active_occurrence(rule_id=rule["id"], dedup_key=late_dedup_key)
 
-        _activity_matcher.evaluate_finalized_instance(missed_instance_id)
-    except Exception as e:
-        print(f"[MISSED][ALERT_WARN] evaluator failed for instance={missed_instance_id}: {e}")
+                _activity_matcher.evaluate_finalized_instance(instance_id)
+            except Exception as e:
+                print(f"[MISSED][ALERT_WARN] evaluator failed for instance={instance_id}: {e}")
 ```
-
-(`missed_instance_id`, `farm_id`, `schedule_id`, `activity_date` are the existing local variables from the surrounding function — match exact names when integrating; if the function returns/computes the new instance's id under a different variable name, use that name instead of `missed_instance_id`.)
 
 - [ ] **Step 3: Manual verification against a real MISSED row**
 
@@ -701,7 +745,7 @@ Run: `cd backend && python -c "
 from aggregation.missed_activity_cron import detect_missed_activities
 detect_missed_activities()
 "`
-Then: `psql "$DATABASE_URL" -c "SELECT al.message, al.lifecycle_state FROM alert_log al JOIN alert_rule ar ON ar.id = al.alert_rule_id WHERE ar.name LIKE 'STEPB_TEST%' OR ar.name LIKE 'ACTIVITY_LATE%' OR ar.name LIKE 'ACTIVITY_MISSED%' ORDER BY al.triggered_at DESC LIMIT 5;"` — confirm no unhandled exception in stdout and (if a MISSED row was actually created this run) a matching `alert_log` row appears.
+Then: `psql "$DATABASE_URL" -c "SELECT al.message, al.lifecycle_state FROM alert_log al JOIN alert_rule ar ON ar.id = al.alert_rule_id WHERE ar.name LIKE 'ACTIVITY_LATE%' OR ar.name LIKE 'ACTIVITY_MISSED%' ORDER BY al.triggered_at DESC LIMIT 5;"` — confirm no unhandled exception in stdout and (if a MISSED row was actually created this run, check the `[MISSED_CREATED]` print lines) a matching `alert_log` row appears with `lifecycle_state = 'ACTIVE'`.
 
 - [ ] **Step 4: Commit**
 
@@ -1157,7 +1201,9 @@ git commit -m "Send detector-health pulse from watchdog, grounded in total_frame
 **Interfaces:**
 - Consumes: `activity_matcher.evaluate_late_start_sweep()` (Task 3), `activity_matcher.evaluate_in_progress_instance()` (existing, unwired until now), `posture_matcher.evaluate_zone_staleness()` (existing, unwired until now), `edge_device_matcher.evaluate_device_offline()` (existing, unwired until now), `edge_device_matcher.evaluate_detector_offline()` (Task 5).
 
-- [ ] **Step 1: Write the orchestrator, following `run_phase5.py`'s existing structure/print-logging convention**
+- [ ] **Step 1: Write the orchestrator, following `run_phase5.py`'s existing structure/print-logging convention, with an explicit non-blocking lock so overlapping runs skip instead of piling up**
+
+`workforce-phase5.timer` already runs its own `Type=oneshot` service every 60s without an explicit lock, relying on systemd not double-starting an already-active oneshot unit — but that's an implicit guarantee this plan shouldn't quietly inherit for a *second*, independent timer. `alerts_cron.py` sweeps 5 different evaluator types across every farm/device/zone/schedule, so it's more likely to occasionally run long than the existing phase5 job; make the guard explicit and self-contained (works even if the systemd-level behavior ever changes) via a non-blocking `flock` on a fixed lock file — if a previous run is still in flight, the new invocation logs and exits immediately rather than running concurrently or queueing:
 
 ```python
 #!/usr/bin/env python3
@@ -1178,8 +1224,18 @@ and missed_activity_cron.py).
 
 Each evaluator call is independently guarded: one farm/device/zone/schedule
 failing must never block the others in the same sweep.
+
+Overlap safety: a non-blocking flock on LOCK_FILE_PATH means that if one
+run takes longer than the 60s timer interval, the next invocation detects
+the lock, logs, and exits immediately (does not block waiting, does not
+run concurrently, does not queue up). WORKFORCE_DETECTOR_OFFLINE's 5-minute
+threshold and ACTIVITY_LATE's 30-minute threshold both have wide enough
+margins that an occasional skipped tick is harmless -- this only needs to
+prevent pile-up, not guarantee every single tick runs.
 """
 
+import fcntl
+import os
 from pathlib import Path
 import sys
 
@@ -1189,6 +1245,8 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from common.db import get_cursor
 from alerts.matchers import activity_matcher, posture_matcher, edge_device_matcher
+
+LOCK_FILE_PATH = os.getenv("ALERTS_CRON_LOCK_FILE", "/tmp/workforce_alerts_cron.lock")
 
 
 def run():
@@ -1236,18 +1294,39 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+
+def main_with_lock():
+    lock_fd = open(LOCK_FILE_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("[ALERTS_CRON] previous run still in progress -- skipping this tick")
+        return
+    try:
+        run()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 ```
 
-- [ ] **Step 2: Run it manually against dev/staging and confirm no unhandled exception**
+Then change the `if __name__ == "__main__":` block to call the locked entry point instead:
+```python
+if __name__ == "__main__":
+    main_with_lock()
+```
+(remove the earlier standalone `if __name__ == "__main__": run()` shown above — `main_with_lock()` is the only script entry point; `run()` itself stays callable directly by tests without the lock, since a test process isn't racing the systemd timer.)
 
-Run: `cd backend && python aggregation/alerts_cron.py`
-Expected: prints each `[ALERTS_CRON] ... sweep...` line and any per-item `[ERROR]` lines (should be none on a healthy dev DB with fixture data), exits 0.
+- [ ] **Step 2: Run it twice concurrently to verify the lock actually prevents overlap**
+
+Run: `cd backend && python aggregation/alerts_cron.py & python aggregation/alerts_cron.py & wait`
+Expected: one process prints the normal `[ALERTS_CRON] ... sweep...` sequence and exits 0; the other prints `[ALERTS_CRON] previous run still in progress -- skipping this tick` and exits 0 immediately (or, if the first run finishes fast enough before the second starts, both may run to completion sequentially instead — acceptable, since the guarantee is "no two runs execute their sweeps concurrently," not "the second run always skips").
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add backend/aggregation/alerts_cron.py
-git commit -m "Add alerts_cron.py: Step C periodic evaluator orchestrator"
+git commit -m "Add alerts_cron.py: Step C periodic evaluator orchestrator with overlap lock"
 ```
 
 ---
@@ -1391,7 +1470,8 @@ git commit -m "Add workforce-alerts systemd timer (Step C, not yet installed)"
 - **`ACTIVITY_EARLY` coverage gap:** only wired at the two known `INSERT INTO activity_instance` sites (Task 9). `reopen_missed_activity_instance()` (a third path that reactivates an existing MISSED row rather than creating a new one) is NOT covered — if a reopened MISSED slot's `actual_start_at` also qualifies as "early," no alert fires. Flagged, not fixed, per the frozen spec's "explicitly analyze the safest integration point" instruction — YAGNI until this is shown to matter in practice.
 - **`alert_rule` seed script (Task 2) is farm-specific** (hardcodes the one production farm ID) — must be re-run (or generalized) before onboarding a second farm.
 - **Timezone/DST:** all local-time math in `evaluate_late_start_sweep`/`evaluate_early_start` goes through `pytz.timezone(farm["timezone"])`, matching the existing pattern in `evaluate_in_progress_instance`. Farm timezone is `Asia/Kolkata` (no DST) for the current farm — DST correctness for a future farm in a DST-observing timezone is untested by this plan's test scripts.
-- **`alerts_cron.py` and `missed_activity_cron.py`/`activity_aggregator.py` run on independent timers** (60s vs. 60s vs. on-demand) — there's no cross-process locking. A `ACTIVITY_LATE` sweep and a `missed_activity_cron.py` run resolving the same dedup key could theoretically race; `resolve_active_occurrence`'s `UPDATE ... WHERE lifecycle_state = 'ACTIVE'` is naturally idempotent under this race (worst case: a harmless redundant no-op UPDATE), so no additional locking is added here.
+- **`alerts_cron.py` has its own overlap lock (Task 8) but is not locked against `missed_activity_cron.py`/`activity_aggregator.py`**, which run on independent timers (60s vs. 60s vs. on-demand). A `ACTIVITY_LATE` sweep and a `missed_activity_cron.py` run resolving the same dedup key could theoretically race across processes; `resolve_active_occurrence`'s `UPDATE ... WHERE lifecycle_state = 'ACTIVE'` is naturally idempotent under this race (worst case: a harmless redundant no-op UPDATE), so no additional cross-process locking is added for that case.
+- **`alerts_cron.py`'s flock is non-blocking and skip-on-contention, not queue-on-contention** — an occasional skipped 60s tick is an accepted tradeoff, not a bug: `WORKFORCE_DETECTOR_OFFLINE`'s 5-minute threshold and `ACTIVITY_LATE`'s 30-minute threshold both have wide enough margins that missing one tick out of every ~5-30 has no user-visible effect.
 - **`notification_dispatcher.py`'s JOIN issue is out of scope** — confirmed nothing in this plan reads through it; left for Step D as originally decided.
 
 ## Explicit list of things intentionally NOT changing
