@@ -100,3 +100,61 @@ def evaluate_device_offline(device_id):
         "alerts_created": created,
         "alerts_resolved": resolved,
     }
+
+
+_DETECTOR_AGE_METRIC = "detector_heartbeat_age_minutes"
+
+
+def evaluate_detector_offline(device_id):
+    """
+    STEP C — WORKFORCE_DETECTOR_OFFLINE. Driven purely by freshness/absence
+    of edge_device.detector_last_seen_at (set by the new detector-heartbeat
+    ingest endpoint, see api/edge_detector_health_api.py) -- never by a
+    received payload's detector_healthy value. A NULL detector_last_seen_at
+    (new device, or pre-Step-C rollout) is "not yet observed", not "stale":
+    do not alert on it, matching evaluate_device_offline's identical
+    handling of last_seen_at IS NULL.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT id, farm_id, detector_last_seen_at FROM edge_device WHERE id = %s",
+            (device_id,),
+        )
+        device = cur.fetchone()
+        if not device:
+            return {"device_found": False}
+        rules = _load_edge_device_rules(cur, device["farm_id"])
+
+    if device["detector_last_seen_at"] is None:
+        return {"device_found": True, "age_minutes": None, "alerts_created": []}
+
+    age_minutes = (utc_now() - device["detector_last_seen_at"]).total_seconds() / 60.0
+
+    created = []
+    resolved = 0
+    dedup_key = str(device_id)
+    for rule in rules:
+        condition = rule["condition"] or {}
+        if condition.get("metric") != _DETECTOR_AGE_METRIC:
+            continue
+
+        if condition_matches(condition, age_minutes):
+            inserted = upsert_active_alert(
+                farm_id=device["farm_id"],
+                rule=rule,
+                dedup_key=dedup_key,
+                message=f"{rule['name']}: no detector-health pulse in {age_minutes:.1f} minutes.",
+                details={"device_id": str(device_id), "detector_heartbeat_age_minutes": round(age_minutes, 2)},
+                device_id=device_id,
+            )
+            if inserted:
+                created.append(rule["id"])
+        else:
+            resolved += resolve_active_occurrence(rule_id=rule["id"], dedup_key=dedup_key)
+
+    return {
+        "device_found": True,
+        "age_minutes": age_minutes,
+        "alerts_created": created,
+        "alerts_resolved": resolved,
+    }
