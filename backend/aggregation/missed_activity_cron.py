@@ -105,7 +105,13 @@ def detect_missed_activities():
     """
     
     now_utc = utc_now()
-    
+
+    # STEP C: (instance_id, farm_id, activity_type_id, schedule_id, activity_date)
+    # for every newly-created MISSED row this run, evaluated for alerts only
+    # after the outer commit below (see module-level note in task-4-brief.md
+    # -- evaluating inline would read across an uncommitted connection).
+    newly_missed = []
+
     with get_cursor() as cur:
         # 1. Load all active schedules with farm timezone
         cur.execute(
@@ -262,6 +268,7 @@ def detect_missed_activities():
                     )
                     ON CONFLICT (farm_id, activity_schedule_id, activity_date)
                     DO NOTHING
+                    RETURNING id
                     """,
                     (
                         farm_id,
@@ -274,11 +281,15 @@ def detect_missed_activities():
                 )
 
                 if cur.rowcount:
+                    new_row = cur.fetchone()
                     print(
                         f"[MISSED_CREATED] "
                         f"schedule={schedule_id} "
                         f"activity_type={activity_type_id} "
                         f"date={activity_date}"
+                    )
+                    newly_missed.append(
+                        (new_row["id"], farm_id, activity_type_id, schedule_id, activity_date)
                     )
                 else:
                     print(
@@ -289,6 +300,24 @@ def detect_missed_activities():
                     )
 
         cur.connection.commit()
+
+    # STEP C: now that the MISSED rows are committed and visible to other
+    # connections, resolve any still-ACTIVE ACTIVITY_LATE for the same
+    # (schedule, date) -- MISSED supersedes it -- and let the finalized-
+    # instance matcher fire ACTIVITY_MISSED on each new row. Never let an
+    # alert-layer failure block missed-activity detection itself, which has
+    # already fully committed by this point regardless of what happens below.
+    if newly_missed:
+        from alerts.matchers import activity_matcher as _activity_matcher
+
+        for instance_id, farm_id, activity_type_id, schedule_id, activity_date in newly_missed:
+            try:
+                _activity_matcher.resolve_late_start_alerts_for_occurrence(
+                    farm_id, activity_type_id, schedule_id, activity_date
+                )
+                _activity_matcher.evaluate_finalized_instance(instance_id)
+            except Exception as e:
+                print(f"[MISSED][ALERT_WARN] evaluator failed for instance={instance_id}: {e}")
 
 
 # -------------------------------------------------

@@ -321,11 +321,57 @@ def evaluate_late_start_sweep(farm_id=None):
                     },
                 )
                 if inserted:
-                    created.append(rule["id"])
+                    # Part F(b): close (not eliminate -- full atomicity would
+                    # need cross-process locking, out of scope) the race
+                    # window between this function's own read of
+                    # instance_exists above and this INSERT: re-check right
+                    # now, cheaply, whether an activity_instance has since
+                    # appeared (e.g. missed_activity_cron.py's MISSED insert
+                    # landed in between). If so, self-correct immediately
+                    # instead of leaving a stray ACTIVE alert for a whole
+                    # sweep interval.
+                    with get_cursor() as recheck_cur:
+                        recheck_cur.execute(
+                            """
+                            SELECT 1 FROM activity_instance
+                            WHERE farm_id = %s AND activity_schedule_id = %s AND activity_date = %s
+                            LIMIT 1
+                            """,
+                            (sched["farm_id"], sched["schedule_id"], today_local),
+                        )
+                        instance_now_exists = recheck_cur.fetchone() is not None
+                    if instance_now_exists:
+                        resolved += resolve_active_occurrence(rule_id=rule["id"], dedup_key=dedup_key)
+                    else:
+                        created.append(rule["id"])
             elif instance_exists:
                 resolved += resolve_active_occurrence(rule_id=rule["id"], dedup_key=dedup_key)
 
     return {"schedules_evaluated": len(schedules), "alerts_created": created, "alerts_resolved": resolved}
+
+
+def resolve_late_start_alerts_for_occurrence(farm_id, activity_type_id, activity_schedule_id, activity_date):
+    """
+    STEP C -- called by missed_activity_cron.py after a new ACTIVITY_MISSED
+    row commits, to resolve any still-ACTIVE ACTIVITY_LATE for the SAME
+    occurrence (MISSED supersedes LATE). Reuses the exact same rule-scoping
+    mechanism as evaluate_late_start_sweep() (_load_activity_rules) rather
+    than a separate/duplicated lookup -- never falls back to matching by
+    activity_type_id alone; the schedule_id + activity_date pairing (via
+    the dedup_key) is the sole occurrence identity.
+    """
+    if activity_schedule_id is None:
+        return 0
+    with get_cursor() as cur:
+        rules = _load_activity_rules(cur, farm_id, activity_type_id, activity_schedule_id)
+    dedup_key = f"{activity_schedule_id}:{activity_date.isoformat()}"
+    resolved = 0
+    for rule in rules:
+        condition = rule["condition"] or {}
+        if condition.get("metric") != _LATE_START_METRIC:
+            continue
+        resolved += resolve_active_occurrence(rule_id=rule["id"], dedup_key=dedup_key)
+    return resolved
 
 
 def evaluate_in_progress_instance(activity_instance_id):
