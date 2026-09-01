@@ -53,6 +53,14 @@ from alerts.alert_conditions import (
 
 _SCHEDULE_ADHERENCE_METRIC = "session_classification"
 _RUNNING_LONG_METRIC = "elapsed_minutes_since_start"
+_EARLY_START_METRIC = "minutes_before_ideal_start"
+_LATE_START_METRIC = "minutes_since_ideal_start"
+
+
+def _ideal_start_local(schedule_row, activity_date, farm_tz):
+    """schedule_row needs ideal_start_time; farm_tz is a pytz timezone."""
+    naive = datetime.combine(activity_date, schedule_row["ideal_start_time"])
+    return farm_tz.localize(naive)
 
 
 def _load_instance(cur, activity_instance_id):
@@ -119,6 +127,14 @@ def evaluate_finalized_instance(activity_instance_id):
             continue
 
         target_value = condition.get("value")
+        if target_value == "LATE":
+            # STEP C: ACTIVITY_LATE is now generated exclusively by the
+            # schedule-keyed evaluate_late_start_sweep() operational evaluator
+            # (see docs/superpowers/specs/2026-08-31-alert-system-step-c-design.md
+            # §2). Finalization must not create a second, separate ACTIVITY_LATE
+            # alert for the historical session_classification='LATE' fact --
+            # that remains purely historical/reporting.
+            continue
         immediately_resolve = target_value == "UNSCHEDULED"
 
         inserted = upsert_active_alert(
@@ -158,6 +174,158 @@ def evaluate_finalized_instance(activity_instance_id):
         )
 
     return {"instance_found": True, "rules_evaluated": len(rules), "alerts_created": created}
+
+
+def evaluate_early_start(activity_instance_id):
+    """
+    STEP C — ACTIVITY_EARLY. Point-in-time, instance-keyed: fires (already
+    RESOLVED) the moment an instance's actual_start_at is more than
+    alert_early_start_min before its schedule's ideal_start_time. Never
+    derived from session_classification -- that stays historical/reporting.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT ai.id, ai.farm_id, ai.activity_type_id, ai.activity_schedule_id,
+                   ai.actual_start_at, ai.zone_id, ai.activity_date,
+                   s.ideal_start_time, f.timezone
+            FROM activity_instance ai
+            JOIN activity_schedule s ON s.id = ai.activity_schedule_id
+            JOIN farm f ON f.id = ai.farm_id
+            WHERE ai.id = %s
+            """,
+            (activity_instance_id,),
+        )
+        row = cur.fetchone()
+        if not row or row["actual_start_at"] is None or row["activity_schedule_id"] is None:
+            return {"instance_found": bool(row), "alerts_created": []}
+        rules = _load_activity_rules(cur, row["farm_id"], row["activity_type_id"], row["activity_schedule_id"])
+
+    farm_tz = pytz.timezone(row["timezone"])
+    start_local = row["actual_start_at"].astimezone(farm_tz)
+    # Use the instance's own activity_date (already resolved correctly at
+    # instance-creation time by activity_aggregator.compute_activity_date,
+    # which handles midnight-crossing schedules) rather than recomputing it
+    # from start_local.date() here.
+    ideal_start_local = _ideal_start_local(row, row["activity_date"], farm_tz)
+    minutes_before = (ideal_start_local - start_local).total_seconds() / 60.0
+
+    created = []
+    for rule in rules:
+        condition = rule["condition"] or {}
+        if condition.get("metric") != _EARLY_START_METRIC:
+            continue
+        if not condition_matches(condition, minutes_before):
+            continue
+
+        # upsert_active_alert's idempotency guard only blocks a duplicate
+        # when an ACTIVE row with the same (rule_id, dedup_key) already
+        # exists. immediately_resolve=True inserts an already-RESOLVED row,
+        # so that guard never fires here and repeated evaluation of the same
+        # instance would otherwise insert a new RESOLVED row every time.
+        # This local, instance-scoped check covers that gap without touching
+        # the shared helper (which stays correct for every other matcher).
+        with get_cursor() as cur2:
+            cur2.execute(
+                "SELECT 1 FROM alert_log WHERE alert_rule_id = %s AND dedup_key = %s LIMIT 1",
+                (rule["id"], str(row["id"])),
+            )
+            already_recorded = cur2.fetchone() is not None
+        if already_recorded:
+            continue
+
+        inserted = upsert_active_alert(
+            farm_id=row["farm_id"],
+            rule=rule,
+            dedup_key=str(row["id"]),
+            message=f"{rule['name']}: activity started {minutes_before:.0f} minutes early.",
+            details={
+                "activity_type_id": row["activity_type_id"],
+                "activity_schedule_id": str(row["activity_schedule_id"]),
+                "minutes_before_ideal_start": round(minutes_before, 1),
+            },
+            activity_instance_id=row["id"],
+            zone_id=row["zone_id"],
+            immediately_resolve=True,
+        )
+        if inserted:
+            created.append(rule["id"])
+
+    return {"instance_found": True, "alerts_created": created}
+
+
+def evaluate_late_start_sweep(farm_id=None):
+    """
+    STEP C — ACTIVITY_LATE. Schedule-keyed periodic sweep (called from
+    aggregation/alerts_cron.py every 60s), not instance-keyed -- by
+    definition no activity_instance exists yet when this should first fire.
+    Deliberately ignores activity_schedule.tolerance_late_min (that's
+    ACTIVITY_MISSED's mechanism); uses alert_rule.condition's own
+    minutes_since_ideal_start threshold instead.
+    """
+    with get_cursor() as cur:
+        query = """
+            SELECT s.id AS schedule_id, s.farm_id, s.activity_type_id,
+                   s.ideal_start_time, f.timezone
+            FROM activity_schedule s
+            JOIN farm f ON f.id = s.farm_id
+            WHERE s.is_active = true
+        """
+        params = ()
+        if farm_id:
+            query += " AND s.farm_id = %s"
+            params = (farm_id,)
+        cur.execute(query, params)
+        schedules = cur.fetchall()
+
+    created = []
+    resolved = 0
+    for sched in schedules:
+        farm_tz = pytz.timezone(sched["timezone"])
+        now_local = datetime.now(timezone.utc).astimezone(farm_tz)
+        today_local = now_local.date()
+        ideal_start_local = _ideal_start_local(sched, today_local, farm_tz)
+        minutes_since = (now_local - ideal_start_local).total_seconds() / 60.0
+        if minutes_since < 0:
+            continue  # ideal start hasn't happened yet today
+
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM activity_instance
+                WHERE farm_id = %s AND activity_schedule_id = %s AND activity_date = %s
+                LIMIT 1
+                """,
+                (sched["farm_id"], sched["schedule_id"], today_local),
+            )
+            instance_exists = cur.fetchone() is not None
+            rules = _load_activity_rules(cur, sched["farm_id"], sched["activity_type_id"], sched["schedule_id"])
+
+        dedup_key = f"{sched['schedule_id']}:{today_local.isoformat()}"
+        for rule in rules:
+            condition = rule["condition"] or {}
+            if condition.get("metric") != _LATE_START_METRIC:
+                continue
+
+            if not instance_exists and condition_matches(condition, minutes_since):
+                inserted = upsert_active_alert(
+                    farm_id=sched["farm_id"],
+                    rule=rule,
+                    dedup_key=dedup_key,
+                    message=f"{rule['name']}: no activity started {minutes_since:.0f} minutes after ideal start.",
+                    details={
+                        "activity_type_id": sched["activity_type_id"],
+                        "activity_schedule_id": str(sched["schedule_id"]),
+                        "activity_date": today_local.isoformat(),
+                        "minutes_since_ideal_start": round(minutes_since, 1),
+                    },
+                )
+                if inserted:
+                    created.append(rule["id"])
+            elif instance_exists:
+                resolved += resolve_active_occurrence(rule_id=rule["id"], dedup_key=dedup_key)
+
+    return {"schedules_evaluated": len(schedules), "alerts_created": created, "alerts_resolved": resolved}
 
 
 def evaluate_in_progress_instance(activity_instance_id):

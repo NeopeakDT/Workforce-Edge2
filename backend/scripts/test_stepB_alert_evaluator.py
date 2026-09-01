@@ -114,6 +114,18 @@ def test_activity_missed():
 
 
 def test_activity_late_and_recovery():
+    # STEP C (deliberate, spec-mandated change -- not a bug fix): per
+    # docs/superpowers/specs/2026-08-31-alert-system-step-c-design.md §2,
+    # finalization with session_classification='LATE' must no longer create
+    # a second, separate ACTIVITY_LATE alert -- that alert is now generated
+    # exclusively by the new schedule-keyed evaluate_late_start_sweep()
+    # operational evaluator (see activity_matcher.evaluate_finalized_instance,
+    # which now `continue`s past any rule whose condition targets
+    # session_classification == 'LATE'). This test's assertions are updated
+    # to match: finalizing a LATE instance must create NO alert_log row for
+    # a session_classification='LATE' rule, and the schedule-wide recovery
+    # call (still invoked, still lists "LATE") remains a harmless no-op
+    # since nothing creates such rows anymore.
     rule_ids = []
     try:
         with get_cursor() as cur:
@@ -125,15 +137,15 @@ def test_activity_late_and_recovery():
         rule_ids.append(late_rule_id)
 
         result = alert_evaluator.evaluate_activity_alerts(EXISTING_LATE_INSTANCE)
-        check("ACTIVITY_LATE: alert created", late_rule_id in result.get("alerts_created", []))
+        check("ACTIVITY_LATE: finalization no longer creates this alert (Step C Correction 1)",
+              late_rule_id not in result.get("alerts_created", []))
 
         rows = fetch_alert_logs(late_rule_id)
-        check("ACTIVITY_LATE: one ACTIVE row", len(rows) == 1 and rows[0]["lifecycle_state"] == "ACTIVE")
-        check("ACTIVITY_LATE: message says 'completed late', not 'running late'",
-              rows and "completed late" in rows[0]["message"] and "running" not in rows[0]["message"].lower(),
-              detail=str(rows[0]["message"]) if rows else "no row")
+        check("ACTIVITY_LATE: zero alert_log rows after finalization", len(rows) == 0, f"got {len(rows)}")
 
-        # Simulate a later successful occurrence of the SAME schedule -> must resolve the LATE alert.
+        # Simulate a later successful occurrence of the SAME schedule -> the
+        # LATE/MISSED schedule-wide recovery call still runs, but since no
+        # LATE alert was ever created, it has nothing to resolve (no-op).
         synthetic_id = str(uuid.uuid4())
         with get_cursor() as cur:
             cur.execute(
@@ -151,13 +163,9 @@ def test_activity_late_and_recovery():
 
         rows_after = fetch_alert_logs(late_rule_id)
         check(
-            "ACTIVITY_LATE: resolved after ON_TIME occurrence of same schedule",
-            rows_after and rows_after[0]["lifecycle_state"] == "RESOLVED" and rows_after[0]["resolved_at"] is not None,
+            "ACTIVITY_LATE: still zero rows after a later ON_TIME occurrence (recovery no-op)",
+            len(rows_after) == 0,
             detail=str([dict(r) for r in rows_after]),
-        )
-        check(
-            "ACTIVITY_LATE: alert_log row NOT deleted (kept for history)",
-            len(rows_after) == 1,
         )
 
         cleanup([], extra_instance_ids=[synthetic_id])
