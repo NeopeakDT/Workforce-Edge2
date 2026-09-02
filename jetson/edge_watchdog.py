@@ -11,6 +11,7 @@ import os
 import subprocess
 import time
 
+import requests
 from dotenv import load_dotenv
 
 
@@ -28,6 +29,18 @@ DETECTOR_SERVICE_NAME = os.getenv(
     "EDGE_DETECTOR_SERVICE_NAME",
     "workforce-edge.service",
 )
+
+# Detector-health pulse config. Unlike edge_heartbeat_agent.py, this
+# process's primary job is local restart-on-hang, so a missing
+# API_BASE/DEVICE_KEY must NOT prevent the watchdog from running --
+# it just means the pulse is never sent (see send_detector_health_pulse).
+API_BASE = os.getenv("EDGE_API_BASE")
+DEVICE_KEY = os.getenv("EDGE_DEVICE_KEY")
+DETECTOR_PULSE_INTERVAL_SEC = int(os.getenv("EDGE_DETECTOR_PULSE_INTERVAL_SEC", "60"))
+
+# Persists across main() loop iterations; last time send_detector_health_pulse
+# returned True (not last attempt).
+_last_pulse_sent_at = 0.0
 
 
 def read_heartbeat_age_seconds():
@@ -100,6 +113,50 @@ def is_system_stuck(payload):
     return True
 
 
+def send_detector_health_pulse(payload):
+    """
+    Send a detector-health pulse to the backend.
+
+    Must only ever be called from the watchdog's already-confirmed-healthy
+    branch (Branch 3: is_system_stuck() evaluated and returned False for
+    this payload) -- so detector_healthy is always True here; there is
+    nothing left to compute or derive. The backend endpoint itself is
+    dumb and records whatever it's told, so all health-decision
+    responsibility lives here, in whether this function is called at all.
+
+    Returns True only on a genuine HTTP 200. Never raises.
+    """
+    if not API_BASE or not DEVICE_KEY:
+        return False
+
+    body = {
+        "detector_healthy": True,
+        "total_frames": payload.get("total_frames", 0),
+        "camera_count": len(payload.get("camera_last_seen") or {}),
+    }
+
+    base_url = API_BASE.rstrip("/")
+    endpoint = f"{base_url}/ingest/detector-heartbeat"
+
+    try:
+        resp = requests.post(
+            endpoint,
+            headers={"X-DEVICE-KEY": DEVICE_KEY},
+            json=body,
+            timeout=5,
+        )
+
+        if resp.status_code != 200:
+            print(f"[WATCHDOG][PULSE][ERROR] HTTP {resp.status_code}: {resp.text[:200]}")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"[WATCHDOG][PULSE][ERROR] {str(e)[:200]}")
+        return False
+
+
 def restart_detector():
     # If the unit already hit its StartLimitBurst/StartLimitIntervalSec
     # window (crash-looped too many times, e.g. from persistent RTSP
@@ -136,10 +193,17 @@ def restart_detector():
 
 
 def main():
+    global _last_pulse_sent_at
+
     print("Edge Watchdog started")
     print(f"Watching  : {WATCHDOG_FILE_PATH}")
     print(f"Timeout   : {WATCHDOG_TIMEOUT_SEC}s")
     print(f"Service   : {DETECTOR_SERVICE_NAME}")
+    if not API_BASE or not DEVICE_KEY:
+        print(
+            "[WATCHDOG] EDGE_API_BASE/EDGE_DEVICE_KEY not set -- "
+            "detector-health pulses disabled (restart logic unaffected)"
+        )
 
     while True:
         payload = read_heartbeat_payload()
@@ -159,6 +223,9 @@ def main():
             restart_detector()
             time.sleep(WATCHDOG_TIMEOUT_SEC)
         else:
+            if payload is not None and time.time() - _last_pulse_sent_at >= DETECTOR_PULSE_INTERVAL_SEC:
+                if send_detector_health_pulse(payload):
+                    _last_pulse_sent_at = time.time()
             time.sleep(CHECK_INTERVAL_SEC)
 
 
