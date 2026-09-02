@@ -78,6 +78,7 @@ if ENABLE_EDGE_BOOTSTRAP_APIS:
 if ENABLE_INGEST_APIS:
     from api.event_ingest_api import router as event_ingest_router
     from api.heartbeat_ingest_api import router as heartbeat_ingest_router
+    from api.edge_detector_health_api import router as edge_detector_health_router
 
     app.include_router(
         event_ingest_router,
@@ -87,6 +88,12 @@ if ENABLE_INGEST_APIS:
 
     app.include_router(
         heartbeat_ingest_router,
+        prefix="/api/v1",
+        tags=["ingestion"],
+    )
+
+    app.include_router(
+        edge_detector_health_router,
         prefix="/api/v1",
         tags=["ingestion"],
     )
