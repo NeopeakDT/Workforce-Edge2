@@ -72,6 +72,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from common.db import get_cursor
 from common.time_utils import utc_now
+from alerts.matchers import activity_matcher as _alert_activity_matcher
 
 from aggregation.activity_schedule_resolver import (
     ideal_window_utc_bounds,
@@ -560,11 +561,18 @@ def resolve_fallback_instance_or_skip(
     event_row_id,
     event_columns,
     fatal_label,
+    newly_created_ids=None,
 ):
     """
     Last-resort INSERT when session restore, bucket attach, and ENDED extension all miss (backlog /
     fragmentation). Retry via `merge_processed=FALSE` semantics on failure paths.
     Disabled when `AGG_DISABLE_FALLBACK_INSTANCE_CREATE` is truthy.
+
+    `newly_created_ids`, when given a list, gets the new instance id appended
+    ONLY on a genuine fresh INSERT (the `if row:` branch below) -- never on the
+    reattach/reuse/fallback branches further down that return an id for an
+    EXISTING instance. Callers use this to run post-commit, cross-connection
+    alert evaluation (e.g. ACTIVITY_EARLY) only for instances that are truly new.
     """
     if os.getenv("AGG_DISABLE_FALLBACK_INSTANCE_CREATE", "").lower() in (
         "1",
@@ -640,6 +648,8 @@ def resolve_fallback_instance_or_skip(
             f"[FALLBACK_INSTANCE] created instance_id={iid} event_row_id={event_row_id} "
             f"reason={fatal_label}"
         )
+        if newly_created_ids is not None:
+            newly_created_ids.append(iid)
         return iid
 
     # INSERT was skipped by ON CONFLICT -- any of the 4 unique indexes on
@@ -1945,6 +1955,12 @@ def run(max_loops=None):
         processed = False
         now_ts = time.time()
 
+        # Reset per iteration: ids of instances genuinely freshly-created (real
+        # INSERT ... RETURNING id, never reattach/reuse/fallback) this batch.
+        # Drained (post-commit, once the enclosing get_cursor() block below has
+        # exited) for ACTIVITY_EARLY evaluation. Must not leak across iterations.
+        newly_created_instance_ids = []
+
         # Cleanup stale session map entries to prevent unbounded memory growth.
         for sid, (_, last_touch_ts) in list(session_map.items()):
             if now_ts - last_touch_ts > MAX_SESSION_AGE_SEC:
@@ -2873,6 +2889,7 @@ def run(max_loops=None):
                                 _new_row = cur.fetchone()
                                 if _new_row:
                                     instance_id = _new_row["id"]
+                                    newly_created_instance_ids.append(instance_id)
                                     print(
                                         f"[DEBUG] CREATED-NEW → instance_id={instance_id} "
                                         f"schedule_id={schedule_id}"
@@ -3044,6 +3061,7 @@ def run(max_loops=None):
                                             e["event_row_id"],
                                             event_columns,
                                             "START UniqueViolation recovery miss",
+                                            newly_created_ids=newly_created_instance_ids,
                                         )
                                         if instance_id is None:
                                             continue
@@ -3089,6 +3107,7 @@ def run(max_loops=None):
                                                 e["event_row_id"],
                                                 event_columns,
                                                 "START duplicate guard gap exceeded",
+                                                newly_created_ids=newly_created_instance_ids,
                                             )
                                             if instance_id is None:
                                                 continue
@@ -3153,6 +3172,7 @@ def run(max_loops=None):
                                                 e["event_row_id"],
                                                 event_columns,
                                                 "START MISSED reopen raced",
+                                                newly_created_ids=newly_created_instance_ids,
                                             )
                                             if instance_id is None:
                                                 continue
@@ -3214,6 +3234,7 @@ def run(max_loops=None):
                                                     e["event_row_id"],
                                                     event_columns,
                                                     "START ENDED replay gap exceeded",
+                                                    newly_created_ids=newly_created_instance_ids,
                                                 )
                                                 if instance_id is None:
                                                     continue
@@ -3280,6 +3301,7 @@ def run(max_loops=None):
                                             e["event_row_id"],
                                             event_columns,
                                             "START finalized unrecoverable",
+                                            newly_created_ids=newly_created_instance_ids,
                                         )
 
                                         if instance_id is None:
@@ -3313,6 +3335,7 @@ def run(max_loops=None):
                                 e["event_row_id"],
                                 event_columns,
                                 "START path exhausted",
+                                newly_created_ids=newly_created_instance_ids,
                             )
                             if instance_id is None:
                                 continue
@@ -3373,6 +3396,7 @@ def run(max_loops=None):
                                 e["event_row_id"],
                                 event_columns,
                                 f"{etype} attach exhausted",
+                                newly_created_ids=newly_created_instance_ids,
                             )
                             if instance_id:
                                 session_map[session_id] = (instance_id, time.time())
@@ -3594,6 +3618,17 @@ def run(max_loops=None):
             cleanup_stale_instances(cur, session_map)
             normalize_null_instance_statuses(cur)
             cur.connection.commit()
+
+        # Post-commit: the batch's `with get_cursor()` block above has exited,
+        # so this iteration's inserts are committed and visible cross-connection.
+        # evaluate_early_start() opens its own DB connection internally -- it
+        # MUST run out here, never inside the still-open batch transaction above,
+        # or it would query rows its own connection cannot see yet.
+        for _iid in newly_created_instance_ids:
+            try:
+                _alert_activity_matcher.evaluate_early_start(_iid)
+            except Exception as e:
+                print(f"[ALERT_WARN] evaluate_early_start failed for instance={_iid}: {e}")
 
         if not processed:
             time.sleep(2)   # no load → slow polling

@@ -1,0 +1,30 @@
+# Workforce Alerts Service (Compliance Alert Evaluation + Dispatch)
+#
+# What it does:
+# - Runs the alerts cron batch once per invocation.
+# - Evaluates compliance-derived alert conditions and dispatches notifications
+#   for instances/schedules that crossed an alert threshold since the last run.
+#
+# How to use:
+# 1) sudo cp systemd/workforce-alerts.service /etc/systemd/system/workforce-alerts.service
+# 2) sudo cp systemd/workforce-alerts.timer /etc/systemd/system/workforce-alerts.timer
+# 3) sudo systemctl daemon-reload
+# 4) sudo systemctl enable workforce-alerts.timer
+# 5) sudo systemctl start workforce-alerts.timer
+     sudo systemctl stop workforce-alerts.timer
+# 6) systemctl list-timers --all | grep workforce-alerts (--status)
+     journalctl -u workforce-alerts.service -f (--log)
+#-----------------------------------------------------------------------------------------------
+
+
+[Unit]
+Description=Workforce Alerts (Compliance Alert Evaluation + Dispatch)
+After=network.target
+
+[Service]
+Type=oneshot
+# Use backend/ as cwd so python-dotenv loads the same .env as workforce-backend (DATABASE_URL, etc.).
+WorkingDirectory=/home/neopeak/Desktop/workforce/Edge2/backend
+ExecStart=/home/neopeak/edge2/bin/python aggregation/alerts_cron.py
+Environment=PYTHONUNBUFFERED=1
+User=neopeak

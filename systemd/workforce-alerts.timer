@@ -1,0 +1,23 @@
+# Workforce Alerts Timer
+#
+# What it does:
+# - Triggers workforce-alerts.service every 60 seconds.
+# - Starts one minute after boot.
+#
+# How to use:
+# 1) sudo cp systemd/workforce-alerts.timer /etc/systemd/system/workforce-alerts.timer
+# 2) sudo systemctl daemon-reload
+# 3) sudo systemctl enable workforce-alerts.timer
+# 4) sudo systemctl start workforce-alerts.timer
+# 5) systemctl list-timers --all | grep workforce-alerts
+
+[Unit]
+Description=Run Workforce Alerts every 1 minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+Unit=workforce-alerts.service
+
+[Install]
+WantedBy=timers.target
