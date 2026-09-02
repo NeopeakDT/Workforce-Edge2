@@ -94,11 +94,11 @@ class MainLoopPulseGuardTests(unittest.TestCase):
     """
     Exercise the single iteration of main()'s loop body that decides whether
     to call send_detector_health_pulse, without running the real infinite
-    loop. We reproduce the loop body's branch structure directly against
-    edge_watchdog's real functions (is_system_stuck, read_heartbeat_payload,
-    read_heartbeat_age_seconds) via monkeypatching, mirroring exactly what
-    main() does, so a change to main()'s wiring would be caught by testing
-    main() itself in test_full_iteration_wiring below.
+    loop. main()'s loop body is extracted into
+    edge_watchdog.run_one_watchdog_cycle(payload, age_seconds); these tests
+    call that real function directly (with restart_detector/requests.post/
+    time mocked), so both main() and this suite exercise the same code path
+    instead of a hand-copied reproduction of it.
     """
 
     def setUp(self):
@@ -121,39 +121,17 @@ class MainLoopPulseGuardTests(unittest.TestCase):
             if hasattr(wd.is_system_stuck, attr):
                 delattr(wd.is_system_stuck, attr)
 
-    def _run_one_iteration(self, payload, age_seconds, fake_now, restart_mock, post_mock):
-        """Reproduce main()'s single loop-body iteration exactly."""
-        with patch.object(wd, "read_heartbeat_payload", return_value=payload), \
-             patch.object(wd, "read_heartbeat_age_seconds", return_value=age_seconds), \
-             patch.object(wd, "restart_detector", restart_mock), \
-             patch.object(wd.time, "time", return_value=fake_now), \
-             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
-             patch.object(wd.requests, "post", post_mock):
-
-            payload_ = wd.read_heartbeat_payload()
-            age_seconds_ = wd.read_heartbeat_age_seconds()
-
-            if payload_ and wd.is_system_stuck(payload_):
-                wd.restart_detector()
-                wd.time.sleep(wd.WATCHDOG_TIMEOUT_SEC)
-                return
-
-            if age_seconds_ is not None and age_seconds_ > wd.WATCHDOG_TIMEOUT_SEC:
-                wd.restart_detector()
-                wd.time.sleep(wd.WATCHDOG_TIMEOUT_SEC)
-            else:
-                if payload_ is not None and wd.time.time() - wd._last_pulse_sent_at >= wd.DETECTOR_PULSE_INTERVAL_SEC:
-                    if wd.send_detector_health_pulse(payload_):
-                        wd._last_pulse_sent_at = wd.time.time()
-                wd.time.sleep(wd.CHECK_INTERVAL_SEC)
-
     def test_A_healthy_branch3_interval_elapsed_pulse_sent(self):
         payload = make_payload(total_frames=10)
         mock_resp = MagicMock(status_code=200)
         post_mock = MagicMock(return_value=mock_resp)
         restart_mock = MagicMock()
         wd._last_pulse_sent_at = 0.0
-        self._run_one_iteration(payload, 5.0, fake_now=100.0, restart_mock=restart_mock, post_mock=post_mock)
+        with patch.object(wd, "restart_detector", restart_mock), \
+             patch.object(wd.time, "time", return_value=100.0), \
+             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
+             patch.object(wd.requests, "post", post_mock):
+            wd.run_one_watchdog_cycle(payload, 5.0)
         post_mock.assert_called_once()
         restart_mock.assert_not_called()
 
@@ -162,7 +140,11 @@ class MainLoopPulseGuardTests(unittest.TestCase):
         post_mock = MagicMock()
         restart_mock = MagicMock()
         wd._last_pulse_sent_at = 100.0
-        self._run_one_iteration(payload, 5.0, fake_now=110.0, restart_mock=restart_mock, post_mock=post_mock)
+        with patch.object(wd, "restart_detector", restart_mock), \
+             patch.object(wd.time, "time", return_value=110.0), \
+             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
+             patch.object(wd.requests, "post", post_mock):
+            wd.run_one_watchdog_cycle(payload, 5.0)
         post_mock.assert_not_called()
 
     def test_C_successful_pulse_advances_last_sent(self):
@@ -171,7 +153,11 @@ class MainLoopPulseGuardTests(unittest.TestCase):
         post_mock = MagicMock(return_value=mock_resp)
         restart_mock = MagicMock()
         wd._last_pulse_sent_at = 0.0
-        self._run_one_iteration(payload, 5.0, fake_now=200.0, restart_mock=restart_mock, post_mock=post_mock)
+        with patch.object(wd, "restart_detector", restart_mock), \
+             patch.object(wd.time, "time", return_value=200.0), \
+             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
+             patch.object(wd.requests, "post", post_mock):
+            wd.run_one_watchdog_cycle(payload, 5.0)
         self.assertEqual(wd._last_pulse_sent_at, 200.0)
 
     def test_D_failed_pulse_does_not_advance_last_sent(self):
@@ -180,7 +166,11 @@ class MainLoopPulseGuardTests(unittest.TestCase):
         post_mock = MagicMock(return_value=mock_resp)
         restart_mock = MagicMock()
         wd._last_pulse_sent_at = 0.0
-        self._run_one_iteration(payload, 5.0, fake_now=200.0, restart_mock=restart_mock, post_mock=post_mock)
+        with patch.object(wd, "restart_detector", restart_mock), \
+             patch.object(wd.time, "time", return_value=200.0), \
+             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
+             patch.object(wd.requests, "post", post_mock):
+            wd.run_one_watchdog_cycle(payload, 5.0)
         self.assertEqual(wd._last_pulse_sent_at, 0.0)
 
     def test_E_stuck_no_pulse_attempted_regardless_of_interval(self):
@@ -193,7 +183,11 @@ class MainLoopPulseGuardTests(unittest.TestCase):
         post_mock = MagicMock()
         restart_mock = MagicMock()
         wd._last_pulse_sent_at = 0.0
-        self._run_one_iteration(payload, None, fake_now=100000.0, restart_mock=restart_mock, post_mock=post_mock)
+        with patch.object(wd, "restart_detector", restart_mock), \
+             patch.object(wd.time, "time", return_value=100000.0), \
+             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
+             patch.object(wd.requests, "post", post_mock):
+            wd.run_one_watchdog_cycle(payload, None)
         post_mock.assert_not_called()
         restart_mock.assert_called_once()
 
@@ -203,7 +197,11 @@ class MainLoopPulseGuardTests(unittest.TestCase):
         wd._last_pulse_sent_at = 0.0
         # Simulates a watchdog file that has never existed:
         # read_heartbeat_payload() -> None, read_heartbeat_age_seconds() -> None.
-        self._run_one_iteration(None, None, fake_now=100.0, restart_mock=restart_mock, post_mock=post_mock)
+        with patch.object(wd, "restart_detector", restart_mock), \
+             patch.object(wd.time, "time", return_value=100.0), \
+             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
+             patch.object(wd.requests, "post", post_mock):
+            wd.run_one_watchdog_cycle(None, None)
         post_mock.assert_not_called()
         restart_mock.assert_not_called()
 
@@ -213,7 +211,11 @@ class MainLoopPulseGuardTests(unittest.TestCase):
         restart_mock = MagicMock()
         wd._last_pulse_sent_at = 0.0
         stale_age = wd.WATCHDOG_TIMEOUT_SEC + 1
-        self._run_one_iteration(payload, stale_age, fake_now=100.0, restart_mock=restart_mock, post_mock=post_mock)
+        with patch.object(wd, "restart_detector", restart_mock), \
+             patch.object(wd.time, "time", return_value=100.0), \
+             patch.object(wd.time, "sleep", lambda *_a, **_k: None), \
+             patch.object(wd.requests, "post", post_mock):
+            wd.run_one_watchdog_cycle(payload, stale_age)
         post_mock.assert_not_called()
         restart_mock.assert_called_once()
 

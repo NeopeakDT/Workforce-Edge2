@@ -192,9 +192,40 @@ def restart_detector():
         )
 
 
-def main():
+def run_one_watchdog_cycle(payload, age_seconds):
+    """
+    Perform exactly one iteration of the watchdog loop's decision logic:
+    Branch 1 (system stuck -> restart), Branch 2 (heartbeat file stale ->
+    restart), Branch 3 (healthy -> maybe send a detector-health pulse).
+
+    This is a mechanical extraction of main()'s former inline loop body --
+    same branches, same guards, same sleeps, same side effects on
+    _last_pulse_sent_at -- so both main() and the test suite exercise this
+    single code path instead of a parallel copy of it.
+    """
     global _last_pulse_sent_at
 
+    if payload and is_system_stuck(payload):
+        print(f"[WATCHDOG] System stuck -> restarting {DETECTOR_SERVICE_NAME}")
+        restart_detector()
+        time.sleep(WATCHDOG_TIMEOUT_SEC)
+        return
+
+    if age_seconds is not None and age_seconds > WATCHDOG_TIMEOUT_SEC:
+        print(
+            f"[WATCHDOG] Heartbeat stale ({age_seconds:.1f}s). "
+            f"Restarting {DETECTOR_SERVICE_NAME}"
+        )
+        restart_detector()
+        time.sleep(WATCHDOG_TIMEOUT_SEC)
+    else:
+        if payload is not None and time.time() - _last_pulse_sent_at >= DETECTOR_PULSE_INTERVAL_SEC:
+            if send_detector_health_pulse(payload):
+                _last_pulse_sent_at = time.time()
+        time.sleep(CHECK_INTERVAL_SEC)
+
+
+def main():
     print("Edge Watchdog started")
     print(f"Watching  : {WATCHDOG_FILE_PATH}")
     print(f"Timeout   : {WATCHDOG_TIMEOUT_SEC}s")
@@ -208,25 +239,7 @@ def main():
     while True:
         payload = read_heartbeat_payload()
         age_seconds = read_heartbeat_age_seconds()
-
-        if payload and is_system_stuck(payload):
-            print(f"[WATCHDOG] System stuck -> restarting {DETECTOR_SERVICE_NAME}")
-            restart_detector()
-            time.sleep(WATCHDOG_TIMEOUT_SEC)
-            continue
-
-        if age_seconds is not None and age_seconds > WATCHDOG_TIMEOUT_SEC:
-            print(
-                f"[WATCHDOG] Heartbeat stale ({age_seconds:.1f}s). "
-                f"Restarting {DETECTOR_SERVICE_NAME}"
-            )
-            restart_detector()
-            time.sleep(WATCHDOG_TIMEOUT_SEC)
-        else:
-            if payload is not None and time.time() - _last_pulse_sent_at >= DETECTOR_PULSE_INTERVAL_SEC:
-                if send_detector_health_pulse(payload):
-                    _last_pulse_sent_at = time.time()
-            time.sleep(CHECK_INTERVAL_SEC)
+        run_one_watchdog_cycle(payload, age_seconds)
 
 
 if __name__ == "__main__":
