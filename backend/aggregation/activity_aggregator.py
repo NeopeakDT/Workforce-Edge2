@@ -932,7 +932,7 @@ def find_in_progress_bucket_attach(
             activity_type_id,
             activity_date,
             zone_id,
-            *sched[:4],
+            *sched[:3],
         ),
     )
     row = cur.fetchone()
