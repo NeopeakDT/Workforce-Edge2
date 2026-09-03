@@ -768,34 +768,59 @@ def get_latest_observation_and_heartbeat(farm_id: str, zone_id: str):
 # Alerts
 # -------------------------------------------------
 
-def list_recent_alerts(farm_id: str, limit=20):
+def list_recent_alerts(farm_id: str, lifecycle_state: str = "ACTIVE", limit=20):
     """
     Recent alerts with context for dashboard.
+
+    STEP D — D1: `activity_instance` is now a LEFT JOIN (was INNER JOIN).
+    An INNER JOIN silently dropped every alert whose `activity_instance_id`
+    is NULL -- which is every WORKFORCE_DETECTOR_OFFLINE, EDGE_DEVICE_OFFLINE,
+    POSTURE_DATA_STALE, and schedule-keyed ACTIVITY_LATE row (Step C). Those
+    alert types have no activity_instance at all by design (device/zone/
+    schedule-keyed, not instance-keyed), so `ai.*` fields are NULL for them
+    -- expected, not a data-quality problem.
+
+    `lifecycle_state` defaults to 'ACTIVE' (current-alerts view -- an
+    operational alert screen should not show resolved history as if it
+    were a current problem); pass 'RESOLVED' explicitly for history, or
+    None for both. This filters server-side by design (Step D decision)
+    rather than leaving every caller to filter the full result client-side.
     """
     with get_cursor() as cur:
-        cur.execute(
-            """
+        query = """
             SELECT
                 al.id,
                 al.triggered_at,
+                al.resolved_at,
                 al.status AS alert_status,
+                al.lifecycle_state,
+                al.alert_type,
+                al.dedup_key,
                 al.message,
                 al.channel,
+                al.activity_instance_id,
+                al.zone_id,
+                al.device_id,
 
                 ar.severity,
                 ar.name AS rule_name,
 
                 ai.activity_type_id,
+                ai.activity_schedule_id,
                 ai.status AS activity_status
 
             FROM alert_log al
             JOIN alert_rule ar ON ar.id = al.alert_rule_id
-            JOIN activity_instance ai ON ai.id = al.activity_instance_id
+            LEFT JOIN activity_instance ai ON ai.id = al.activity_instance_id
 
             WHERE al.farm_id = %s
-            ORDER BY al.triggered_at DESC
-            LIMIT %s
-            """,
-            (farm_id, limit),
-        )
+        """
+        params = [farm_id]
+        if lifecycle_state is not None:
+            query += " AND al.lifecycle_state = %s"
+            params.append(lifecycle_state)
+        query += " ORDER BY al.triggered_at DESC LIMIT %s"
+        params.append(limit)
+
+        cur.execute(query, tuple(params))
         return cur.fetchall()
