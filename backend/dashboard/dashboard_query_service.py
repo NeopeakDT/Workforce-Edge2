@@ -768,9 +768,16 @@ def get_latest_observation_and_heartbeat(farm_id: str, zone_id: str):
 # Alerts
 # -------------------------------------------------
 
-def list_recent_alerts(farm_id: str, lifecycle_state: str = "ACTIVE", limit=20):
+def list_recent_alerts(farm_id: str, lifecycle_state: str = "ACTIVE", alert_type: str = None, limit=20):
     """
     Recent alerts with context for dashboard.
+
+    STEP D — D2: added the optional `alert_type` filter. This must be
+    applied in SQL, not by filtering the Python result after the fact --
+    filtering post-LIMIT would silently under-return (a LIMIT-truncated
+    query can drop a matching row before a caller-side filter ever sees
+    it). Purely additive: existing callers that never pass `alert_type`
+    are unaffected (the clause is only added when it's not None).
 
     STEP D — D1: `activity_instance` is now a LEFT JOIN (was INNER JOIN).
     An INNER JOIN silently dropped every alert whose `activity_instance_id`
@@ -819,6 +826,9 @@ def list_recent_alerts(farm_id: str, lifecycle_state: str = "ACTIVE", limit=20):
         if lifecycle_state is not None:
             query += " AND al.lifecycle_state = %s"
             params.append(lifecycle_state)
+        if alert_type is not None:
+            query += " AND al.alert_type = %s"
+            params.append(alert_type)
         query += " ORDER BY al.triggered_at DESC LIMIT %s"
         params.append(limit)
 

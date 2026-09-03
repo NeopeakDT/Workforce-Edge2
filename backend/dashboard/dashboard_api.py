@@ -24,6 +24,7 @@ common.auth.user_can_access_farm().
 """
 
 from datetime import date as date_type, datetime, time as time_type, timedelta
+from typing import Literal, Optional
 
 import pytz
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -42,6 +43,7 @@ from dashboard.dashboard_query_service import (
     get_posture_7d_buckets,
     get_posture_24h_buckets,
     get_posture_daily_summary,
+    list_recent_alerts,
 )
 
 router = APIRouter()
@@ -1289,4 +1291,69 @@ def _build_response(observation: dict) -> dict:
             "received_cameras": received_cameras,
             "coverage_percentage": coverage_percentage,
         },
+    }
+
+
+# -------------------------------------------------
+# Step D2 — Alerts read endpoint
+# -------------------------------------------------
+# Pull/read model only (Step D frozen decision): this endpoint exposes
+# alert_log via the existing dashboard auth/authorization pattern. It does
+# not create, resolve, or otherwise mutate any alert -- alert_log remains
+# exclusively Step C's write surface. No dispatcher, no alert_delivery, no
+# push transport; see docs history for the Step D design freeze.
+#
+# lifecycle_state and alert_type are typed as Literal[...] rather than
+# `str` so FastAPI/Pydantic reject any value outside the supported set at
+# the request-validation layer (422) before this function body ever runs
+# -- no arbitrary string is ever interpolated into SQL. This intentionally
+# does not expose dashboard_query_service.list_recent_alerts()'s internal
+# lifecycle_state=None ("both states") capability over HTTP; the frozen
+# API surface offers exactly ACTIVE or RESOLVED, per the Step D decision.
+
+@router.get("/alerts")
+def list_alerts(
+    farm_id: str = Query(..., description="Farm UUID"),
+    lifecycle_state: Literal["ACTIVE", "RESOLVED"] = Query(
+        "ACTIVE", description="Alert lifecycle state to return."
+    ),
+    alert_type: Optional[Literal["ACTIVITY", "EDGE_DEVICE", "POSTURE"]] = Query(
+        None, description="Restrict to one alert type. Omit for all types."
+    ),
+    limit: int = Query(20, ge=1, le=100, description="Max rows to return."),
+    authorization: str = Header(None),
+):
+    # -------------------------------------------------
+    # 1. Authenticate (existing common/auth.py JWT flow)
+    # -------------------------------------------------
+    try:
+        ctx = parse_auth_header(authorization)
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    # -------------------------------------------------
+    # 2. Authorize — caller must have access to this farm
+    # -------------------------------------------------
+    if not user_can_access_farm(ctx.user_id, farm_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized for this farm",
+        )
+
+    # -------------------------------------------------
+    # 3. Delegate to the query service (no SQL here)
+    # -------------------------------------------------
+    alerts = list_recent_alerts(
+        farm_id,
+        lifecycle_state=lifecycle_state,
+        alert_type=alert_type,
+        limit=limit,
+    )
+
+    return {
+        "farm_id": farm_id,
+        "lifecycle_state": lifecycle_state,
+        "alert_type": alert_type,
+        "count": len(alerts),
+        "alerts": alerts,
     }
