@@ -84,9 +84,34 @@ def cleanup(rule_ids, extra_instance_ids=None):
 
 
 def test_activity_missed():
+    # Uses a synthetic activity_instance rather than EXISTING_MISSED_INSTANCE
+    # (a real production row). Since ops/seed_alert_rules_activity_missed.sql
+    # added a real "ACTIVITY_MISSED: Morning Scrapping" production rule,
+    # evaluating a real production MISSED instance would match BOTH that
+    # real rule and this test's temporary rule, and this test's cleanup()
+    # only removes rows tied to its own rule_ids -- leaving a real,
+    # unintended alert_log row against the production rule behind. This was
+    # discovered live (alert_log row b22a95e5-7fdb-4f61-9939-bc628d609442,
+    # manually removed via the DB admin path) and is fixed here by
+    # following the same synthetic-activity_instance convention already
+    # used by test_activity_running_long() in this file, so the test never
+    # touches production data again regardless of what production rules
+    # exist.
     rule_ids = []
+    synthetic_id = str(uuid.uuid4())
     try:
         with get_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO activity_instance
+                    (id, farm_id, activity_type_id, activity_schedule_id, activity_date,
+                     actual_start_at, actual_end_at, status, source, zone_id, session_classification)
+                VALUES (%s, %s, 3, %s, DATE '2019-02-01',
+                        %s, %s, 'ENDED', 'SYSTEM', %s, 'MISSED')
+                """,
+                (synthetic_id, FARM_ID, SCRAP_MORNING_SCHEDULE, utc_now(), utc_now(), ZONE_ID),
+            )
+
             rule_id = make_rule(
                 cur, alert_type="ACTIVITY", name="STEPB_TEST Missed Scrapping",
                 condition={"metric": "session_classification", "operator": "=", "value": "MISSED", "duration_minutes": 0},
@@ -94,7 +119,7 @@ def test_activity_missed():
             )
         rule_ids.append(rule_id)
 
-        result = alert_evaluator.evaluate_activity_alerts(EXISTING_MISSED_INSTANCE)
+        result = alert_evaluator.evaluate_activity_alerts(synthetic_id)
         check("ACTIVITY_MISSED: evaluator finds the instance", result["instance_found"])
         check("ACTIVITY_MISSED: alert created", rule_id in result.get("alerts_created", []))
 
@@ -102,15 +127,40 @@ def test_activity_missed():
         check("ACTIVITY_MISSED: exactly one alert_log row", len(rows) == 1, f"got {len(rows)}")
         if rows:
             check("ACTIVITY_MISSED: lifecycle_state ACTIVE", rows[0]["lifecycle_state"] == "ACTIVE")
-            check("ACTIVITY_MISSED: dedup_key is instance id", rows[0]["dedup_key"] == EXISTING_MISSED_INSTANCE)
+            check("ACTIVITY_MISSED: dedup_key is instance id", rows[0]["dedup_key"] == synthetic_id)
             check("ACTIVITY_MISSED: alert_type is ACTIVITY", rows[0]["alert_type"] == "ACTIVITY")
 
         # Re-run: must NOT create a second row (anti-storm / dedup).
-        alert_evaluator.evaluate_activity_alerts(EXISTING_MISSED_INSTANCE)
+        alert_evaluator.evaluate_activity_alerts(synthetic_id)
         rows_after = fetch_alert_logs(rule_id)
         check("ACTIVITY_MISSED: re-evaluation does not duplicate", len(rows_after) == 1, f"got {len(rows_after)}")
+
+        # The synthetic instance shares the real "Morning Scrapping" schedule,
+        # so the real production ACTIVITY_MISSED rule also matches it and
+        # will have created its own alert_log row (correct, expected
+        # behavior -- this is confirmed, not suppressed). That row's
+        # activity_instance_id is the synthetic id, never a real one, but it
+        # is still keyed to a real alert_rule_id, not our tracked rule_ids,
+        # so cleanup() below (which only deletes by rule_ids) would not
+        # remove it -- and it would block the activity_instance DELETE via
+        # the alert_log_activity_instance_id_fkey FK. Remove any such row by
+        # dedup_key (the synthetic instance id) regardless of which rule
+        # created it, before cleanup() runs.
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT alert_rule_id FROM alert_log WHERE dedup_key = %s AND alert_rule_id != %s",
+                (synthetic_id, rule_id),
+            )
+            other_rows = cur.fetchall()
+        check(
+            "ACTIVITY_MISSED: real production rule also matched (expected coverage, not a bug)",
+            len(other_rows) >= 1,
+        )
+        with get_cursor() as cur:
+            cur.execute("DELETE FROM alert_log WHERE dedup_key = %s AND alert_rule_id != %s",
+                        (synthetic_id, rule_id))
     finally:
-        cleanup(rule_ids)
+        cleanup(rule_ids, extra_instance_ids=[synthetic_id])
 
 
 def test_activity_late_and_recovery():
