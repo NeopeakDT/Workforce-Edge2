@@ -80,6 +80,22 @@ def cleanup(rule_ids, extra_instance_ids=None):
             cur.execute("DELETE FROM alert_log WHERE alert_rule_id = ANY(%s::uuid[])", (rule_ids,))
             cur.execute("DELETE FROM alert_rule WHERE id = ANY(%s::uuid[])", (rule_ids,))
         if extra_instance_ids:
+            # A real, farm-wide alert_rule (e.g. ACTIVITY_RUNNING_LONG,
+            # seeded by ops/seed_alert_rules_running_long_posture_device.sql)
+            # can also match one of these synthetic instances independently
+            # of any rule_ids tracked above, leaving its own alert_log row
+            # referencing this instance -- which would otherwise block the
+            # DELETE below via alert_log_activity_instance_id_fkey and, if
+            # it does, roll back this entire cleanup (this exact failure
+            # mode created real leftover rows once already, in
+            # test_activity_running_long(), manually removed via the DB
+            # admin path). Delete by activity_instance_id directly,
+            # regardless of which rule created the row, before deleting
+            # the instances themselves.
+            cur.execute(
+                "DELETE FROM alert_log WHERE activity_instance_id = ANY(%s::uuid[])",
+                (extra_instance_ids,),
+            )
             cur.execute("DELETE FROM activity_instance WHERE id = ANY(%s::uuid[])", (extra_instance_ids,))
 
 
@@ -299,12 +315,27 @@ def test_activity_running_long():
 
 
 def test_posture_data_stale():
+    # Uses a synthetic farm_zone + posture_observation rather than the real
+    # POSTURE_ZONE_ID. Since ops/seed_alert_rules_running_long_posture_device.sql
+    # added a real farm-wide "POSTURE_DATA_STALE" production rule, evaluating
+    # the real zone would also match that real rule and create a stray real
+    # alert_log row -- exactly the same failure mode discovered and fixed
+    # for test_activity_missed() above. The synthetic observation is fixed
+    # at 15 minutes old (deterministically stale relative to both this
+    # test's own thresholds and the real rule's threshold, whatever it is)
+    # so the test never depends on live posture data timing.
     rule_ids = []
+    zone_id = str(uuid.uuid4())
     try:
         with get_cursor() as cur:
-            # duration_minutes/value=0 -> even the freshest real observation is "stale" relative to
-            # this threshold, deterministically proving the trigger path without fabricating rows
-            # in posture_observation.
+            cur.execute(
+                "INSERT INTO farm_zone (id, farm_id, name) VALUES (%s, %s, 'STEPB_TEST synthetic zone')",
+                (zone_id, FARM_ID),
+            )
+            cur.execute(
+                "INSERT INTO posture_observation (farm_id, zone_id, observed_at) VALUES (%s, %s, %s)",
+                (FARM_ID, zone_id, utc_now() - timedelta(minutes=15)),
+            )
             trigger_rule_id = make_rule(
                 cur, alert_type="POSTURE", name="STEPB_TEST Posture Stale (forced trigger)",
                 condition={"metric": "observation_age_minutes", "operator": ">", "value": -1, "duration_minutes": 0},
@@ -316,14 +347,14 @@ def test_posture_data_stale():
             )
         rule_ids.extend([trigger_rule_id, quiet_rule_id])
 
-        result = alert_evaluator.evaluate_posture_alerts(FARM_ID, POSTURE_ZONE_ID)
+        result = alert_evaluator.evaluate_posture_alerts(FARM_ID, zone_id)
         check("POSTURE_DATA_STALE: observation found for zone", result.get("observation_found") is True, detail=str(result))
         check("POSTURE_DATA_STALE: trigger rule fires", trigger_rule_id in result.get("alerts_created", []))
         check("POSTURE_DATA_STALE: quiet rule does not fire", quiet_rule_id not in result.get("alerts_created", []))
 
         trigger_rows = fetch_alert_logs(trigger_rule_id)
         check("POSTURE_DATA_STALE: one ACTIVE row for trigger rule", len(trigger_rows) == 1 and trigger_rows[0]["lifecycle_state"] == "ACTIVE")
-        check("POSTURE_DATA_STALE: zone_id set on row", trigger_rows and str(trigger_rows[0]["zone_id"]) == POSTURE_ZONE_ID)
+        check("POSTURE_DATA_STALE: zone_id set on row", trigger_rows and str(trigger_rows[0]["zone_id"]) == zone_id)
 
         quiet_rows = fetch_alert_logs(quiet_rule_id)
         check("POSTURE_DATA_STALE: no row for quiet rule", len(quiet_rows) == 0)
@@ -335,7 +366,7 @@ def test_posture_data_stale():
                 "UPDATE alert_rule SET condition = %s WHERE id = %s",
                 (Json({"metric": "observation_age_minutes", "operator": ">", "value": 10_000_000, "duration_minutes": 0}), trigger_rule_id),
             )
-        alert_evaluator.evaluate_posture_alerts(FARM_ID, POSTURE_ZONE_ID)
+        alert_evaluator.evaluate_posture_alerts(FARM_ID, zone_id)
         trigger_rows_after = fetch_alert_logs(trigger_rule_id)
         check(
             "POSTURE_DATA_STALE: resolves once condition no longer holds",
@@ -343,13 +374,34 @@ def test_posture_data_stale():
             detail=str([dict(r) for r in trigger_rows_after]),
         )
     finally:
+        # The real farm-wide POSTURE_DATA_STALE rule also matches this
+        # synthetic zone (15 min > its threshold) -- remove its alert_log
+        # row by dedup_key (not one of our tracked rule_ids) before
+        # deleting the zone, then delete the observation and zone.
+        with get_cursor() as cur:
+            cur.execute("DELETE FROM alert_log WHERE dedup_key = %s", (zone_id,))
+            cur.execute("DELETE FROM posture_observation WHERE zone_id = %s", (zone_id,))
+            cur.execute("DELETE FROM farm_zone WHERE id = %s", (zone_id,))
         cleanup(rule_ids)
 
 
 def test_edge_device_offline():
+    # Uses a synthetic edge_device rather than the real DEVICE_ID, for the
+    # same reason as test_posture_data_stale() above: a real, farm-wide
+    # "EDGE_DEVICE_OFFLINE" production rule now exists
+    # (ops/seed_alert_rules_running_long_posture_device.sql) and would also
+    # match the real device. The synthetic device's last_seen_at is fixed
+    # at 15 minutes old so the test never depends on the live heartbeat
+    # agent's actual cadence/freshness.
     rule_ids = []
+    device_id = str(uuid.uuid4())
     try:
         with get_cursor() as cur:
+            cur.execute(
+                "INSERT INTO edge_device (id, farm_id, name, code, api_key_hash, is_active, last_seen_at) "
+                "VALUES (%s, %s, 'STEPB_TEST synthetic device', %s, 'x', true, %s)",
+                (device_id, FARM_ID, f"STEPB_TEST_{device_id[:8]}", utc_now() - timedelta(minutes=15)),
+            )
             trigger_rule_id = make_rule(
                 cur, alert_type="EDGE_DEVICE", name="STEPB_TEST Device Offline (forced trigger)",
                 condition={"metric": "heartbeat_age_minutes", "operator": ">", "value": -1, "duration_minutes": 0},
@@ -362,17 +414,17 @@ def test_edge_device_offline():
             )
         rule_ids.extend([trigger_rule_id, quiet_rule_id])
 
-        result = alert_evaluator.evaluate_edge_device_alerts(DEVICE_ID)
+        result = alert_evaluator.evaluate_edge_device_alerts(device_id)
         check("EDGE_DEVICE_OFFLINE: device found", result.get("device_found") is True, detail=str(result))
         check("EDGE_DEVICE_OFFLINE: trigger rule fires", trigger_rule_id in result.get("alerts_created", []))
         check("EDGE_DEVICE_OFFLINE: quiet rule does not fire", quiet_rule_id not in result.get("alerts_created", []))
 
         rows = fetch_alert_logs(trigger_rule_id)
         check("EDGE_DEVICE_OFFLINE: one ACTIVE row, device_id set",
-              len(rows) == 1 and rows[0]["lifecycle_state"] == "ACTIVE" and str(rows[0]["device_id"]) == DEVICE_ID)
+              len(rows) == 1 and rows[0]["lifecycle_state"] == "ACTIVE" and str(rows[0]["device_id"]) == device_id)
 
         # Re-run: dedup, no duplicate row.
-        alert_evaluator.evaluate_edge_device_alerts(DEVICE_ID)
+        alert_evaluator.evaluate_edge_device_alerts(device_id)
         rows_after = fetch_alert_logs(trigger_rule_id)
         check("EDGE_DEVICE_OFFLINE: re-evaluation does not duplicate", len(rows_after) == 1)
 
@@ -382,7 +434,7 @@ def test_edge_device_offline():
                 "UPDATE alert_rule SET condition = %s WHERE id = %s",
                 (Json({"metric": "heartbeat_age_minutes", "operator": ">", "value": 10_000_000, "duration_minutes": 0}), trigger_rule_id),
             )
-        alert_evaluator.evaluate_edge_device_alerts(DEVICE_ID)
+        alert_evaluator.evaluate_edge_device_alerts(device_id)
         rows_final = fetch_alert_logs(trigger_rule_id)
         check(
             "EDGE_DEVICE_OFFLINE: resolves once heartbeat is 'fresh enough'",
@@ -390,6 +442,12 @@ def test_edge_device_offline():
             detail=str([dict(r) for r in rows_final]),
         )
     finally:
+        # The real farm-wide EDGE_DEVICE_OFFLINE rule also matches this
+        # synthetic device (15 min > its threshold) -- remove its alert_log
+        # row by dedup_key before deleting the device.
+        with get_cursor() as cur:
+            cur.execute("DELETE FROM alert_log WHERE dedup_key = %s", (device_id,))
+            cur.execute("DELETE FROM edge_device WHERE id = %s", (device_id,))
         cleanup(rule_ids)
 
 
