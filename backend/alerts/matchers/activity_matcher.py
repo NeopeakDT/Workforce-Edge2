@@ -262,6 +262,35 @@ def evaluate_late_start_sweep(farm_id=None):
     Deliberately ignores activity_schedule.tolerance_late_min (that's
     ACTIVITY_MISSED's mechanism); uses alert_rule.condition's own
     minutes_since_ideal_start threshold instead.
+
+    Three occurrence states per (farm, schedule, activity_date) -- there can
+    be at most one activity_instance row per that triple
+    (uq_missed_schedule_per_day is a full, non-partial unique index):
+
+      1. No row at all -- the occurrence is still undecided. Ordinary LATE
+         create/dedup logic applies.
+      2. A row with actual_start_at IS NOT NULL -- a genuine occurrence
+         (source='AI' today; also 'MANUAL'/'AI_WITH_MANUAL_OVERRIDE' per the
+         activity_source enum, not source-specific by design). The activity
+         actually started -- LATE may resolve.
+      3. A row with session_classification='MISSED' AND source='SYSTEM' --
+         missed_activity_cron.py's placeholder, inserted once an occurrence
+         is confirmed missed (always actual_start_at=NULL). This occurrence
+         is CLOSED: missed_activity_cron.py's own
+         resolve_late_start_alerts_for_occurrence() already resolved LATE
+         synchronously the moment this row was created, and
+         evaluate_finalized_instance() already had its chance to create the
+         separate ACTIVITY_MISSED alert. The sweep must take no action at
+         all here -- neither create (the occurrence isn't undecided) nor
+         resolve (already done once; re-resolving here would just be a
+         harmless no-op, but re-CREATING on a later tick, after some
+         hypothetical future resolution of that already-closed LATE row,
+         would not be -- see the investigation report this fix closes).
+
+    Any other, unrecognized shape (actual_start_at NULL but not matching the
+    MISSED/SYSTEM signature -- not currently possible against this schema,
+    but not asserted against) falls through to state 1's undecided handling,
+    preserving prior behavior for anything not explicitly covered.
     """
     with get_cursor() as cur:
         query = """
@@ -292,19 +321,35 @@ def evaluate_late_start_sweep(farm_id=None):
         with get_cursor() as cur:
             cur.execute(
                 """
-                SELECT 1 FROM activity_instance
+                SELECT actual_start_at, session_classification, source
+                FROM activity_instance
                 WHERE farm_id = %s AND activity_schedule_id = %s AND activity_date = %s
                 LIMIT 1
                 """,
                 (sched["farm_id"], sched["schedule_id"], today_local),
             )
-            instance_exists = cur.fetchone() is not None
+            existing = cur.fetchone()
             rules = _load_activity_rules(cur, sched["farm_id"], sched["activity_type_id"], sched["schedule_id"])
+
+        instance_exists = existing is not None and existing["actual_start_at"] is not None
+        occurrence_closed = (
+            existing is not None
+            and existing["actual_start_at"] is None
+            and existing["session_classification"] == "MISSED"
+            and existing["source"] == "SYSTEM"
+        )
 
         dedup_key = f"{sched['schedule_id']}:{today_local.isoformat()}"
         for rule in rules:
             condition = rule["condition"] or {}
             if condition.get("metric") != _LATE_START_METRIC:
+                continue
+
+            if occurrence_closed:
+                # STATE 3: already conclusively MISSED. LATE was already
+                # resolved once by resolve_late_start_alerts_for_occurrence()
+                # at the moment the MISSED row was created -- take no action
+                # here, in either direction.
                 continue
 
             if not instance_exists and condition_matches(condition, minutes_since):
@@ -324,23 +369,35 @@ def evaluate_late_start_sweep(farm_id=None):
                     # Part F(b): close (not eliminate -- full atomicity would
                     # need cross-process locking, out of scope) the race
                     # window between this function's own read of
-                    # instance_exists above and this INSERT: re-check right
-                    # now, cheaply, whether an activity_instance has since
-                    # appeared (e.g. missed_activity_cron.py's MISSED insert
-                    # landed in between). If so, self-correct immediately
-                    # instead of leaving a stray ACTIVE alert for a whole
-                    # sweep interval.
+                    # instance_exists/occurrence_closed above and this
+                    # INSERT: re-check right now, cheaply, whether the
+                    # occurrence has since resolved itself either way --
+                    # a genuine occurrence appearing (self-correct: resolve),
+                    # or missed_activity_cron.py's MISSED insert landing in
+                    # this exact window (also self-correct: resolve, since
+                    # its own resolve_late_start_alerts_for_occurrence() call
+                    # would have found nothing yet to resolve and this row
+                    # would otherwise be left ACTIVE for an already-closed
+                    # occurrence). Otherwise, leave the new row ACTIVE.
                     with get_cursor() as recheck_cur:
                         recheck_cur.execute(
                             """
-                            SELECT 1 FROM activity_instance
+                            SELECT actual_start_at, session_classification, source
+                            FROM activity_instance
                             WHERE farm_id = %s AND activity_schedule_id = %s AND activity_date = %s
                             LIMIT 1
                             """,
                             (sched["farm_id"], sched["schedule_id"], today_local),
                         )
-                        instance_now_exists = recheck_cur.fetchone() is not None
-                    if instance_now_exists:
+                        recheck_row = recheck_cur.fetchone()
+                    instance_now_exists = recheck_row is not None and recheck_row["actual_start_at"] is not None
+                    now_closed = (
+                        recheck_row is not None
+                        and recheck_row["actual_start_at"] is None
+                        and recheck_row["session_classification"] == "MISSED"
+                        and recheck_row["source"] == "SYSTEM"
+                    )
+                    if instance_now_exists or now_closed:
                         resolved += resolve_active_occurrence(rule_id=rule["id"], dedup_key=dedup_key)
                     else:
                         created.append(rule["id"])
