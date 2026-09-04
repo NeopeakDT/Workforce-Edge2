@@ -8,16 +8,13 @@ their numeric thresholds are still pending business approval per the A4
 review; EDGE_DEVICE_HIGH_GPU_USAGE was excluded entirely in A4 -- no GPU
 utilization field exists in edge_device_heartbeat, only gpu_temp_c).
 
-Freshness is read from edge_device.last_seen_at -- the same field
-aggregation/device_health_monitor.py already uses for its own offline
-detection. This module does not redefine the 10-minute threshold; the
-threshold is supplied via the alert_rule's own condition JSON (callers
-should seed it from device_health_monitor.OFFLINE_THRESHOLD_MIN for
-consistency, per A4's "reuse existing constants" instruction), so nothing
-here special-cases or hardcodes that number.
+Freshness is read from edge_device.last_seen_at. This module does not
+redefine the 10-minute threshold itself; the threshold is supplied via the
+alert_rule's own condition JSON
+(ops/seed_alert_rules_running_long_posture_device.sql seeds it as 10), so
+nothing here special-cases or hardcodes that number.
 
-Not wired into heartbeat_ingest_api.py or device_health_monitor.py yet --
-that wiring is Step C.
+Wired into aggregation/alerts_cron.py's 60s sweep (Step C, Task 8).
 """
 
 from pathlib import Path

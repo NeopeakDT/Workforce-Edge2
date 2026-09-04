@@ -9,7 +9,6 @@ admin_endpoints.py - Administrative operations
 Aggregation (aggregation/):
 activity_aggregator.py - Manages activity_instance lifecycle (single source of truth)
 missed_activity_cron.py - Background job for missed activities
-device_health_monitor.py - Monitors device health
 
 Alerts (alerts/):
 alert_evaluator.py - Evaluates alert conditions
